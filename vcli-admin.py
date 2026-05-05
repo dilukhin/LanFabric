@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "1.0.13"
+__version__ = "0.0.5"
 
 import sys
 import os
@@ -24,6 +24,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("vcli")
 
+def print_intro():
+    """Выводит краткую информацию о клиентском инструменте."""
+    print(f"LanFabric CLI v{__version__} — клиент управления VPN")
+    
 def build_ssh_cmd(args, use_tty=False):
     """Формирует базовый список аргументов для SSH."""
     base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"]
@@ -169,29 +173,17 @@ def cmd_init(args):
     log.info("Среда успешно создана и проверена")
 
 def cmd_remove(args):
-    """Удаление среды с сервера."""
-    if args.confirm != args.host:
-        raise RuntimeError("Подтверждение не совпадает с адресом сервера. Удаление отменено.")
-        
-    log.info("Остановка служб и очистка сервера")
-    cleanup_cmds = [
-        ["sudo", "systemctl", "disable", "--now", "wg-quick@wg0"],
-        ["sudo", "ip", "link", "del", "wg0"],
-        ["sudo", "iptables", "-F", "FORWARD"],
-        ["sudo", "iptables", "-t", "nat", "-F", "POSTROUTING"],
-        ["sudo", "netfilter-persistent", "save"],
-        ["sudo", "apt-get", "remove", "-y", "wireguard", "amneziawg"],
-        ["sudo", "rm", "-rf", REMOTE_DIR]
-    ]
-    
-    for cmd in cleanup_cmds:
-        try:
-            exec_remote(args, cmd)
-        except RuntimeError as e:
-            log.warning(f"Некритичная ошибка при очистке: {e}")
-            
-    log.info("Среда удалена. Сервер возвращён к базовому состоянию.")
+    """Удаление среды с сервера через серверный скрипт."""
+    if args.confirm not in ("REMOVE", "PURGE"):
+        raise RuntimeError("Для подтверждения укажите REMOVE или PURGE")
 
+    remote_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, args.command, args.confirm]
+
+    log.info(f"Выполнение на сервере: {' '.join(shlex.quote(c) for c in remote_cmd)}")
+    out = exec_remote(args, remote_cmd)
+    if out:
+        print(out)
+        
 def cmd_config(args):
     """Скачивание конфигурации клиента."""
     remote_file = f"{REMOTE_DIR}/configs/{args.name}.conf"
@@ -253,9 +245,14 @@ def get_key_path(key_arg):
     return os.path.abspath(path)  # Возвращаем абсолютный путь для точной диагностики
 
 def main():
+    
     if len(sys.argv) == 1:
-        print("Краткая справка: vcli-admin.py {init|remove|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
+        print_intro()
+        print("Краткая справка: vcli-admin.py {init|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
         sys.exit(0)
+        
+    if "--version" not in sys.argv:
+        print_intro()
 
     parser = argparse.ArgumentParser(description="Клиентское управление VPN-сетью")
     parser.add_argument("--version", action="version", version=f"vcli-admin {__version__}")
@@ -273,8 +270,11 @@ def main():
     p_init = subparsers.add_parser("init", help="Развёртывание среды на сервере")
     p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
 
-    p_remove = subparsers.add_parser("remove", help="Удаление среды с сервера")
-    p_remove.add_argument("confirm", help="Введите IP/хост сервера для подтверждения удаления")
+    p_remove = subparsers.add_parser("remove", help="Удаление VPN runtime и пакетов без удаления данных")
+    p_remove.add_argument("confirm", help="Для подтверждения введите REMOVE")
+    
+    p_purge = subparsers.add_parser("purge", help="Полное удаление LanFabric с сервера")
+    p_purge.add_argument("confirm", help="Для подтверждения введите PURGE")
 
     p_add = subparsers.add_parser("add", help="Создание учётной записи")
     p_add.add_argument("name", help="Имя пользователя")
@@ -315,7 +315,7 @@ def main():
     try:
         if args.command == "init":
             cmd_init(args)
-        elif args.command == "remove":
+        elif args.command in ("remove", "purge"):
             cmd_remove(args)
         elif args.command == "config":
             cmd_config(args)

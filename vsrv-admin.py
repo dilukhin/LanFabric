@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "1.0.13"
+__version__ = "0.0.5"
 
 import sys
 import os
@@ -22,6 +22,9 @@ SERVER_IP = "10.8.0.1"
 VPN_NET = "10.8.0.0/24"
 CONF_DIR = "/opt/vpn-admin/configs"
 WG_BASE_PORT = 51820
+BACKEND_PATH = "/opt/vpn-admin/backend"
+REMOTE_DIR = "/opt/vpn-admin"
+SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
 
 # Логирование
 logging.basicConfig(
@@ -32,6 +35,10 @@ logging.basicConfig(
 for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 log = logging.getLogger("vsrv")
+
+def print_intro():
+    """Выводит краткую информацию о серверном инструменте."""
+    print(f"LanFabric SRV v{__version__} — сервер управления VPN")
 
 def get_backend():
     path = "/opt/vpn-admin/backend"
@@ -55,6 +62,105 @@ def run_cmd(cmd, check=True):
             f"Ошибка выполнения '{cmd}': {result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout.strip()
+
+def cleanup_runtime():
+    """Останавливает VPN и удаляет runtime-состояние без удаления данных."""
+    log.info("Остановка WireGuard/AmneziaWG и очистка runtime-состояния")
+
+    # systemd WireGuard
+    run_cmd(f"systemctl disable --now wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+
+    # Интерфейс
+    run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+
+    # Базовые правила LanFabric
+    run_cmd(f"iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT 2>/dev/null || true", check=False)
+    run_cmd(f"iptables -D FORWARD -i {WG_IF} -j DROP 2>/dev/null || true", check=False)
+    run_cmd(f"iptables -t nat -D POSTROUTING -s {VPN_NET} -j MASQUERADE 2>/dev/null || true", check=False)
+
+    # Динамические правила клиентов из БД
+    if os.path.exists(DB_PATH):
+        try:
+            conn = init_db()
+            rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
+            for row in rows:
+                ip = row[0]
+                run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT 2>/dev/null || true", check=False)
+                run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE 2>/dev/null || true", check=False)
+        except Exception as e:
+            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
+
+    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+
+    # Модули
+    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
+    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
+
+
+def remove_packages(purge=False):
+    """Удаляет установленные VPN-пакеты."""
+    action = "purge" if purge else "remove"
+    log.info(f"Удаление VPN-пакетов через apt-get {action}")
+
+    packages = [
+        "wireguard",
+        "wireguard-tools",
+        "amneziawg",
+        "amneziawg-tools",
+        "amneziawg-dkms",
+    ]
+
+    run_cmd(
+        "DEBIAN_FRONTEND=noninteractive apt-get "
+        f"{action} -y " + " ".join(packages) + " 2>/dev/null || true",
+        check=False
+    )
+
+    if purge:
+        run_cmd("DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true", check=False)
+        run_cmd("DEBIAN_FRONTEND=noninteractive apt-get autoclean -y 2>/dev/null || true", check=False)
+
+
+def cleanup_amnezia_repo():
+    """Удаляет подключённый PPA AmneziaWG."""
+    log.info("Удаление источников пакетов AmneziaWG")
+    run_cmd("rm -f /etc/apt/sources.list.d/amnezia-ubuntu-ppa*.list 2>/dev/null || true", check=False)
+    run_cmd("rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null || true", check=False)
+    run_cmd("apt-get update -qq 2>/dev/null || true", check=False)
+
+
+def cmd_remove(args):
+    """Удаление VPN runtime и пакетов без удаления данных LanFabric."""
+    if args.confirm != "REMOVE":
+        raise RuntimeError("Для подтверждения удаления укажите: REMOVE")
+
+    log.info("Начало remove: удаление runtime и пакетов, данные сохраняются")
+
+    cleanup_runtime()
+    remove_packages(purge=False)
+
+    log.info("Remove завершён. Данные /opt/vpn-admin и /etc/wireguard сохранены.")
+
+
+def cmd_purge(args):
+    """Полное удаление LanFabric с сервера."""
+    if args.confirm != "PURGE":
+        raise RuntimeError("Для подтверждения полного удаления укажите: PURGE")
+
+    log.info("Начало purge: полное удаление LanFabric с сервера")
+
+    cleanup_runtime()
+    remove_packages(purge=True)
+    cleanup_amnezia_repo()
+
+    log.info("Удаление конфигураций и данных LanFabric")
+    run_cmd("rm -rf /etc/wireguard 2>/dev/null || true", check=False)
+    run_cmd(f"rm -f {SUDOERS_PATH} 2>/dev/null || true", check=False)
+    run_cmd("rm -f /etc/sysctl.d/99-vpn-forward.conf 2>/dev/null || true", check=False)
+
+    log.info("Удаление каталога LanFabric. Серверный скрипт будет удалён вместе с каталогом.")
+    run_cmd(f"rm -rf {REMOTE_DIR} 2>/dev/null || true", check=False)
+    print("Purge завершён. LanFabric полностью удалён с сервера.")
 
 def init_db():
     """Создаёт или подключается к SQLite базе."""
@@ -152,10 +258,25 @@ def cmd_init(args):
 
     # --- Загрузка модуля ---
     if backend == "awg":
-        run_cmd("modprobe amneziawg")
+        log.info("Загрузка модуля AmneziaWG")
+        run_cmd("command -v awg")
+        try:
+            run_cmd("modprobe amneziawg")
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Не удалось загрузить модуль AmneziaWG: {e}. "
+                "Проверьте установку amneziawg или перезапустите init с --no-amnezia"
+            )
         wg_bin = "awg"
     else:
-        run_cmd("modprobe wireguard")
+        log.info("Загрузка модуля WireGuard")
+        run_cmd("command -v wg")
+        try:
+            run_cmd("modprobe wireguard")
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Не удалось загрузить модуль WireGuard: {e}"
+            )
         wg_bin = "wg"
 
     # --- Включение IP forward ---
@@ -195,6 +316,12 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 """
     Path(f"/etc/wireguard/{WG_IF}.conf").write_text(conf)
 
+    setconf = f"""[Interface]
+PrivateKey = {priv}
+ListenPort = {WG_BASE_PORT}
+"""
+    Path(f"/etc/wireguard/{WG_IF}.setconf").write_text(setconf)
+
     # --- Поднятие интерфейса ---
     log.info("Запуск интерфейса")
 
@@ -202,13 +329,22 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
         run_cmd("systemctl enable wg-quick@wg0")
         run_cmd("systemctl restart wg-quick@wg0")
     else:
-        run_cmd("ip link add wg0 type wireguard")
-        run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/wg0.conf")
+        try:
+            run_cmd("ip link add wg0 type amneziawg")
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Не удалось создать интерфейс AmneziaWG wg0: {e}. "
+                "Модуль amneziawg загружен, но тип интерфейса amneziawg недоступен"
+            )
+        run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/{WG_IF}.setconf")
         run_cmd(f"ip addr add {SERVER_IP}/24 dev wg0")
         run_cmd("ip link set up dev wg0")
+        run_cmd(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+        run_cmd(f"iptables -A FORWARD -i {WG_IF} -j DROP")        
 
     # --- Проверка ---
     run_cmd("ip link show wg0")
+    run_cmd(f"{wg_bin} show {WG_IF}")
 
     # --- Сохранение правил ---
     run_cmd("netfilter-persistent save")
@@ -217,40 +353,103 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 
 def cmd_status():
     """Быстрая проверка состояния."""
-    log.info("Статус службы: " + run_cmd("systemctl is-active wg-quick@wg0"))
-    log.info("Состояние интерфейса: " + run_cmd("ip -brief link show wg0 || echo 'не найден'"))
+    backend = get_backend()
+    wg_bin = get_wg_cmd()
+
+    log.info(f"Backend: {backend}")
+
+    if backend == "wg":
+        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False).strip()
+        log.info(f"Сервис wg-quick@wg0: {svc or 'unknown'}")
+    elif backend == "awg":
+        log.info("Сервис wg-quick@wg0: не используется для backend awg")
+    else:
+        log.warning(f"Неизвестный backend: {backend}")
+
+    iface = run_cmd("ip -brief link show wg0 || echo 'не найден'", check=False)
+    log.info("Состояние интерфейса: " + iface)
+
+    wg_state = run_cmd(f"{wg_bin} show {WG_IF}", check=False)
+    if wg_state:
+        log.info(f"Состояние backend {backend}: OK")
+    else:
+        log.warning(f"Backend {backend} не вернул состояние интерфейса {WG_IF}")
+
     conn = init_db()
     total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
     active = conn.execute("SELECT count(*) FROM users WHERE blocked=0").fetchone()[0]
     log.info(f"Учётные записи: всего {total}, активных {active}")
+    
 
 def cmd_health():
     """Глубокая диагностика."""
     log.info("=== Глубокая диагностика ===")
     errors = []
 
-    # Проверка наличия WireGuard
+    # Проверка backend
+    backend = None
+    try:
+        backend = get_backend()
+        log.info(f"Backend: {backend}")
+        if backend not in ("wg", "awg"):
+            errors.append(f"Неизвестный backend: {backend}")
+    except Exception as e:
+        errors.append(f"Backend не определён: {e}")
+
+    # Проверка наличия WireGuard / AmneziaWG
     wg_bin = get_wg_cmd(allow_missing=True)
     if not wg_bin:
-        errors.append("WireGuard не установлен (бинарники wg/awg не найдены)")
+        errors.append("Backend-команда не определена: wg/awg недоступен")
     else:
-        log.info(f"Обнаружен бинарник WireGuard: {wg_bin}")
+        bin_path = run_cmd(f"command -v {wg_bin}", check=False)
+        if bin_path:
+            log.info(f"Обнаружен бинарник backend: {wg_bin} ({bin_path})")
+        else:
+            errors.append(f"Бинарник backend не найден: {wg_bin}")
 
     # Проверка интерфейса wg0
     try:
-        run_cmd("ip link show wg0")
+        run_cmd(f"ip link show {WG_IF}")
     except RuntimeError:
-        errors.append("Интерфейс wg0 не поднят или отсутствует")
+        errors.append(f"Интерфейс {WG_IF} не поднят или отсутствует")
 
-    # Проверка порта (только если wg есть смысл ожидать)
-    port_open = run_cmd("ss -ulnH | grep :51820", check=False)
+    # Проверка, что backend может читать состояние интерфейса
+    if wg_bin:
+        try:
+            run_cmd(f"{wg_bin} show {WG_IF}")
+            log.info(f"Backend {backend or '?'} читает состояние интерфейса {WG_IF}")
+        except RuntimeError:
+            errors.append(f"Backend {backend or '?'} не может прочитать состояние интерфейса {WG_IF}")
+
+    # Проверка порта
+    port_open = run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False)
     if not port_open:
-        errors.append("Порт 51820/UDP не слушается")
+        errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
 
-    # Проверка iptables (базовое правило DROP)
-    try:
-        run_cmd("iptables -L FORWARD -n | grep DROP")
-    except RuntimeError:
+    # Проверка iptables: базовое разрешение VPN-клиентам общаться между собой
+    base_accept = run_cmd(
+        f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT 2>/dev/null",
+        check=False
+    )
+    if base_accept is None:
+        pass
+
+    accept_check = subprocess.run(
+        f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    if accept_check.returncode != 0:
+        errors.append("Базовое правило ACCEPT для FORWARD между VPN-клиентами отсутствует")
+
+    drop_check = subprocess.run(
+        f"iptables -C FORWARD -i {WG_IF} -j DROP",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    if drop_check.returncode != 0:
         errors.append("Базовое правило DROP для FORWARD отсутствует")
 
     # Проверка IP forward
@@ -262,9 +461,12 @@ def cmd_health():
         errors.append("Не удалось проверить net.ipv4.ip_forward")
 
     # Проверка systemd сервиса
-    svc = run_cmd("systemctl is-active wg-quick@wg0", check=False)
-    if svc.strip() != "active":
-        errors.append(f"Сервис wg-quick@wg0 не активен (сейчас: {svc.strip() or 'unknown'})")
+    if backend == "wg":
+        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False)
+        if svc.strip() != "active":
+            errors.append(f"Сервис wg-quick@wg0 не активен (сейчас: {svc.strip() or 'unknown'})")
+    elif backend == "awg":
+        log.info("Сервис wg-quick@wg0: не требуется для backend awg")
 
     # Проверка базы данных
     try:
@@ -445,10 +647,15 @@ def cmd_list():
         log.info(f"{r[0]:<15} {r[1]:<12} {'ДА' if r[2] else 'НЕТ':<6} {'ДА' if r[3] else 'НЕТ':<6} {status:<10} {r[5]}")
 
 def main():
+    
     if len(sys.argv) == 1:
-        print("Краткая справка: vsrv-admin.py {init|status|health|sync|add|edit|block|delete|list|help} [--version]")
+        print_intro()
+        print("Краткая справка: vsrv-admin.py {init|status|health|sync|add|edit|block|delete|list|remove|purge|help} [--version]")
         sys.exit(0)
-
+        
+    if "--version" not in sys.argv:
+        print_intro()
+        
     parser = argparse.ArgumentParser(description="Серверное управление VPN-сетью", add_help=False)
     subparsers = parser.add_subparsers(dest="command")
 
@@ -456,6 +663,12 @@ def main():
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика системы")
     subparsers.add_parser("sync", help="Пересборка состояния из базы данных")
+    
+    p_remove = subparsers.add_parser("remove", help="Удаление VPN runtime и пакетов без удаления данных")
+    p_remove.add_argument("confirm", help="Для подтверждения введите REMOVE")
+
+    p_purge = subparsers.add_parser("purge", help="Полное удаление LanFabric с сервера")
+    p_purge.add_argument("confirm", help="Для подтверждения введите PURGE")
     
     p_add = subparsers.add_parser("add", help="Создание учётной записи")
     p_add.add_argument("name", help="Имя пользователя")
@@ -505,6 +718,10 @@ def main():
             cmd_delete(args)
         elif args.command == "list":
             cmd_list()
+        elif args.command == "remove":
+            cmd_remove(args)
+        elif args.command == "purge":
+            cmd_purge(args)
     except Exception as e:
         log.error(str(e))
         sys.exit(1)
