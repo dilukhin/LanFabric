@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 
 import sys
 import os
@@ -33,18 +33,20 @@ for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 log = logging.getLogger("vsrv")
 
+def get_backend():
+    path = "/opt/vpn-admin/backend"
+    if not os.path.exists(path):
+        raise RuntimeError("Backend не определён. Выполните init")
+    return open(path).read().strip()
+
 def get_wg_cmd(allow_missing=False):
-    """Определяет используемый бинарный файл wireguard. По умолчанию amneziawg (awg)."""
-    if os.path.exists("/usr/bin/awg"):
-        return "awg"
-    if os.path.exists("/usr/bin/wg"):
-        return "wg"
-    if allow_missing:
-        return None        
-    raise RuntimeError(
-        "WireGuard не установлен (бинарники wg/awg не найдены). "
-        "Выполните init или проверьте установку пакетов."
-    )
+    try:
+        backend = get_backend()
+        return "awg" if backend == "awg" else "wg"
+    except Exception:
+        if allow_missing:
+            return None
+        raise
 
 def run_cmd(cmd, check=True):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -97,53 +99,66 @@ def cmd_init(args):
     log.info("Начало инициализации сервера")
     ensure_dirs()
 
-    # Выбор WG бинарника и пакета с автоматическим откатом
-    wg_bin = "wireguard"
-    pkg_name = "wireguard"
+    # --- Очистка предыдущего состояния ---
+    log.info("Очистка предыдущего состояния VPN (если есть)")
 
-    repo_added = False
-    key_added = False
+    run_cmd("systemctl disable --now wg-quick@wg0 2>/dev/null || true", check=False)
+    run_cmd("ip link del wg0 2>/dev/null || true", check=False)
 
-    if not args.no_amnezia:
-        log.info("Попытка установки AmneziaWG через PPA")
-        try:
-            run_cmd("apt-get update -qq")
-            run_cmd("apt-get install -y software-properties-common gnupg2")
+    run_cmd("iptables -D FORWARD -i wg0 -o wg0 -j ACCEPT 2>/dev/null || true", check=False)
+    run_cmd("iptables -D FORWARD -i wg0 -j DROP 2>/dev/null || true", check=False)
+    run_cmd("iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true", check=False)
 
-            run_cmd("add-apt-repository -y ppa:amnezia/ppa")
-            repo_added = True
+    run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
+    run_cmd("rm -f /etc/wireguard/wg0.private /etc/wireguard/wg0.public", check=False)
 
-            run_cmd("apt-get update -qq")
-            run_cmd("apt-get install -y amneziawg")
+    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
+    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
 
-            wg_bin = "awg"
-            pkg_name = "amneziawg"
-            log.info("AmneziaWG установлен успешно")
+    run_cmd("rm -f /opt/vpn-admin/backend", check=False)
 
-        except RuntimeError as e:
-            log.error(f"AmneziaWG недоступен ({e})")
-
-            # очистка
-            if repo_added:
-                run_cmd("rm -f /etc/apt/sources.list.d/amnezia-ubuntu-ppa*.list || true", check=False)
-                run_cmd("apt-get update -qq", check=False)
-
-            raise RuntimeError(
-                "AmneziaWG недоступен. Для продолжения со стандартным WireGuard "
-                "перезапустите с флагом --no-amnezia"
-            )
-
-    # Установка пакетов
-    log.info("Обновление списка пакетов и установка зависимостей")
+    # --- Установка пакетов ---
+    log.info("Обновление списка пакетов")
     run_cmd("apt-get update -qq")
 
-    if args.no_amnezia:
-        log.info("Установка стандартного WireGuard...")
-        run_cmd("DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard")
+    backend = None
 
+    if args.no_amnezia:
+        log.info("Установка стандартного WireGuard")
+        run_cmd("DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard")
+        backend = "wg"
+    else:
+        log.info("Попытка установки AmneziaWG")
+        try:
+            run_cmd("apt-get install -y software-properties-common gnupg2")
+            run_cmd("add-apt-repository -y ppa:amnezia/ppa")
+            run_cmd("apt-get update -qq")
+            run_cmd("apt-get install -y amneziawg")
+            backend = "awg"
+        except RuntimeError as e:
+            run_cmd("rm -f /etc/apt/sources.list.d/amnezia-ubuntu-ppa*.list || true", check=False)
+            run_cmd("apt-get update -qq", check=False)
+            raise RuntimeError(
+                f"AmneziaWG недоступен ({e}). Перезапустите с --no-amnezia"
+            )
+
+    # Общие зависимости
     run_cmd("DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent")
-    # Включение IP-форвардинга
-    log.info("Включение IPv4 forward")
+
+    log.info(f"Выбран backend: {backend}")
+
+    with open("/opt/vpn-admin/backend", "w") as f:
+        f.write(backend)
+
+    # --- Загрузка модуля ---
+    if backend == "awg":
+        run_cmd("modprobe amneziawg")
+        wg_bin = "awg"
+    else:
+        run_cmd("modprobe wireguard")
+        wg_bin = "wg"
+
+    # --- Включение IP forward ---
     current = run_cmd("sysctl -n net.ipv4.ip_forward", check=False)
     if current.strip() != "1":
         log.info("Включение IPv4 forward")
@@ -154,22 +169,25 @@ def cmd_init(args):
         with open(conf_path, "w") as f:
             f.write("net.ipv4.ip_forward=1\n")
 
-    # Генерация ключей сервера
+    # --- Генерация ключей ---
     log.info("Генерация ключей сервера")
+
     priv_path = "/etc/wireguard/wg0.private"
     pub_path = "/etc/wireguard/wg0.public"
-    if not os.path.exists(priv_path):
-        priv = run_cmd(f"{wg_bin} genkey")
-        with open(priv_path, "w") as f:
-            f.write(priv)
-    server_pub = run_cmd(f"{wg_bin} pubkey < {priv_path}").strip()
+
+    priv = run_cmd(f"{wg_bin} genkey")
+    with open(priv_path, "w") as f:
+        f.write(priv)
+
+    server_pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey").strip()
     with open(pub_path, "w") as f:
         f.write(server_pub)
 
-    # Создание базового конфига
+    # --- Конфигурация ---
     log.info("Создание конфигурации интерфейса")
+
     conf = f"""[Interface]
-PrivateKey = {open(priv_path).read().strip()}
+PrivateKey = {priv}
 Address = {SERVER_IP}/24
 ListenPort = {WG_BASE_PORT}
 PostUp = iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -A FORWARD -i {WG_IF} -j DROP
@@ -177,13 +195,24 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 """
     Path(f"/etc/wireguard/{WG_IF}.conf").write_text(conf)
 
-    # Запуск службы
-    log.info("Активация и запуск wg-quick@wg0.service")
-    run_cmd("systemctl enable wg-quick@wg0")
-    run_cmd("systemctl restart wg-quick@wg0")
+    # --- Поднятие интерфейса ---
+    log.info("Запуск интерфейса")
 
-    # Сохранение правил
+    if backend == "wg":
+        run_cmd("systemctl enable wg-quick@wg0")
+        run_cmd("systemctl restart wg-quick@wg0")
+    else:
+        run_cmd("ip link add wg0 type wireguard")
+        run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/wg0.conf")
+        run_cmd(f"ip addr add {SERVER_IP}/24 dev wg0")
+        run_cmd("ip link set up dev wg0")
+
+    # --- Проверка ---
+    run_cmd("ip link show wg0")
+
+    # --- Сохранение правил ---
     run_cmd("netfilter-persistent save")
+
     log.info("Инициализация завершена. Интерфейс поднят, правила сохранены.")
 
 def cmd_status():
