@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.5"
+__version__ = "0.0.7"
 
 import sys
 import os
@@ -55,6 +55,13 @@ def get_wg_cmd(allow_missing=False):
             return None
         raise
 
+def require_backend():
+    """Возвращает сохранённый backend и проверяет его допустимость."""
+    backend = get_backend()
+    if backend not in ("wg", "awg"):
+        raise RuntimeError(f"Неизвестный backend: {backend}")
+    return backend
+
 def run_cmd(cmd, check=True):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -62,6 +69,109 @@ def run_cmd(cmd, check=True):
             f"Ошибка выполнения '{cmd}': {result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout.strip()
+
+def ensure_iptables_rule(rule):
+    """Добавляет правило iptables, если оно ещё не существует."""
+    check_rule = rule.replace(" -A ", " -C ", 1)
+    add_rule = rule
+    res = subprocess.run(check_rule, shell=True, capture_output=True, text=True)
+    if res.returncode != 0:
+        run_cmd(add_rule)
+
+def delete_iptables_rule(rule):
+    """Удаляет правило iptables, если оно существует."""
+    delete_rule = rule.replace(" -A ", " -D ", 1)
+    run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
+
+def cleanup_firewall_rules():
+    """Удаляет базовые и пользовательские правила LanFabric."""
+    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
+    delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {VPN_NET} -j MASQUERADE")
+
+    if os.path.exists(DB_PATH):
+        try:
+            conn = init_db()
+            rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
+            for row in rows:
+                ip = row[0]
+                delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+                delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+        except Exception as e:
+            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
+
+def ensure_base_firewall_rules():
+    """Восстанавливает базовые правила LanFabric."""
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
+
+def cmd_stop():
+    """Останавливает VPN runtime без удаления пакетов и данных."""
+    backend = require_backend()
+    log.info(f"Остановка VPN runtime. Backend: {backend}")
+
+    if backend == "wg":
+        run_cmd(f"systemctl stop wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+    else:
+        run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+
+    cleanup_firewall_rules()
+    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+    log.info("VPN runtime остановлен")
+
+def cmd_start():
+    """Запускает VPN runtime по сохранённому backend без полного init."""
+    backend = require_backend()
+    wg_bin = get_wg_cmd()
+    log.info(f"Запуск VPN runtime. Backend: {backend}")
+
+    if backend == "wg":
+        run_cmd(f"systemctl enable wg-quick@{WG_IF}")
+        run_cmd(f"systemctl restart wg-quick@{WG_IF}")
+    else:
+        setconf_path = f"/etc/wireguard/{WG_IF}.setconf"
+        if not os.path.exists(setconf_path):
+            raise RuntimeError(f"Файл конфигурации backend отсутствует: {setconf_path}. Выполните init")
+
+        run_cmd("command -v awg")
+        run_cmd("modprobe amneziawg")
+
+        iface_exists = subprocess.run(
+            f"ip link show {WG_IF}",
+            shell=True,
+            capture_output=True,
+            text=True
+        ).returncode == 0
+        if iface_exists:
+            backend_ok = subprocess.run(
+                f"{wg_bin} show {WG_IF}",
+                shell=True,
+                capture_output=True,
+                text=True
+            ).returncode == 0
+            if not backend_ok:
+                log.warning(f"Интерфейс {WG_IF} существует, но backend {backend} не может его прочитать. Пересоздание интерфейса")
+                run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+                iface_exists = False
+
+        if not iface_exists:
+            run_cmd(f"ip link add {WG_IF} type amneziawg")
+            run_cmd(f"{wg_bin} setconf {WG_IF} {setconf_path}")
+            run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
+
+        run_cmd(f"ip link set up dev {WG_IF}")
+        ensure_base_firewall_rules()
+
+    run_cmd(f"ip link show {WG_IF}")
+    run_cmd(f"{wg_bin} show {WG_IF}")
+    cmd_sync()
+    log.info("VPN runtime запущен")
+
+def cmd_restart():
+    """Перезапускает VPN runtime без полного init."""
+    log.info("Перезапуск VPN runtime")
+    cmd_stop()
+    cmd_start()
 
 def cleanup_runtime():
     """Останавливает VPN и удаляет runtime-состояние без удаления данных."""
@@ -73,23 +183,8 @@ def cleanup_runtime():
     # Интерфейс
     run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
 
-    # Базовые правила LanFabric
-    run_cmd(f"iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT 2>/dev/null || true", check=False)
-    run_cmd(f"iptables -D FORWARD -i {WG_IF} -j DROP 2>/dev/null || true", check=False)
-    run_cmd(f"iptables -t nat -D POSTROUTING -s {VPN_NET} -j MASQUERADE 2>/dev/null || true", check=False)
-
-    # Динамические правила клиентов из БД
-    if os.path.exists(DB_PATH):
-        try:
-            conn = init_db()
-            rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-            for row in rows:
-                ip = row[0]
-                run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT 2>/dev/null || true", check=False)
-                run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE 2>/dev/null || true", check=False)
-        except Exception as e:
-            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
-
+    # Правила LanFabric
+    cleanup_firewall_rules()
     run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
 
     # Модули
@@ -339,8 +434,7 @@ ListenPort = {WG_BASE_PORT}
         run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/{WG_IF}.setconf")
         run_cmd(f"ip addr add {SERVER_IP}/24 dev wg0")
         run_cmd("ip link set up dev wg0")
-        run_cmd(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-        run_cmd(f"iptables -A FORWARD -i {WG_IF} -j DROP")        
+        ensure_base_firewall_rules()        
 
     # --- Проверка ---
     run_cmd("ip link show wg0")
@@ -358,13 +452,51 @@ def cmd_status():
 
     log.info(f"Backend: {backend}")
 
+    state = "UNKNOWN"
+
     if backend == "wg":
         svc = run_cmd("systemctl is-active wg-quick@wg0", check=False).strip()
         log.info(f"Сервис wg-quick@wg0: {svc or 'unknown'}")
+
+        if svc == "active":
+            state = "RUNNING"
+        else:
+            state = "STOPPED"
+
     elif backend == "awg":
         log.info("Сервис wg-quick@wg0: не используется для backend awg")
+
+        iface_exists = False
+        backend_ok = False
+
+        iface_check = subprocess.run(
+            f"ip link show {WG_IF}",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if iface_check.returncode == 0:
+            iface_exists = True
+
+        backend_check = subprocess.run(
+            f"{wg_bin} show {WG_IF}",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if backend_check.returncode == 0:
+            backend_ok = True
+
+        if not iface_exists:
+            state = "STOPPED"
+        elif iface_exists and backend_ok:
+            state = "RUNNING"
+        else:
+            state = "BROKEN"
+
     else:
         log.warning(f"Неизвестный backend: {backend}")
+        state = "BROKEN"
 
     iface = run_cmd("ip -brief link show wg0 || echo 'не найден'", check=False)
     log.info("Состояние интерфейса: " + iface)
@@ -375,16 +507,23 @@ def cmd_status():
     else:
         log.warning(f"Backend {backend} не вернул состояние интерфейса {WG_IF}")
 
+    log.info(f"Состояние VPN: {state}")
+
+    if state == "STOPPED":
+        log.info("Рекомендация: выполните команду start для запуска VPN")
+    elif state == "BROKEN":
+        log.warning("Рекомендация: выполните health для подробной диагностики, затем restart или init при необходимости")
+
     conn = init_db()
     total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
     active = conn.execute("SELECT count(*) FROM users WHERE blocked=0").fetchone()[0]
-    log.info(f"Учётные записи: всего {total}, активных {active}")
-    
+    log.info(f"Учётные записи: всего {total}, активных {active}")    
 
 def cmd_health():
     """Глубокая диагностика."""
     log.info("=== Глубокая диагностика ===")
     errors = []
+    advices = []
 
     # Проверка backend
     backend = None
@@ -393,47 +532,61 @@ def cmd_health():
         log.info(f"Backend: {backend}")
         if backend not in ("wg", "awg"):
             errors.append(f"Неизвестный backend: {backend}")
+            advices.append("Исправьте /opt/vpn-admin/backend или выполните init заново с явным выбором backend")
     except Exception as e:
         errors.append(f"Backend не определён: {e}")
+        advices.append("Выполните init, чтобы явно выбрать backend и создать /opt/vpn-admin/backend")
 
     # Проверка наличия WireGuard / AmneziaWG
     wg_bin = get_wg_cmd(allow_missing=True)
     if not wg_bin:
         errors.append("Backend-команда не определена: wg/awg недоступен")
+        advices.append("Проверьте backend-файл. Backend не должен угадываться по бинарникам")
     else:
         bin_path = run_cmd(f"command -v {wg_bin}", check=False)
         if bin_path:
             log.info(f"Обнаружен бинарник backend: {wg_bin} ({bin_path})")
         else:
             errors.append(f"Бинарник backend не найден: {wg_bin}")
+            if backend == "awg":
+                advices.append("AmneziaWG не установлен или удалён. Если это штатное удаление — выполните init; если нужен WireGuard — выполните init --no-amnezia")
+            elif backend == "wg":
+                advices.append("WireGuard не установлен или удалён. Выполните init --no-amnezia")
 
     # Проверка интерфейса wg0
+    iface_ok = True
     try:
         run_cmd(f"ip link show {WG_IF}")
     except RuntimeError:
+        iface_ok = False
         errors.append(f"Интерфейс {WG_IF} не поднят или отсутствует")
+        if backend == "awg":
+            advices.append("Похоже, runtime AmneziaWG потерян после остановки VPS. Выполните start, полный init не требуется")
+        elif backend == "wg":
+            advices.append("Выполните start или проверьте systemd-сервис wg-quick@wg0")
 
     # Проверка, что backend может читать состояние интерфейса
+    backend_show_ok = True
     if wg_bin:
         try:
             run_cmd(f"{wg_bin} show {WG_IF}")
             log.info(f"Backend {backend or '?'} читает состояние интерфейса {WG_IF}")
         except RuntimeError:
+            backend_show_ok = False
             errors.append(f"Backend {backend or '?'} не может прочитать состояние интерфейса {WG_IF}")
+            if iface_ok:
+                advices.append("Интерфейс существует, но не соответствует выбранному backend. Выполните restart; если ошибка повторится — проверьте тип интерфейса")
 
     # Проверка порта
     port_open = run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False)
     if not port_open:
         errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
+        if backend == "awg" and (not iface_ok or not backend_show_ok):
+            advices.append("После start порт должен появиться автоматически. Если нет — проверьте awg show wg0")
+        elif backend == "wg":
+            advices.append("Проверьте wg-quick@wg0 через status или выполните restart")
 
     # Проверка iptables: базовое разрешение VPN-клиентам общаться между собой
-    base_accept = run_cmd(
-        f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT 2>/dev/null",
-        check=False
-    )
-    if base_accept is None:
-        pass
-
     accept_check = subprocess.run(
         f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT",
         shell=True,
@@ -442,6 +595,7 @@ def cmd_health():
     )
     if accept_check.returncode != 0:
         errors.append("Базовое правило ACCEPT для FORWARD между VPN-клиентами отсутствует")
+        advices.append("Выполните start или restart для восстановления базовых iptables-правил")
 
     drop_check = subprocess.run(
         f"iptables -C FORWARD -i {WG_IF} -j DROP",
@@ -451,20 +605,24 @@ def cmd_health():
     )
     if drop_check.returncode != 0:
         errors.append("Базовое правило DROP для FORWARD отсутствует")
+        advices.append("Выполните start или restart для восстановления изоляции клиентов от интернета по умолчанию")
 
     # Проверка IP forward
     try:
         ipf = run_cmd("sysctl -n net.ipv4.ip_forward", check=False)
         if ipf.strip() != "1":
             errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
+            advices.append("Включите net.ipv4.ip_forward или выполните init, если sysctl-конфигурация потеряна")
     except Exception:
         errors.append("Не удалось проверить net.ipv4.ip_forward")
+        advices.append("Проверьте доступность sysctl на сервере")
 
     # Проверка systemd сервиса
     if backend == "wg":
         svc = run_cmd("systemctl is-active wg-quick@wg0", check=False)
         if svc.strip() != "active":
             errors.append(f"Сервис wg-quick@wg0 не активен (сейчас: {svc.strip() or 'unknown'})")
+            advices.append("Выполните start или restart. Для WireGuard используется wg-quick@wg0")
     elif backend == "awg":
         log.info("Сервис wg-quick@wg0: не требуется для backend awg")
 
@@ -475,12 +633,17 @@ def cmd_health():
         log.info(f"База данных: пользователей {total}")
     except Exception as e:
         errors.append(f"Ошибка базы данных: {e}")
+        advices.append("Проверьте /opt/vpn-admin/vpn.db. Если БД потеряна, потребуется восстановление из резервной копии или новый init")
 
     # Итог
     if errors:
         log.warning("Обнаружены проблемы:")
         for err in errors:
             log.warning(f"- {err}")
+        if advices:
+            log.info("Рекомендации:")
+            for advice in dict.fromkeys(advices):
+                log.info(f"- {advice}")
     else:
         log.info("Система работает штатно, нарушений не выявлено")
 
@@ -496,9 +659,12 @@ def cmd_sync():
             run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
 
     conn = init_db()
-    # Очистка динамических правил (базовые оставляем)
-    run_cmd("iptables -D FORWARD -i wg0 -s 10.8.0.0/24 -j ACCEPT 2>/dev/null || true")
-    run_cmd("iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true")
+    # Очистка динамических правил клиентов (базовые оставляем)
+    rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
+    for row in rows_all:
+        ip = row[0]
+        delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+        delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
     
     # Восстановление пиров и правил
     rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
@@ -507,8 +673,8 @@ def cmd_sync():
         allowed = f"{ip}/32"
         run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
         if internet:
-            run_cmd(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-            run_cmd(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+            ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+            ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
     run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
 
@@ -536,8 +702,8 @@ def cmd_add(args):
     if not blocked_val:
         run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
         if internet_val:
-            run_cmd(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-            run_cmd(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+            ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+            ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
             run_cmd("netfilter-persistent save")
             
     server_pub = open("/etc/wireguard/wg0.public").read().strip()
@@ -650,7 +816,7 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vsrv-admin.py {init|status|health|sync|add|edit|block|delete|list|remove|purge|help} [--version]")
+        print("Краткая справка: vsrv-admin.py {init|start|stop|restart|status|health|sync|add|edit|block|delete|list|remove|purge|help} [--version]")
         sys.exit(0)
         
     if "--version" not in sys.argv:
@@ -660,6 +826,9 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("init", help="Инициализация сервера и установка пакетов").add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
+    subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
+    subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика системы")
     subparsers.add_parser("sync", help="Пересборка состояния из базы данных")
@@ -702,6 +871,12 @@ def main():
     try:
         if args.command == "init":
             cmd_init(args)
+        elif args.command == "start":
+            cmd_start()
+        elif args.command == "stop":
+            cmd_stop()
+        elif args.command == "restart":
+            cmd_restart()
         elif args.command == "status":
             cmd_status()
         elif args.command == "health":

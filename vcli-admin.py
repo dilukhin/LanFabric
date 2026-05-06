@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.5"
+__version__ = "0.0.7"
 
 import sys
 import os
@@ -248,7 +248,7 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vcli-admin.py {init|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
+        print("Краткая справка: vcli-admin.py {init|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
         sys.exit(0)
         
     if "--version" not in sys.argv:
@@ -295,6 +295,9 @@ def main():
     p_del.add_argument("name", help="Имя учётки")
     p_del.add_argument("confirm", help="Введите имя учётки для подтверждения удаления")
 
+    subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
+    subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
+    subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
     subparsers.add_parser("list", help="Список учётных записей")
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика")
