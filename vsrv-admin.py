@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 import sys
 import os
@@ -118,6 +118,7 @@ def cmd_stop():
     cleanup_firewall_rules()
     run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
     log.info("VPN runtime остановлен")
+    log.info("Рекомендация: для повторного запуска выполните start, для проверки состояния — status или health")
 
 def cmd_start():
     """Запускает VPN runtime по сохранённому backend без полного init."""
@@ -166,6 +167,7 @@ def cmd_start():
     run_cmd(f"{wg_bin} show {WG_IF}")
     cmd_sync()
     log.info("VPN runtime запущен")
+    log.info("Рекомендация: выполните status или health. Для подключения клиента скачайте конфиг командой config <имя>")
 
 def cmd_restart():
     """Перезапускает VPN runtime без полного init."""
@@ -235,6 +237,7 @@ def cmd_remove(args):
     remove_packages(purge=False)
 
     log.info("Remove завершён. Данные /opt/vpn-admin и /etc/wireguard сохранены.")
+    log.info("Рекомендация: для повторного развёртывания выполните init. Для полного удаления используйте purge PURGE")
 
 
 def cmd_purge(args):
@@ -256,6 +259,7 @@ def cmd_purge(args):
     log.info("Удаление каталога LanFabric. Серверный скрипт будет удалён вместе с каталогом.")
     run_cmd(f"rm -rf {REMOTE_DIR} 2>/dev/null || true", check=False)
     print("Purge завершён. LanFabric полностью удалён с сервера.")
+    print("Рекомендация: для новой установки заново выполните init с клиента")
 
 def init_db():
     """Создаёт или подключается к SQLite базе."""
@@ -444,6 +448,7 @@ ListenPort = {WG_BASE_PORT}
     run_cmd("netfilter-persistent save")
 
     log.info("Инициализация завершена. Интерфейс поднят, правила сохранены.")
+    log.info("Рекомендация: выполните add <имя> для создания пользователя или health для проверки системы")
 
 def cmd_status():
     """Быстрая проверка состояния."""
@@ -457,43 +462,28 @@ def cmd_status():
     if backend == "wg":
         svc = run_cmd("systemctl is-active wg-quick@wg0", check=False).strip()
         log.info(f"Сервис wg-quick@wg0: {svc or 'unknown'}")
-
-        if svc == "active":
-            state = "RUNNING"
-        else:
-            state = "STOPPED"
-
+        state = "RUNNING" if svc == "active" else "STOPPED"
     elif backend == "awg":
         log.info("Сервис wg-quick@wg0: не используется для backend awg")
-
-        iface_exists = False
-        backend_ok = False
-
-        iface_check = subprocess.run(
+        iface_exists = subprocess.run(
             f"ip link show {WG_IF}",
             shell=True,
             capture_output=True,
             text=True
-        )
-        if iface_check.returncode == 0:
-            iface_exists = True
-
-        backend_check = subprocess.run(
+        ).returncode == 0
+        backend_ok = subprocess.run(
             f"{wg_bin} show {WG_IF}",
             shell=True,
             capture_output=True,
             text=True
-        )
-        if backend_check.returncode == 0:
-            backend_ok = True
+        ).returncode == 0
 
         if not iface_exists:
             state = "STOPPED"
-        elif iface_exists and backend_ok:
+        elif backend_ok:
             state = "RUNNING"
         else:
             state = "BROKEN"
-
     else:
         log.warning(f"Неизвестный backend: {backend}")
         state = "BROKEN"
@@ -508,16 +498,17 @@ def cmd_status():
         log.warning(f"Backend {backend} не вернул состояние интерфейса {WG_IF}")
 
     log.info(f"Состояние VPN: {state}")
-
-    if state == "STOPPED":
-        log.info("Рекомендация: выполните команду start для запуска VPN")
+    if state == "RUNNING":
+        log.info("Рекомендация: можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
+    elif state == "STOPPED":
+        log.info("Рекомендация: выполните start для запуска VPN runtime")
     elif state == "BROKEN":
         log.warning("Рекомендация: выполните health для подробной диагностики, затем restart или init при необходимости")
 
     conn = init_db()
     total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
     active = conn.execute("SELECT count(*) FROM users WHERE blocked=0").fetchone()[0]
-    log.info(f"Учётные записи: всего {total}, активных {active}")    
+    log.info(f"Учётные записи: всего {total}, активных {active}")
 
 def cmd_health():
     """Глубокая диагностика."""
@@ -677,6 +668,41 @@ def cmd_sync():
             ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
     run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
+    log.info("Рекомендация: выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
+
+def build_client_config(row):
+    """Формирует клиентский конфиг из данных БД."""
+    server_pub = open(f"/etc/wireguard/{WG_IF}.public").read().strip()
+    server_ip = run_cmd("hostname -I | awk '{print $1}'").strip()
+    allowed_ips = "0.0.0.0/0" if row["internet"] else VPN_NET
+
+    return f"""[Interface]
+PrivateKey = {row["privkey"]}
+Address = {row["ip"]}/32
+DNS = 8.8.8.8
+
+[Peer]
+PublicKey = {server_pub}
+Endpoint = {server_ip}:{WG_BASE_PORT}
+AllowedIPs = {allowed_ips}
+PersistentKeepalive = 25
+"""
+
+def write_client_config(row):
+    """Сохраняет клиентский конфиг на сервере."""
+    cfg_path = Path(f"{CONF_DIR}/{row['name']}.conf")
+    cfg_path.write_text(build_client_config(row))
+    cfg_path.chmod(0o600)
+    return cfg_path
+
+def cmd_config(args):
+    """Выводит клиентский конфиг в stdout для безопасного скачивания через sudo."""
+    conn = init_db()
+    row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
+    if not row:
+        raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
+
+    sys.stdout.write(build_client_config(row))
 
 def cmd_add(args):
     """Добавление учётной записи."""
@@ -706,26 +732,15 @@ def cmd_add(args):
             ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
             run_cmd("netfilter-persistent save")
             
-    server_pub = open("/etc/wireguard/wg0.public").read().strip()
-    server_ip = run_cmd("hostname -I | awk '{print $1}'").strip()
-    
-    cfg_path = Path(f"{CONF_DIR}/{args.name}.conf")
-    cfg_content = f"""[Interface]
-PrivateKey = {priv}
-Address = {ip}/32
-DNS = 8.8.8.8
-
-[Peer]
-PublicKey = {server_pub}
-Endpoint = {server_ip}:{WG_BASE_PORT}
-AllowedIPs = {VPN_NET}
-PersistentKeepalive = 25
-"""
-    cfg_path.write_text(cfg_content)
-    cfg_path.chmod(0o600)
+    row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
+    cfg_path = write_client_config(row)
     
     log.info(f"Учётная запись '{args.name}' создана. IP: {ip}, Админ: {bool(admin_val)}, Интернет: {bool(internet_val)}")
     log.info(f"Конфиг сохранён: {cfg_path}")
+    if internet_val:
+        log.info("Рекомендация: скачайте конфиг командой config и импортируйте его в клиент. Интернет-трафик будет направлен через VPN")
+    else:
+        log.info("Рекомендация: скачайте конфиг командой config. По умолчанию будет доступна только VPN-сеть")
 
 def cmd_edit(args):
     """Редактирование учётной записи."""
@@ -752,7 +767,8 @@ def cmd_edit(args):
     params.append(args.name)
     conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE name=?", params)
     conn.commit()
-    log.info("Параметры учётной записи обновлены. Требуется перезапуск или синхронизация для применения сетевых правил.")
+    log.info("Параметры учётной записи обновлены")
+    log.info("Рекомендация: выполните sync для применения сетевых правил. Если менялся интернет-доступ, заново скачайте config <имя>")
 
 def cmd_block(args):
     """Блокировка учётной записи."""
@@ -772,6 +788,7 @@ def cmd_block(args):
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
     log.info(f"Учётная запись '{args.name}' заблокирована. Соединение разорвано.")
+    log.info("Рекомендация: выполните list для проверки статуса или sync для полной пересборки runtime-правил")
 
 def cmd_delete(args):
     """Удаление учётной записи с подтверждением."""
@@ -798,6 +815,7 @@ def cmd_delete(args):
         cfg.unlink()
         
     log.info(f"Учётная запись '{args.name}' полностью удалена.")
+    log.info("Рекомендация: выполните list для проверки списка пользователей")
 
 def cmd_list():
     """Список учётных записей."""
@@ -816,10 +834,10 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vsrv-admin.py {init|start|stop|restart|status|health|sync|add|edit|block|delete|list|remove|purge|help} [--version]")
+        print("Краткая справка: vsrv-admin.py {init|start|stop|restart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
         sys.exit(0)
         
-    if "--version" not in sys.argv:
+    if "--version" not in sys.argv and (len(sys.argv) < 2 or sys.argv[1] != "config"):
         print_intro()
         
     parser = argparse.ArgumentParser(description="Серверное управление VPN-сетью", add_help=False)
@@ -859,6 +877,9 @@ def main():
     p_del.add_argument("name", help="Имя учётки")
     p_del.add_argument("confirm", help="Введите имя учётки для подтверждения удаления")
     
+    p_cfg = subparsers.add_parser("config", help="Вывод клиентского .conf в stdout")
+    p_cfg.add_argument("name", help="Имя учётной записи")
+
     subparsers.add_parser("list", help="Вывод списка учётных записей")
     subparsers.add_parser("help", help="Подробная справка")
     parser.add_argument("--version", action="version", version=f"vsrv-admin {__version__}")
@@ -893,6 +914,8 @@ def main():
             cmd_delete(args)
         elif args.command == "list":
             cmd_list()
+        elif args.command == "config":
+            cmd_config(args)
         elif args.command == "remove":
             cmd_remove(args)
         elif args.command == "purge":

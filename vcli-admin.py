@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 import sys
 import os
@@ -28,7 +28,7 @@ def print_intro():
     """Выводит краткую информацию о клиентском инструменте."""
     print(f"LanFabric CLI v{__version__} — клиент управления VPN")
     
-def build_ssh_cmd(args, use_tty=False):
+def build_ssh_cmd(args, use_tty=False, force_no_debug=False):
     """Формирует базовый список аргументов для SSH."""
     base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"]
     if use_tty or getattr(args, "ssh_tty", False):
@@ -38,14 +38,14 @@ def build_ssh_cmd(args, use_tty=False):
         if not os.path.isfile(key_path):
             raise RuntimeError(f"Файл ключа не найден: {key_path}")
         base.extend(["-i", key_path])
-    if args.debug:
+    if args.debug and not force_no_debug:
         base.append("-v")
     base.append(f"{args.user}@{args.host}")
     return base
 
-def exec_remote(args, remote_cmd_list, use_tty=False):
-    """Выполняет команду на удалённом сервере с потоковым выводом."""
-    ssh_cmd = build_ssh_cmd(args, use_tty)
+def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_no_debug=False):
+    """Выполняет команду на удалённом сервере с потоковым выводом или захватом stdout."""
+    ssh_cmd = build_ssh_cmd(args, use_tty, force_no_debug=force_no_debug)
     safe_remote_cmd = " ".join(shlex.quote(str(c)) for c in remote_cmd_list)
     ssh_cmd.append(safe_remote_cmd)
 
@@ -75,7 +75,8 @@ def exec_remote(args, remote_cmd_list, use_tty=False):
     for line in iter(process.stdout.readline, ''):
         line = line.rstrip()
         if line:
-            print(line)          # сразу в консоль
+            if stream_output:
+                print(line)          # сразу в консоль
             output_lines.append(line)
 
     process.stdout.close()
@@ -180,25 +181,28 @@ def cmd_remove(args):
     remote_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, args.command, args.confirm]
 
     log.info(f"Выполнение на сервере: {' '.join(shlex.quote(c) for c in remote_cmd)}")
-    out = exec_remote(args, remote_cmd)
-    if out:
-        print(out)
+    exec_remote(args, remote_cmd)
         
 def cmd_config(args):
-    """Скачивание конфигурации клиента."""
-    remote_file = f"{REMOTE_DIR}/configs/{args.name}.conf"
+    """Скачивание конфигурации клиента через серверный скрипт с sudo-доступом."""
     local_file = f"{args.name}.conf"
     log.info(f"Загрузка конфигурации для {args.name}")
-    
-    scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
-    scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
-    if args.auth == "key":
-        scp_cmd.extend(["-i", get_key_path(args.key)])
-    scp_cmd.extend([f"{args.user}@{args.host}:{remote_file}", local_file])
-    
+
+    remote_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "config", args.name]
+
     try:
-        run_local(scp_cmd, args.debug)
+        # Для конфига нужен чистый stdout: без потоковой печати и без ssh -v даже при --debug.
+        content = exec_remote(args, remote_cmd, stream_output=False, force_no_debug=True)
+        if not content.strip():
+            raise RuntimeError("сервер вернул пустой конфиг")
+        with open(local_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+            if not content.endswith("\n"):
+                f.write("\n")
+        os.chmod(local_file, 0o600)
         log.info(f"Конфиг сохранён: {os.path.abspath(local_file)}")
+        log.info("Дальше: импортируйте конфиг в WireGuard/AmneziaWG-клиент и включите туннель")
+        log.info("Проверка: ping 10.8.0.1, затем проверьте внешний IP через браузер или curl ifconfig.me")
     except RuntimeError as e:
         raise RuntimeError(f"Не удалось скачать конфиг. Проверьте имя учётки: {e}")
 
@@ -227,9 +231,7 @@ def cmd_forward(args):
         remote_cmd.extend(["--comment", str(args.comment)])
         
     log.info(f"Выполнение на сервере: {' '.join(shlex.quote(c) for c in remote_cmd)}")
-    out = exec_remote(args, remote_cmd)
-    if out:
-        print(out)
+    exec_remote(args, remote_cmd)
 
 def get_key_path(key_arg):
     """Корректное разрешение пути к SSH-ключу (поддержка ~, .ssh/, абсолютных путей)."""
