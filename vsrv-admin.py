@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 import sys
 import os
@@ -256,7 +256,7 @@ def cmd_purge(args):
     run_cmd(f"rm -f {SUDOERS_PATH} 2>/dev/null || true", check=False)
     run_cmd("rm -f /etc/sysctl.d/99-vpn-forward.conf 2>/dev/null || true", check=False)
 
-    log.info("Удаление каталога LanFabric. Серверный скрипт будет удалён вместе с каталогом.")
+    log.info("Удаление каталога LanFabric. Серверный модуль будет удалён вместе с каталогом.")
     run_cmd(f"rm -rf {REMOTE_DIR} 2>/dev/null || true", check=False)
     print("Purge завершён. LanFabric полностью удалён с сервера.")
     print("Рекомендация: для новой установки заново выполните init с клиента")
@@ -695,6 +695,11 @@ def write_client_config(row):
     cfg_path.chmod(0o600)
     return cfg_path
 
+def cmd_backend():
+    """Выводит сохранённый backend в stdout без логов."""
+    backend = require_backend()
+    sys.stdout.write(backend + "\n")
+
 def cmd_config(args):
     """Выводит клиентский конфиг в stdout для безопасного скачивания через sudo."""
     conn = init_db()
@@ -834,16 +839,17 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vsrv-admin.py {init|start|stop|restart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
+        print("Краткая справка: vsrv-admin.py {init|backend|start|stop|restart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
         sys.exit(0)
         
-    if "--version" not in sys.argv and (len(sys.argv) < 2 or sys.argv[1] != "config"):
+    if "--version" not in sys.argv and (len(sys.argv) < 2 or sys.argv[1] not in ("config", "backend")):
         print_intro()
         
     parser = argparse.ArgumentParser(description="Серверное управление VPN-сетью", add_help=False)
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("init", help="Инициализация сервера и установка пакетов").add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    subparsers.add_parser("backend", help="Вывести сохранённый backend")
     subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
     subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
     subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
@@ -892,6 +898,8 @@ def main():
     try:
         if args.command == "init":
             cmd_init(args)
+        elif args.command == "backend":
+            cmd_backend()
         elif args.command == "start":
             cmd_start()
         elif args.command == "stop":
