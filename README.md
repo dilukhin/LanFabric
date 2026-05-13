@@ -1,14 +1,15 @@
 # LanFabric
 
-LanFabric — CLI-инструменты управления VPN на базе WireGuard / AmneziaWG для организации изолированной L3-сети поверх интернета.
+LanFabric — CLI-инструменты управления VPN на базе WireGuard / AmneziaWG для организации изолированной L3-сети поверх интернета с управляемым доступом клиентов в интернет.
 
-Основная задача проекта — быстро поднять приватную сеть, в которой клиенты видят друг друга как в локальной сети, а доступ в интернет выдаётся централизованно и только тем пользователям, которым он явно разрешён.
+Основной сценарий: администратор запускает клиентский модуль на Windows или Linux, модуль подключается к серверу по SSH, копирует и запускает серверный модуль, а серверный модуль управляет WireGuard / AmneziaWG, SQLite, iptables и systemd.
 
 ## Состав проекта
 
 ```text
-vcli-admin.py   клиентский CLI, запускается на Windows/Linux
-vsrv-admin.py   серверный исполнитель, запускается на Ubuntu
+vcli-admin.py   клиентский модуль администратора, запускается на Windows/Linux
+vsrv-admin.py   серверный модуль, запускается на Ubuntu
+README.md       описание проекта и сценариев использования
 ```
 
 Схема работы:
@@ -30,14 +31,17 @@ VPN-клиенты
 ## Основные свойства
 
 - Управление полностью через CLI.
-- Связь клиента с сервером через SSH.
-- Аутентификация по SSH-ключу или паролю.
+- Связь клиента с сервером через SSH/SCP.
 - Серверные действия выполняются через `sudo`.
-- Backend выбирается явно при `init` и сохраняется на сервере.
+- Поддерживаются backend `awg` и `wg`.
+- Backend выбирается при `init` и сохраняется на сервере.
 - Автоматического fallback между AmneziaWG и WireGuard нет.
 - Интернет пользователям запрещён по умолчанию.
-- Данные пользователей хранятся в SQLite.
+- Доступ в интернет выдаётся явно через `add --internet` или `edit --internet true`.
+- Пользователи VPN хранятся в SQLite.
 - Используются только стандартная библиотека Python и системные утилиты.
+- Команды выводят рекомендации по дальнейшим действиям.
+- Для full-tunnel на Windows клиентский модуль автоматически добавляет маршрут к Endpoint мимо VPN через UAC-запрос.
 
 ## Требования
 
@@ -45,16 +49,18 @@ VPN-клиенты
 
 - Ubuntu 22.04 или 24.04.
 - Python 3.12+.
-- Доступ в интернет для установки пакетов.
+- SSH-доступ.
 - Пользователь с `sudo`.
-- Открытый UDP-порт `51820` на внешнем firewall/cloud firewall.
+- Доступ в интернет для установки пакетов.
+- Открытый UDP-порт `51820` во внешнем firewall/security group/cloud firewall.
 
 ### Клиент администратора
 
 - Windows или Linux.
 - Python 3.12+.
 - Установленные `ssh` и `scp`.
-- SSH-доступ к серверу.
+- Для автоматической установки VPN-клиента на Windows нужен `winget`.
+- Для автоматического добавления Windows-маршрута к Endpoint нужен UAC-запрос.
 
 ## Backend
 
@@ -65,7 +71,7 @@ awg   AmneziaWG
 wg    стандартный WireGuard
 ```
 
-Выбранный backend сохраняется на сервере в файле:
+Backend сохраняется на сервере:
 
 ```text
 /opt/vpn-admin/backend
@@ -74,84 +80,139 @@ wg    стандартный WireGuard
 Правила выбора:
 
 - обычный `init` выбирает AmneziaWG (`awg`);
-- `init --no-amnezia` выбирает WireGuard (`wg`);
-- если AmneziaWG не удалось установить или запустить, `init` завершается ошибкой;
-- автоматического отката на WireGuard нет;
-- чтобы выбрать WireGuard, нужно явно выполнить `init --no-amnezia`.
+- `init --no-amnezia` выбирает стандартный WireGuard (`wg`);
+- если AmneziaWG установить или запустить нельзя, `init` завершается ошибкой;
+- silent fallback `awg -> wg` запрещён;
+- backend нельзя угадывать по наличию `/usr/bin/wg` или `/usr/bin/awg`.
 
-Это сделано намеренно: backend не должен угадываться по наличию бинарников `awg` или `wg`, иначе легко получить смешанное и трудно диагностируемое состояние.
+Для backend `awg` LanFabric генерирует и сохраняет параметры AmneziaWG:
+
+```text
+/opt/vpn-admin/awg_params
+```
+
+Эти параметры добавляются и в серверный `/etc/wireguard/wg0.setconf`, и в клиентские конфиги:
+
+```ini
+Jc = ...
+Jmin = ...
+Jmax = ...
+S1 = ...
+S2 = ...
+H1 = ...
+H2 = ...
+H3 = ...
+H4 = ...
+```
+
+## Версии и обновление
+
+Версия задаётся в начале каждого модуля:
+
+```python
+__version__ = "major.minor.patch"
+```
+
+Текущая версия:
+
+```text
+0.0.14
+```
+
+Правила совместимости:
+
+- если версии клиента и сервера совпадают полностью, команда разрешена;
+- если отличается только `patch`, обычные серверные команды блокируются, нужно выполнить `patch`;
+- если отличаются `major` или `minor`, разрешён только `init`;
+- пользователь не копирует серверный модуль вручную, команда `patch` делает это сама.
+
+Проверка версии клиента:
+
+```bash
+python vcli-admin.py --version
+```
+
+Проверка версии серверного модуля после установки:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm status
+```
+
+Обновление серверного модуля при отличии только patch-версии:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm patch
+```
 
 ## Быстрый старт
 
-Пример ниже использует сервер `198.51.100.42`, пользователя `donpedro` и ключ `id_yandex_vm`.
+В примерах используются условные значения:
 
-### Инициализация сервера с AmneziaWG
+```text
+сервер:         198.51.100.42
+SSH-пользователь: donpedro
+VPN-пользователи: alice, bob
+SSH-ключ:       id_yandex_vm
+```
+
+### 1. Инициализация сервера с AmneziaWG
 
 ```bash
 python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm init
 ```
 
-### Инициализация сервера со стандартным WireGuard
+### 2. Инициализация сервера со стандартным WireGuard
 
 ```bash
 python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm init --no-amnezia
 ```
 
-### Проверка состояния
+### 3. Проверка состояния
 
 ```bash
 python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm status
 python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm health
 ```
 
-### Создание пользователя без интернета
+### 4. Создание пользователя с интернетом
 
 ```bash
-python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm add user1
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm add alice --internet
 ```
 
-### Создание пользователя с интернетом
-
-```bash
-python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm add user1 --internet
-```
-
-### Создание администратора
-
-```bash
-python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm add user1 --admin
-```
-
-На текущем этапе `admin` — это флаг в базе данных и задел под будущие политики доступа. При создании пользователя `--admin` также включает интернет-доступ. Отдельные административные возможности внутри VPN пока не реализованы.
-
-### Скачать клиентский конфиг
-
-```bash
-python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm config user1
-```
-
-Файл будет сохранён локально как:
-
-```text
-user1.conf
-```
-
-Команда `config` получает конфиг через серверный модуль, а не прямым `scp` к файлу. Это нужно потому, что конфиги на сервере хранятся с закрытыми правами и могут быть недоступны обычному SSH-пользователю.
-
-### Установить клиент на локальной машине
+### 5. Установка локального VPN-клиента
 
 ```bash
 python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm install-client
 ```
 
-Если нужно установить клиент без запроса к серверу:
+### 6. Скачивание конфига
 
 ```bash
-python vcli-admin.py install-client --client-type awg
-python vcli-admin.py install-client --client-type wg
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm config alice
 ```
 
-## Команды клиента
+Файл будет сохранён локально:
+
+```text
+alice.conf
+```
+
+На Windows при full-tunnel-конфиге команда `config` автоматически проверит и добавит маршрут к Endpoint мимо VPN. Если потребуются права администратора, появится UAC-запрос.
+
+### 7. Импорт и проверка
+
+Импортировать `alice.conf` в WireGuard/AmneziaWG-клиент, включить туннель и проверить:
+
+```bash
+ping 10.8.0.1
+ping 8.8.8.8
+curl https://ifconfig.me
+```
+
+При работающем full-tunnel внешний IP должен совпасть с публичным IP сервера.
+
+## Глобальные параметры клиента
 
 Общий вид:
 
@@ -159,17 +220,21 @@ python vcli-admin.py install-client --client-type wg
 python vcli-admin.py --host <сервер> --user <ssh-user> --auth key --key <ключ> <команда> [параметры]
 ```
 
-Глобальные параметры:
+Параметры:
 
 ```text
---host       IP или DNS-имя сервера; не нужен для install-client --client-type wg/awg
+--host       IP или DNS-имя сервера
 --user       SSH-пользователь, по умолчанию root
 --auth       key или password
 --key        путь к приватному SSH-ключу
---debug      подробный вывод SSH-команд
+--debug      подробный вывод команд и SSH
 --tty        принудительный TTY-режим для ручного ввода sudo-пароля
---version    версия клиента
+--version    версия клиентского модуля
 ```
+
+`--host` не нужен только для `install-client --client-type wg` и `install-client --client-type awg`, когда тип клиента задан вручную и сервер не опрашивается.
+
+## Команды
 
 ### init
 
@@ -184,14 +249,17 @@ python vcli-admin.py --host <сервер> init --no-amnezia
 
 - проверяет SSH-доступ;
 - настраивает `sudo` без пароля для нужных команд;
-- копирует серверный модуль `vsrv-admin.py` на сервер;
+- копирует серверный модуль;
 - очищает старое runtime-состояние VPN;
 - устанавливает WireGuard или AmneziaWG;
 - сохраняет выбранный backend;
+- для `awg` создаёт параметры AmneziaWG;
 - генерирует серверные ключи;
 - создаёт и запускает интерфейс `wg0`;
 - включает IPv4 forwarding;
 - сохраняет iptables-правила.
+
+После успешного `init` можно выполнять `add`, `status`, `health`.
 
 ### patch
 
@@ -201,14 +269,7 @@ python vcli-admin.py --host <сервер> init --no-amnezia
 python vcli-admin.py --host <сервер> patch
 ```
 
-Правило версий:
-
-- если совпадают `major.minor.patch`, команда не нужна;
-- если отличаются только `patch`, нужно выполнить `patch`;
-- если отличаются `major` или `minor`, разрешена только команда `init`;
-- остальные команды управления сервером при несовпадении версий не выполняются.
-
-Команда сама копирует серверный модуль на сервер. Пользователь ничего не копирует вручную.
+Если отличаются `major` или `minor`, `patch` запрещён, требуется `init`.
 
 ### install-client
 
@@ -235,23 +296,42 @@ python vcli-admin.py install-client --client-type awg --manual
 --manual             не устанавливать, вывести инструкцию
 ```
 
-Для `auto` клиент запрашивает backend у сервера:
-
-```text
-awg -> AmneziaWG
-wg  -> WireGuard
-```
-
-Для `wg` и `awg` сервер не опрашивается, поэтому `--host` можно не указывать.
-
-На Windows установка выполняется через `winget` по точному package id:
+На Windows установка выполняется через `winget`:
 
 ```text
 Amnezia.AmneziaWG
 WireGuard.WireGuard
 ```
 
-Перед установкой команда получает сведения через `winget show`, показывает доступную версию пакета и после установки проверяет установленный пакет через `winget list`. Если `winget` недоступен, версия пакета не определяется или установка завершается ошибкой, выводится инструкция для ручной установки.
+Если вывод перенаправлен в файл, для установки нужно использовать `--yes`, иначе команда не будет ждать невидимого интерактивного подтверждения.
+
+### endpoint-route
+
+Управляет Windows-маршрутом к Endpoint мимо full-tunnel VPN.
+
+```bash
+python vcli-admin.py --host <сервер> endpoint-route add
+python vcli-admin.py --host <сервер> endpoint-route status
+python vcli-admin.py --host <сервер> endpoint-route delete
+```
+
+Обычно вручную выполнять не нужно: команда `config <имя>` сама добавляет маршрут при скачивании full-tunnel-конфига на Windows.
+
+Команда нужна как fallback, если автоматическое добавление маршрута не удалось или UAC-запрос был отменён.
+
+Зачем нужен маршрут: при `AllowedIPs = 0.0.0.0/0` Windows направляет весь трафик в туннель. Без отдельного маршрута к Endpoint попытка связаться с VPN-сервером может уйти в ещё неработающий туннель.
+
+Пример ручного маршрута, который команда добавляет автоматически:
+
+```cmd
+route add 198.51.100.42 mask 255.255.255.255 <основной-шлюз> metric 1
+```
+
+Удаление:
+
+```bash
+python vcli-admin.py --host <сервер> endpoint-route delete
+```
 
 ### start
 
@@ -261,19 +341,20 @@ WireGuard.WireGuard
 python vcli-admin.py --host <сервер> start
 ```
 
-Для `awg` команда восстанавливает вручную управляемое состояние:
+Для `awg` команда:
 
 - загружает модуль `amneziawg`;
-- создаёт `wg0 type amneziawg`;
-- применяет `/etc/wireguard/wg0.setconf`;
-- назначает адрес `10.8.0.1/24`;
+- пересобирает `/etc/wireguard/wg0.setconf` с сохранёнными AWG-параметрами;
+- создаёт `wg0 type amneziawg`, если интерфейс отсутствует;
+- применяет `awg setconf wg0 /etc/wireguard/wg0.setconf`;
+- назначает `10.8.0.1/24`;
 - поднимает интерфейс;
-- восстанавливает базовые правила;
-- выполняет синхронизацию пиров из БД.
+- восстанавливает базовые firewall-правила;
+- выполняет `sync`.
 
 Для `wg` команда запускает `wg-quick@wg0`.
 
-Эта команда нужна после перезапуска или сна прерываемого VPS, когда данные и конфиги сохранились, но runtime-интерфейс `wg0` исчез.
+Команда полезна после остановки или сна VPS, когда данные сохранились, но runtime-интерфейс исчез.
 
 ### stop
 
@@ -283,17 +364,17 @@ python vcli-admin.py --host <сервер> start
 python vcli-admin.py --host <сервер> stop
 ```
 
-Команда удаляет runtime-интерфейс и текущие runtime-правила, но не удаляет БД, конфиги и установленное окружение.
+Удаляет runtime-интерфейс и текущие runtime-правила, но сохраняет БД, backend, ключи и конфиги.
 
 ### restart
 
-Перезапускает VPN runtime без полного `init`.
+Перезапускает VPN runtime.
 
 ```bash
 python vcli-admin.py --host <сервер> restart
 ```
 
-Эквивалентно последовательности:
+Эквивалентно:
 
 ```text
 stop
@@ -308,10 +389,6 @@ start
 python vcli-admin.py --host <сервер> status
 ```
 
-Для `wg` состояние определяется через `systemctl is-active wg-quick@wg0`.
-
-Для `awg` состояние определяется по наличию интерфейса `wg0` и успешности команды `awg show wg0`.
-
 Возможные состояния:
 
 ```text
@@ -321,7 +398,7 @@ BROKEN    интерфейс или backend в неконсистентном с
 UNKNOWN   состояние не удалось определить
 ```
 
-Команда также выводит рекомендации по дальнейшим действиям.
+Также выводит количество учётных записей и рекомендации.
 
 ### health
 
@@ -334,44 +411,39 @@ python vcli-admin.py --host <сервер> health
 Проверяет:
 
 - backend-файл;
-- наличие бинарника `awg` или `wg`;
+- наличие backend-бинарника `awg` или `wg`;
 - интерфейс `wg0`;
-- возможность прочитать состояние через backend;
+- чтение состояния через backend;
 - UDP-порт `51820`;
 - базовые iptables-правила;
+- порядок FORWARD-правил;
 - IPv4 forwarding;
 - systemd-сервис для `wg`;
 - БД пользователей.
 
-Если обнаружены проблемы, команда выводит рекомендации. Например, если backend и БД есть, но интерфейс отсутствует, обычно нужно выполнить:
-
-```bash
-python vcli-admin.py --host <сервер> start
-```
-
-а не полный `init`.
+Важно: `health` проверяет сервер изнутри. Он не доказывает, что внешний cloud firewall пропускает UDP `51820` снаружи.
 
 ### add
 
-Создаёт пользователя.
+Создаёт учётную запись VPN.
 
 ```bash
-python vcli-admin.py --host <сервер> add <имя>
-python vcli-admin.py --host <сервер> add <имя> --internet
-python vcli-admin.py --host <сервер> add <имя> --admin
-python vcli-admin.py --host <сервер> add <имя> --comment "комментарий"
+python vcli-admin.py --host <сервер> add alice
+python vcli-admin.py --host <сервер> add alice --internet
+python vcli-admin.py --host <сервер> add alice --admin
+python vcli-admin.py --host <сервер> add alice --comment "комментарий"
 ```
 
 Что делает:
 
 - генерирует ключи пользователя;
-- выделяет первый свободный IP из диапазона `10.8.0.2-10.8.0.254`;
+- выделяет IP из диапазона `10.8.0.2-10.8.0.254`;
 - добавляет пользователя в БД;
 - добавляет peer в текущий интерфейс;
-- при `--internet` добавляет NAT/FORWARD-правила;
-- создаёт клиентский `.conf`.
+- при `--internet` добавляет разрешающее FORWARD-правило и NAT;
+- создаёт клиентский конфиг на сервере.
 
-Если пользователю разрешён интернет, в клиентском конфиге используется:
+Если пользователю разрешён интернет, в клиентском конфиге будет:
 
 ```ini
 AllowedIPs = 0.0.0.0/0
@@ -383,19 +455,21 @@ AllowedIPs = 0.0.0.0/0
 AllowedIPs = 10.8.0.0/24
 ```
 
+`--admin` сейчас включает флаг администратора в БД и автоматически включает интернет-доступ. Полноценная ролевая модель пока не реализована.
+
 ### edit
 
 Меняет параметры существующего пользователя.
 
 ```bash
-python vcli-admin.py --host <сервер> edit <имя> --admin true
-python vcli-admin.py --host <сервер> edit <имя> --admin false
-python vcli-admin.py --host <сервер> edit <имя> --internet true
-python vcli-admin.py --host <сервер> edit <имя> --internet false
-python vcli-admin.py --host <сервер> edit <имя> --comment "новый комментарий"
+python vcli-admin.py --host <сервер> edit alice --admin true
+python vcli-admin.py --host <сервер> edit alice --admin false
+python vcli-admin.py --host <сервер> edit alice --internet true
+python vcli-admin.py --host <сервер> edit alice --internet false
+python vcli-admin.py --host <сервер> edit alice --comment "новый комментарий"
 ```
 
-`edit` меняет данные в БД. После изменения сетевых параметров нужно применить правила:
+После изменения сетевых параметров нужно применить правила:
 
 ```bash
 python vcli-admin.py --host <сервер> sync
@@ -404,7 +478,7 @@ python vcli-admin.py --host <сервер> sync
 Если менялся интернет-доступ, нужно заново скачать конфиг:
 
 ```bash
-python vcli-admin.py --host <сервер> config <имя>
+python vcli-admin.py --host <сервер> config alice
 ```
 
 ### sync
@@ -420,9 +494,16 @@ python vcli-admin.py --host <сервер> sync
 - удаляет текущих peers из интерфейса;
 - заново добавляет активных пользователей;
 - пересобирает динамические правила интернет-доступа;
+- ставит пользовательские ACCEPT-правила до общего DROP;
 - сохраняет iptables-правила.
 
-Команда полезна после `edit`, после ручных изменений и после восстановления runtime.
+Правильный порядок FORWARD-правил:
+
+```text
+-A FORWARD -i wg0 -o wg0 -j ACCEPT
+-A FORWARD -s 10.8.0.2/32 -j ACCEPT
+-A FORWARD -i wg0 -j DROP
+```
 
 ### list
 
@@ -437,7 +518,7 @@ python vcli-admin.py --host <сервер> list
 ```text
 ИМЯ             IP           АДМИН  ИНЕТ   СТАТУС     КОММЕНТАРИЙ
 ----------------------------------------------------------------------
-dima            10.8.0.2     ДА     ДА     АКТИВ
+alice           10.8.0.2     НЕТ    ДА     АКТИВ
 ```
 
 ### block
@@ -445,7 +526,7 @@ dima            10.8.0.2     ДА     ДА     АКТИВ
 Блокирует пользователя.
 
 ```bash
-python vcli-admin.py --host <сервер> block <имя>
+python vcli-admin.py --host <сервер> block alice
 ```
 
 Что делает:
@@ -459,14 +540,10 @@ python vcli-admin.py --host <сервер> block <имя>
 Удаляет пользователя.
 
 ```bash
-python vcli-admin.py --host <сервер> delete <имя> <подтверждение>
+python vcli-admin.py --host <сервер> delete alice alice
 ```
 
-Подтверждение должно совпадать с именем пользователя:
-
-```bash
-python vcli-admin.py --host <сервер> delete dima dima
-```
+Второй аргумент — подтверждение. Он должен совпадать с именем пользователя.
 
 Что делает:
 
@@ -477,21 +554,52 @@ python vcli-admin.py --host <сервер> delete dima dima
 
 ### config
 
-Скачивает клиентский конфиг.
+Скачивает клиентский конфиг через серверный модуль.
 
 ```bash
-python vcli-admin.py --host <сервер> config <имя>
+python vcli-admin.py --host <сервер> config alice
 ```
 
-Файл сохраняется в текущий локальный каталог как:
+Файл сохраняется локально:
 
 ```text
-<имя>.conf
+alice.conf
+```
+
+Особенности:
+
+- Endpoint в конфиге берётся из `--host`, а не из `hostname -I` на сервере;
+- это защищает от попадания приватного cloud-IP в клиентский конфиг;
+- для backend `awg` конфиг содержит параметры AmneziaWG;
+- на Windows для full-tunnel-конфига команда автоматически добавляет маршрут к Endpoint мимо VPN.
+
+Пример full-tunnel-конфига для backend `awg`:
+
+```ini
+[Interface]
+PrivateKey = ...
+Address = 10.8.0.2/32
+DNS = 8.8.8.8
+Jc = 7
+Jmin = 40
+Jmax = 90
+S1 = ...
+S2 = ...
+H1 = ...
+H2 = ...
+H3 = ...
+H4 = ...
+
+[Peer]
+PublicKey = ...
+Endpoint = 198.51.100.42:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
 ```
 
 ### remove
 
-Удаляет runtime и VPN-пакеты, но сохраняет данные LanFabric.
+Удаляет VPN runtime и VPN-пакеты, но сохраняет данные LanFabric.
 
 ```bash
 python vcli-admin.py --host <сервер> remove REMOVE
@@ -532,70 +640,6 @@ python vcli-admin.py --host <сервер> purge PURGE
 
 `/opt/vpn-admin` удаляется последним действием. Серверный модуль удаляет сам себя вместе с каталогом, это ожидаемое поведение.
 
-## Подключение клиента
-
-Перед импортом конфига можно установить подходящий клиент командой:
-
-```bash
-python vcli-admin.py --host <сервер> install-client
-```
-
-Если backend известен заранее и сервер опрашивать не нужно:
-
-```bash
-python vcli-admin.py install-client --client-type awg
-python vcli-admin.py install-client --client-type wg
-```
-
-### Для WireGuard
-
-1. Скачать конфиг:
-
-```bash
-python vcli-admin.py --host <сервер> config <имя>
-```
-
-2. Импортировать файл `<имя>.conf` в WireGuard-клиент.
-3. Включить туннель.
-
-### Для AmneziaWG
-
-Если сервер поднят в backend `awg`, клиент тоже должен поддерживать AmneziaWG.
-
-1. Скачать конфиг:
-
-```bash
-python vcli-admin.py --host <сервер> config <имя>
-```
-
-2. Импортировать файл `<имя>.conf` в AmneziaWG-совместимый клиент.
-3. Включить туннель.
-
-На текущем этапе конфиг формируется в WireGuard-подобном формате. При необходимости полноценной маскировки AmneziaWG может потребоваться расширение генератора конфигов backend-специфичными параметрами.
-
-## Проверка подключения
-
-После включения туннеля:
-
-```bash
-ping 10.8.0.1
-```
-
-Если включён интернет-доступ:
-
-```bash
-ping 8.8.8.8
-curl ifconfig.me
-```
-
-На Windows внешний IP можно проверить в браузере:
-
-```text
-https://ifconfig.me
-```
-
-Если интернет идёт через VPN, внешний IP должен совпадать с публичным IP сервера.
-
 ## Сеть по умолчанию
 
 ```text
@@ -613,6 +657,7 @@ INTERFACE    wg0
   vsrv-admin.py
   vpn.db
   backend
+  awg_params
   configs/
 
 /etc/wireguard/
@@ -637,9 +682,16 @@ YYYY-MM-DD HH:MM:SS [SRV] LEVEL: сообщение
 Особенности:
 
 - сервер запускается через `python3 -u`;
-- вывод сервера виден на клиенте в реальном времени;
-- команды дают рекомендации по дальнейшим действиям;
-- `--debug` включает подробный SSH-вывод.
+- длинные серверные операции выводятся потоково;
+- служебные команды `--version`, `backend`, `config` выполняются с чистым stdout;
+- `--debug` включает подробный вывод SSH и локальных команд;
+- рекомендации выводятся в конце блока:
+
+```text
+*** РЕКОМЕНДАЦИИ ***
+...
+*** КОНЕЦ РЕКОМЕНДАЦИЙ ***
+```
 
 ## Типовые сценарии
 
@@ -656,11 +708,6 @@ YYYY-MM-DD HH:MM:SS [SRV] LEVEL: сообщение
 
 ```bash
 python vcli-admin.py --host <сервер> start
-```
-
-Потом:
-
-```bash
 python vcli-admin.py --host <сервер> status
 python vcli-admin.py --host <сервер> health
 ```
@@ -668,72 +715,124 @@ python vcli-admin.py --host <сервер> health
 ### Пользователю включили интернет через edit
 
 ```bash
-python vcli-admin.py --host <сервер> edit user1 --internet true
+python vcli-admin.py --host <сервер> edit alice --internet true
 python vcli-admin.py --host <сервер> sync
-python vcli-admin.py --host <сервер> config user1
+python vcli-admin.py --host <сервер> config alice
 ```
 
-Затем импортировать новый конфиг в клиент.
+Затем импортировать новый конфиг в VPN-клиент.
 
-### Пользователь не видит интернет
+### Нужно проверить, что full-tunnel работает
 
-Проверить:
+На Windows после включения туннеля:
+
+```cmd
+ping 10.8.0.1
+ping 8.8.8.8
+curl https://ifconfig.me
+```
+
+Ожидаемый результат:
+
+- `10.8.0.1` отвечает;
+- `8.8.8.8` отвечает;
+- `ifconfig.me` показывает публичный IP сервера.
+
+### Клиент показывает «подключен», но пакетов нет
+
+Проверить на Windows:
+
+```cmd
+"C:\Program Files\AmneziaWG\awg.exe" show
+route print
+```
+
+Признаки успешного handshake:
+
+```text
+latest handshake: ... ago
+transfer: ... received, ... sent
+```
+
+Если `AllowedIPs = 0.0.0.0/0`, должен быть маршрут к Endpoint мимо VPN:
+
+```text
+<публичный-IP-сервера>  255.255.255.255  <основной-шлюз>
+```
+
+Если маршрута нет:
 
 ```bash
-python vcli-admin.py --host <сервер> list
+python vcli-admin.py --host <сервер> endpoint-route add
+```
+
+Или заново выполнить:
+
+```bash
+python vcli-admin.py --host <сервер> config alice
+```
+
+### Проверить, доходит ли UDP до сервера
+
+На сервере:
+
+```bash
+sudo tcpdump -ni eth0 -l -U 'host <внешний-IP-клиента> and udp'
+```
+
+На Windows можно отправить тестовый UDP-пакет:
+
+```cmd
+python -c "import socket;s=socket.socket(2,2);s.sendto(b'test',('198.51.100.42',51820));s.close()"
+```
+
+Если тестовый UDP виден, но VPN-клиент не отправляет UDP, проверять профиль, маршрут к Endpoint и вывод `awg.exe show`.
+
+### Интернет не работает, но handshake есть
+
+На сервере проверить порядок правил:
+
+```bash
+sudo iptables -S
+sudo iptables -t nat -S
+```
+
+Разрешающее правило пользователя должно стоять до общего DROP:
+
+```text
+-A FORWARD -s 10.8.0.2/32 -j ACCEPT
+-A FORWARD -i wg0 -j DROP
+```
+
+Восстановить правила штатно:
+
+```bash
+python vcli-admin.py --host <сервер> sync
 python vcli-admin.py --host <сервер> health
 ```
 
-Возможные причины:
+### Cloud firewall / security group
 
-- у пользователя `ИНЕТ: НЕТ`;
-- после `edit` не выполнен `sync`;
-- клиент использует старый конфиг с `AllowedIPs = 10.8.0.0/24`;
-- внешний интерфейс сервера не совпадает с ожидаемым для NAT-правила;
-- cloud firewall блокирует UDP `51820`;
-- клиент подключён не через AmneziaWG при backend `awg`.
+Для работы VPN должен быть открыт входящий UDP `51820` на публичный IP сервера:
 
-### Конфиг не скачивается
-
-Команда `config` должна работать без прямого доступа пользователя к файлу на сервере. Если ошибка сохраняется, проверить:
-
-```bash
-python vcli-admin.py --host <сервер> list
-python vcli-admin.py --host <сервер> health
+```text
+Direction: ingress
+Protocol: UDP
+Port: 51820
+Source: 0.0.0.0/0
 ```
 
-Если пользователя нет — создать заново. Если пользователь есть, но конфиг отсутствует — нужно пересоздать конфиг или пользователя.
-
-### Несовпадение версий клиента и сервера
-
-Все серверные команды проверяют совпадение версии клиента и сервера.
-
-Если отличается только patch-версия:
-
-```bash
-python vcli-admin.py --host <сервер> patch
-```
-
-Если отличается major или minor-версия:
-
-```bash
-python vcli-admin.py --host <сервер> init
-```
-
-Ручное копирование файлов пользователем не требуется.
-
-### Двойной вывод команды
-
-В версии `0.0.9` дублирование потокового вывода клиентом исправлено. Если дублирование осталось, нужно убедиться, что на клиенте и сервере используются модули одной версии.
+SSH по TCP 22 не доказывает, что UDP 51820 открыт.
 
 ## Безопасность
 
 - VPN-ключи пользователей генерируются на сервере.
 - Клиентские конфиги хранятся в `/opt/vpn-admin/configs`.
-- Конфиги не должны быть доступны всем пользователям системы.
-- Команда `config` отдаёт файл через серверный модуль, чтобы не открывать права на чтение обычному SSH-пользователю.
+- Конфиги имеют закрытые права.
+- Команда `config` отдаёт файл через серверный модуль, чтобы не открывать прямой доступ к конфигам обычному SSH-пользователю.
 - `sudoers` ограничивается набором команд, необходимых LanFabric.
 - Интернет-доступ выдаётся явно.
+- Backend сохраняется явно, не определяется эвристически.
 
 ## Ограничения текущей версии
 
@@ -741,31 +840,35 @@ python vcli-admin.py --host <сервер> init
 - Нет API.
 - Нет L2/relay-режима.
 - Нет полноценной ролевой модели для `admin`.
-- Нет автоматического systemd-unit для ручного `awg`-runtime.
-- Для AmneziaWG пока используется WireGuard-подобный клиентский конфиг.
-- NAT-правила пока завязаны на текущую реализацию iptables и могут потребовать уточнения внешнего интерфейса сервера.
-
-## Версия
-
-Текущая версия файлов:
-
-```text
-0.0.9
-```
-
-Проверка версии:
-
-```bash
-python vcli-admin.py --version
-python vsrv-admin.py --version
-```
+- Нет отдельного systemd-unit для ручного `awg`-runtime.
+- NAT-правила пока используют внешний интерфейс `eth0`.
+- Автоматическое добавление маршрута к Endpoint реализовано только для Windows.
+- Автоматическая установка VPN-клиента реализована только для Windows через `winget`.
 
 ## Направления развития
 
 - Вынести backend-логику в отдельный слой `BackendManager`.
-- Добавить backend-специфичную генерацию клиентских конфигов.
+- Добавить автоопределение внешнего интерфейса вместо жёсткого `eth0`.
 - Добавить systemd-unit для автоподъёма `awg` после старта VPS.
-- Улучшить определение внешнего интерфейса для NAT.
 - Добавить команду регенерации конфигов существующих пользователей.
 - Добавить backup/restore БД и конфигов.
 - Развить флаг `admin` в полноценную модель прав.
+- Добавить диагностику внешней доступности UDP `51820`.
+- Добавить поддержку Linux/macOS-клиентских маршрутов к Endpoint.
+
+## Краткая памятка успешного сценария
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm init
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm add alice --internet
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm install-client --yes
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key id_yandex_vm config alice
+```
+
+Дальше импортировать `alice.conf`, включить туннель и проверить:
+
+```cmd
+ping 10.8.0.1
+ping 8.8.8.8
+curl https://ifconfig.me
+```

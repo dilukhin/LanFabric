@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.11"
+__version__ = "0.0.14"
 
 import sys
 import os
@@ -13,6 +13,7 @@ import argparse
 import logging
 import shlex
 import ipaddress
+import secrets
 from pathlib import Path
 
 # Константы
@@ -25,6 +26,8 @@ WG_BASE_PORT = 51820
 BACKEND_PATH = "/opt/vpn-admin/backend"
 REMOTE_DIR = "/opt/vpn-admin"
 SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
+AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
+AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
 
 # Логирование
 logging.basicConfig(
@@ -91,6 +94,122 @@ def run_cmd(cmd, check=True):
         )
     return result.stdout.strip()
 
+def generate_awg_params():
+    """Генерирует параметры маскировки AmneziaWG для сервера и клиентов."""
+    s1 = 15 + secrets.randbelow(136)
+    s2 = 15 + secrets.randbelow(136)
+    while s1 + 56 == s2:
+        s2 = 15 + secrets.randbelow(136)
+
+    headers = set()
+    while len(headers) < 4:
+        headers.add(5 + secrets.randbelow(2147483643))
+
+    h1, h2, h3, h4 = list(headers)
+    return {
+        "Jc": 7,
+        "Jmin": 40,
+        "Jmax": 90,
+        "S1": s1,
+        "S2": s2,
+        "H1": h1,
+        "H2": h2,
+        "H3": h3,
+        "H4": h4,
+    }
+
+def validate_awg_params(params):
+    """Проверяет параметры AmneziaWG перед применением."""
+    missing = [key for key in AWG_PARAM_KEYS if key not in params]
+    if missing:
+        raise RuntimeError("В параметрах AmneziaWG отсутствуют поля: " + ", ".join(missing))
+
+    try:
+        values = {key: int(params[key]) for key in AWG_PARAM_KEYS}
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"Параметры AmneziaWG должны быть целыми числами: {e}")
+
+    if not 1 <= values["Jc"] <= 128:
+        raise RuntimeError("Некорректный параметр AmneziaWG Jc: ожидается 1..128")
+    if not 0 <= values["Jmin"] < values["Jmax"] <= 1280:
+        raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax: ожидается 0 <= Jmin < Jmax <= 1280")
+    if not 0 <= values["S1"] <= 1132:
+        raise RuntimeError("Некорректный параметр AmneziaWG S1: ожидается 0..1132")
+    if not 0 <= values["S2"] <= 1188:
+        raise RuntimeError("Некорректный параметр AmneziaWG S2: ожидается 0..1188")
+    if values["S1"] + 56 == values["S2"]:
+        raise RuntimeError("Некорректные параметры AmneziaWG: S1 + 56 не должно совпадать с S2")
+
+    headers = [values["H1"], values["H2"], values["H3"], values["H4"]]
+    if len(set(headers)) != 4:
+        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть уникальными")
+    if any(value < 5 or value > 2147483647 for value in headers):
+        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть в диапазоне 5..2147483647")
+
+    return values
+
+def read_awg_params_file():
+    """Читает параметры AmneziaWG из файла."""
+    params = {}
+    with open(AWG_PARAMS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise RuntimeError(f"Некорректная строка параметров AmneziaWG: {line}")
+            key, value = line.split("=", 1)
+            params[key.strip()] = value.strip()
+    return validate_awg_params(params)
+
+def write_awg_params_file(params):
+    """Сохраняет параметры AmneziaWG."""
+    params = validate_awg_params(params)
+    Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True)
+    text = "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS) + "\n"
+    Path(AWG_PARAMS_PATH).write_text(text, encoding="utf-8")
+    os.chmod(AWG_PARAMS_PATH, 0o600)
+
+def get_or_create_awg_params():
+    """Возвращает сохранённые параметры AmneziaWG или создаёт новые."""
+    if os.path.exists(AWG_PARAMS_PATH):
+        return read_awg_params_file()
+
+    params = generate_awg_params()
+    write_awg_params_file(params)
+    log.info(f"Параметры AmneziaWG созданы: {AWG_PARAMS_PATH}")
+    return params
+
+def format_awg_params(params):
+    """Формирует блок параметров AmneziaWG для .conf."""
+    params = validate_awg_params(params)
+    return "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS)
+
+def build_setconf(priv, backend):
+    """Формирует конфиг для wg/awg setconf."""
+    conf = f"""[Interface]
+PrivateKey = {priv}
+ListenPort = {WG_BASE_PORT}
+"""
+    if backend == "awg":
+        conf += format_awg_params(get_or_create_awg_params()) + "\n"
+    return conf
+
+def write_setconf(priv, backend):
+    """Сохраняет конфиг для wg/awg setconf."""
+    setconf_path = Path(f"/etc/wireguard/{WG_IF}.setconf")
+    setconf_path.write_text(build_setconf(priv, backend), encoding="utf-8")
+    setconf_path.chmod(0o600)
+    return setconf_path
+
+def ensure_awg_setconf():
+    """Обновляет setconf AmneziaWG сохранёнными параметрами маскировки."""
+    priv_path = f"/etc/wireguard/{WG_IF}.private"
+    if not os.path.exists(priv_path):
+        raise RuntimeError(f"Приватный ключ сервера отсутствует: {priv_path}. Выполните init")
+    priv = Path(priv_path).read_text(encoding="utf-8").strip()
+    return write_setconf(priv, "awg")
+
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
     check_rule = rule.replace(" -A ", " -C ", 1)
@@ -121,10 +240,31 @@ def cleanup_firewall_rules():
         except Exception as e:
             log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
 
+def forward_drop_rule():
+    """Возвращает базовое запрещающее правило для трафика из VPN."""
+    return f"iptables -A FORWARD -i {WG_IF} -j DROP"
+
+
+def ensure_forward_drop_last():
+    """Ставит общий DROP последним, чтобы разрешающие правила успели сработать."""
+    rule = forward_drop_rule()
+    delete_iptables_rule(rule)
+    ensure_iptables_rule(rule)
+
+
 def ensure_base_firewall_rules():
-    """Восстанавливает базовые правила LanFabric."""
+    """Восстанавливает базовые правила LanFabric в правильном порядке."""
+    delete_iptables_rule(forward_drop_rule())
     ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
+    ensure_forward_drop_last()
+
+
+def ensure_client_internet_rules(ip):
+    """Разрешает пользователю интернет до общего DROP и включает NAT."""
+    delete_iptables_rule(forward_drop_rule())
+    ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+    ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+    ensure_forward_drop_last()
 
 def cmd_stop():
     """Останавливает VPN runtime без удаления пакетов и данных."""
@@ -151,9 +291,7 @@ def cmd_start():
         run_cmd(f"systemctl enable wg-quick@{WG_IF}")
         run_cmd(f"systemctl restart wg-quick@{WG_IF}")
     else:
-        setconf_path = f"/etc/wireguard/{WG_IF}.setconf"
-        if not os.path.exists(setconf_path):
-            raise RuntimeError(f"Файл конфигурации backend отсутствует: {setconf_path}. Выполните init")
+        setconf_path = str(ensure_awg_setconf())
 
         run_cmd("command -v awg")
         run_cmd("modprobe amneziawg")
@@ -178,7 +316,9 @@ def cmd_start():
 
         if not iface_exists:
             run_cmd(f"ip link add {WG_IF} type amneziawg")
-            run_cmd(f"{wg_bin} setconf {WG_IF} {setconf_path}")
+
+        run_cmd(f"{wg_bin} setconf {WG_IF} {setconf_path}")
+        if not iface_exists:
             run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
 
         run_cmd(f"ip link set up dev {WG_IF}")
@@ -436,11 +576,7 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 """
     Path(f"/etc/wireguard/{WG_IF}.conf").write_text(conf)
 
-    setconf = f"""[Interface]
-PrivateKey = {priv}
-ListenPort = {WG_BASE_PORT}
-"""
-    Path(f"/etc/wireguard/{WG_IF}.setconf").write_text(setconf)
+    write_setconf(priv, backend)
 
     # --- Поднятие интерфейса ---
     log.info("Запуск интерфейса")
@@ -647,6 +783,34 @@ def cmd_health():
         errors.append(f"Ошибка базы данных: {e}")
         advices.append("Проверьте /opt/vpn-admin/vpn.db. Если БД потеряна, потребуется восстановление из резервной копии или новый init")
 
+    # Проверка порядка правил FORWARD: пользовательские ACCEPT должны быть до общего DROP.
+    try:
+        conn = init_db()
+        internet_rows = conn.execute("SELECT name, ip FROM users WHERE internet=1 AND blocked=0").fetchall()
+        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
+        drop_index = None
+        for index, rule in enumerate(forward_rules):
+            if rule == f"-A FORWARD -i {WG_IF} -j DROP":
+                drop_index = index
+                break
+        if drop_index is not None:
+            for row in internet_rows:
+                accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
+                accept_index = None
+                for index, rule in enumerate(forward_rules):
+                    if rule == accept_rule:
+                        accept_index = index
+                        break
+                if accept_index is None:
+                    errors.append(f"Отсутствует FORWARD ACCEPT для пользователя {row['name']} ({row['ip']})")
+                    advices.append("Выполните sync для восстановления правил интернет-доступа")
+                elif accept_index > drop_index:
+                    errors.append(f"Правило ACCEPT для пользователя {row['name']} стоит после общего DROP")
+                    advices.append("Выполните sync: он переставит пользовательские ACCEPT перед общим DROP")
+    except Exception as e:
+        errors.append(f"Не удалось проверить порядок правил FORWARD: {e}")
+        advices.append("Выполните sync и затем health для повторной проверки firewall")
+
     # Итог
     if errors:
         log.warning("Обнаружены проблемы:")
@@ -670,12 +834,16 @@ def cmd_sync():
             run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
 
     conn = init_db()
-    # Очистка динамических правил клиентов (базовые оставляем)
+    # Очистка динамических правил клиентов и временное удаление общего DROP.
+    # DROP будет добавлен последним после пользовательских ACCEPT.
+    delete_iptables_rule(forward_drop_rule())
     rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
     for row in rows_all:
         ip = row[0]
         delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
         delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
     
     # Восстановление пиров и правил
     rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
@@ -684,8 +852,9 @@ def cmd_sync():
         allowed = f"{ip}/32"
         run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
         if internet:
-            ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-            ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+            ensure_client_internet_rules(ip)
+
+    ensure_forward_drop_last()
     run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
     add_advice("Выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
@@ -695,11 +864,15 @@ def build_client_config(row, endpoint=None):
     server_pub = open(f"/etc/wireguard/{WG_IF}.public").read().strip()
     server_ip = str(endpoint).strip() if endpoint else run_cmd("hostname -I | awk '{print $1}'").strip()
     allowed_ips = "0.0.0.0/0" if row["internet"] else VPN_NET
+    backend = require_backend()
+    awg_params = ""
+    if backend == "awg":
+        awg_params = "\n" + format_awg_params(get_or_create_awg_params())
 
     return f"""[Interface]
 PrivateKey = {row["privkey"]}
 Address = {row["ip"]}/32
-DNS = 8.8.8.8
+DNS = 8.8.8.8{awg_params}
 
 [Peer]
 PublicKey = {server_pub}
@@ -753,8 +926,7 @@ def cmd_add(args):
     if not blocked_val:
         run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
         if internet_val:
-            ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-            ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+            ensure_client_internet_rules(ip)
             run_cmd("netfilter-persistent save")
             
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()

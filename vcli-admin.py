@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.11"
+__version__ = "0.0.14"
 
 import sys
 import os
@@ -594,7 +594,10 @@ def install_windows_client(args, client_type):
     installed, installed_version = winget_list_package(args, package["id"])
     if installed:
         log.info(f"Клиент уже установлен: {package['name']} {installed_version or 'версия не определена'}")
-        add_advice("Дальше: импортируйте .conf в клиент и включите туннель")
+        add_advice(
+            "Дальше: скачайте конфиг командой config <имя> и импортируйте .conf в клиент",
+            "Для full-tunnel на Windows команда config автоматически добавит маршрут к Endpoint",
+        )
         return
 
     if args.check_only:
@@ -656,7 +659,11 @@ def install_windows_client(args, client_type):
         return
 
     log.info(f"Клиент установлен: {package['name']} {installed_version or 'версия не определена'}")
-    add_advice("Дальше: импортируйте .conf в клиент, включите туннель и проверьте ping 10.8.0.1")
+    add_advice(
+        "Дальше: скачайте конфиг командой config <имя>, импортируйте .conf в клиент и включите туннель",
+        "Для full-tunnel на Windows команда config автоматически добавит маршрут к Endpoint",
+        "Проверка после подключения: ping 10.8.0.1, ping 8.8.8.8, curl https://ifconfig.me",
+    )
 
 def cmd_install_client(args):
     """Устанавливает или проверяет локальный VPN-клиент."""
@@ -689,6 +696,154 @@ def cmd_remove(args):
     log.info(f"Выполнение на сервере: {' '.join(shlex.quote(c) for c in remote_cmd)}")
     exec_remote(args, remote_cmd)
         
+def get_windows_default_gateway(args):
+    """Возвращает основной IPv4 gateway Windows для маршрута к Endpoint."""
+    if platform.system() != "Windows":
+        raise RuntimeError("Команда endpoint-route сейчас поддерживается только на Windows")
+
+    code, out, err = run_local_result(["route", "print", "-4"], args.debug)
+    if code != 0:
+        raise RuntimeError(f"Не удалось получить таблицу маршрутов Windows: {err or out}")
+
+    candidates = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[0] != "0.0.0.0" or parts[1] != "0.0.0.0":
+            continue
+        gateway = parts[2]
+        iface = parts[3]
+        if gateway.lower() == "on-link":
+            continue
+        if iface.startswith("10.8."):
+            continue
+        try:
+            metric = int(parts[4])
+        except ValueError:
+            metric = 9999
+        candidates.append((metric, gateway, iface))
+
+    if not candidates:
+        raise RuntimeError("Не найден обычный IPv4 default gateway. Отключите туннель и повторите endpoint-route add")
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0]
+
+
+def windows_endpoint_route_exists(args, gateway=None):
+    """Проверяет наличие Windows-маршрута /32 к Endpoint."""
+    code, out, err = run_local_result(["route", "print", args.host], args.debug)
+    if code != 0:
+        return False
+
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[0] != args.host or parts[1] != "255.255.255.255":
+            continue
+        if gateway and parts[2] != gateway:
+            continue
+        return True
+    return False
+
+
+def run_windows_route_elevated(args, gateway):
+    """Добавляет маршрут к Endpoint через UAC-запрос Windows."""
+    # route delete может завершиться ошибкой, если маршрута ещё нет. Это штатно.
+    cmd_line = (
+        f"route delete {args.host} >nul 2>nul & "
+        f"route add {args.host} mask 255.255.255.255 {gateway} metric 1"
+    )
+    ps_cmd = (
+        "$p = Start-Process -FilePath 'cmd.exe' "
+        f"-ArgumentList @('/c', '{cmd_line}') "
+        "-Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+    )
+    code, out, err = run_local_result(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+        args.debug
+    )
+    if code != 0:
+        raise RuntimeError(
+            "Не удалось добавить маршрут через UAC. "
+            "Возможно, запрос повышения прав был отменён. "
+            f"Подробности: {err or out}"
+        )
+
+
+def ensure_windows_endpoint_route(args, allow_elevate=False):
+    """Обеспечивает Windows-маршрут к Endpoint мимо full-tunnel VPN."""
+    if platform.system() != "Windows":
+        return False
+
+    metric, gateway, iface = get_windows_default_gateway(args)
+    log.info(f"Найден основной gateway Windows: {gateway} через интерфейс {iface}, метрика {metric}")
+
+    if windows_endpoint_route_exists(args, gateway=gateway):
+        log.info(f"Маршрут к Endpoint уже есть: {args.host}/32 -> {gateway}")
+        return True
+
+    if not allow_elevate:
+        # Удаляем старый маршрут к этому Endpoint, чтобы команда была повторяемой.
+        run_local_result(["route", "delete", args.host], args.debug)
+        code, out, err = run_local_result(
+            ["route", "add", args.host, "mask", "255.255.255.255", gateway, "metric", "1"],
+            args.debug
+        )
+        if code != 0:
+            raise RuntimeError(
+                "Не удалось добавить маршрут к Endpoint. "
+                "Запустите командную строку от имени администратора или разрешите UAC-запрос. "
+                f"Подробности: {err or out}"
+            )
+    else:
+        log.info("Для full-tunnel нужен маршрут к Endpoint мимо VPN. Сейчас будет запрос повышения прав Windows")
+        run_windows_route_elevated(args, gateway)
+
+    if not windows_endpoint_route_exists(args, gateway=gateway):
+        raise RuntimeError("Маршрут к Endpoint не найден после добавления")
+
+    log.info(f"Маршрут к Endpoint добавлен: {args.host}/32 -> {gateway}")
+    return True
+
+
+def cmd_endpoint_route(args):
+    """Управляет Windows-маршрутом к Endpoint мимо full-tunnel VPN."""
+    require_host(args)
+    if platform.system() != "Windows":
+        raise RuntimeError("Команда endpoint-route сейчас поддерживается только на Windows")
+
+    if args.route_action == "status":
+        code, out, err = run_local_result(["route", "print", args.host], args.debug)
+        if out:
+            safe_print(out)
+        if err:
+            safe_print(err, file=sys.stderr)
+        if windows_endpoint_route_exists(args):
+            add_advice("Маршрут к Endpoint найден. Можно включать full-tunnel VPN")
+        else:
+            add_advice("Маршрут к Endpoint не найден. Выполните endpoint-route add до включения full-tunnel VPN")
+        return
+
+    if args.route_action == "delete":
+        code, out, err = run_local_result(["route", "delete", args.host], args.debug)
+        if code != 0:
+            log.info(f"Маршрут к Endpoint не найден или уже удалён: {args.host}")
+            add_advice("Удалять нечего. Для проверки выполните endpoint-route status")
+            return
+        log.info(f"Маршрут к Endpoint удалён: {args.host}")
+        add_advice("Перед следующим включением full-tunnel VPN снова выполните config <имя> или endpoint-route add")
+        return
+
+    ensure_windows_endpoint_route(args, allow_elevate=True)
+    add_advice(
+        "Теперь включите туннель и проверьте ping 10.8.0.1.",
+        "Для удаления маршрута выполните endpoint-route delete."
+    )
+
+
 def cmd_config(args):
     """Скачивание конфигурации клиента через серверный модуль с sudo-доступом."""
     ensure_remote_version_compatible(args)
@@ -708,9 +863,34 @@ def cmd_config(args):
                 f.write("\n")
         os.chmod(local_file, 0o600)
         log.info(f"Конфиг сохранён: {os.path.abspath(local_file)}")
-        add_advice("Проверьте, что Endpoint в конфиге равен публичному адресу сервера: " + args.host,
-                   "Дальше: импортируйте конфиг в WireGuard/AmneziaWG-клиент и включите туннель",
-                   "Проверка: ping 10.8.0.1, затем проверьте внешний IP через браузер или curl ifconfig.me")
+
+        full_tunnel = bool(re.search(r"^\s*AllowedIPs\s*=\s*0\.0\.0\.0/0\s*$", content, re.MULTILINE))
+        endpoint_route_ok = True
+
+        if platform.system() == "Windows" and full_tunnel:
+            try:
+                ensure_windows_endpoint_route(args, allow_elevate=True)
+                add_advice("Маршрут к Endpoint добавлен автоматически. Теперь можно включать full-tunnel VPN")
+            except RuntimeError as route_error:
+                endpoint_route_ok = False
+                log.warning(str(route_error))
+                add_advice(
+                    "Автоматически добавить маршрут к Endpoint не удалось.",
+                    "До включения full-tunnel VPN выполните:",
+                    format_current_command(args, "endpoint-route") + " add",
+                )
+
+        advice = [
+            "Проверьте, что Endpoint в конфиге равен публичному адресу сервера: " + args.host,
+            "Для backend awg конфиг должен содержать параметры Jc, Jmin, Jmax, S1, S2, H1-H4",
+        ]
+        if full_tunnel and platform.system() == "Windows" and not endpoint_route_ok:
+            advice.append("Не включайте full-tunnel VPN, пока не добавлен маршрут к Endpoint")
+        advice.extend([
+            "Дальше: импортируйте конфиг в WireGuard/AmneziaWG-клиент и включите туннель",
+            "Проверка: ping 10.8.0.1, ping 8.8.8.8, затем curl https://ifconfig.me",
+        ])
+        add_advice(*advice)
     except RuntimeError as e:
         raise RuntimeError(f"Не удалось скачать конфиг. Проверьте имя учётки: {e}")
 
@@ -759,7 +939,7 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vcli-admin.py {init|patch|install-client|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
+        print("Краткая справка: vcli-admin.py {init|patch|install-client|endpoint-route|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
         sys.exit(0)
         
     if "--version" not in sys.argv:
@@ -788,6 +968,9 @@ def main():
     p_install_client.add_argument("--yes", action="store_true", help="Установить без интерактивного подтверждения")
     p_install_client.add_argument("--check-only", action="store_true", help="Только проверить, ничего не устанавливать")
     p_install_client.add_argument("--manual", action="store_true", help="Не устанавливать, вывести инструкцию")
+
+    p_endpoint_route = subparsers.add_parser("endpoint-route", help="Добавить, удалить или проверить Windows-маршрут к Endpoint")
+    p_endpoint_route.add_argument("route_action", choices=["add", "delete", "status"], help="Действие с маршрутом к --host: add, delete или status")
 
     p_remove = subparsers.add_parser("remove", help="Удаление VPN runtime и пакетов без удаления данных")
     p_remove.add_argument("confirm", help="Для подтверждения введите REMOVE")
@@ -841,6 +1024,8 @@ def main():
             cmd_patch(args)
         elif args.command == "install-client":
             cmd_install_client(args)
+        elif args.command == "endpoint-route":
+            cmd_endpoint_route(args)
         elif args.command in ("remove", "purge"):
             cmd_remove(args)
         elif args.command == "config":
