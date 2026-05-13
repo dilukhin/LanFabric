@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.9"
+__version__ = "0.0.11"
 
 import sys
 import os
@@ -35,6 +35,27 @@ logging.basicConfig(
 for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 log = logging.getLogger("vsrv")
+ADVICE_LINES = []
+
+def add_advice(*lines):
+    """Добавляет рекомендации, которые будут напечатаны в конце вывода."""
+    for line in lines:
+        if not line:
+            continue
+        for part in str(line).splitlines():
+            part = part.strip()
+            if part and part not in ADVICE_LINES:
+                ADVICE_LINES.append(part)
+
+def flush_advice():
+    """Печатает накопленные рекомендации заметным блоком."""
+    if not ADVICE_LINES:
+        return
+    log.info("*** РЕКОМЕНДАЦИИ ***")
+    for line in ADVICE_LINES:
+        log.info(line)
+    log.info("*** КОНЕЦ РЕКОМЕНДАЦИЙ ***")
+    ADVICE_LINES.clear()
 
 def print_intro():
     """Выводит краткую информацию о серверном инструменте."""
@@ -118,7 +139,7 @@ def cmd_stop():
     cleanup_firewall_rules()
     run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
     log.info("VPN runtime остановлен")
-    log.info("Рекомендация: для повторного запуска выполните start, для проверки состояния — status или health")
+    add_advice("Для повторного запуска выполните start, для проверки состояния — status или health")
 
 def cmd_start():
     """Запускает VPN runtime по сохранённому backend без полного init."""
@@ -167,7 +188,7 @@ def cmd_start():
     run_cmd(f"{wg_bin} show {WG_IF}")
     cmd_sync()
     log.info("VPN runtime запущен")
-    log.info("Рекомендация: выполните status или health. Для подключения клиента скачайте конфиг командой config <имя>")
+    add_advice("Выполните status или health. Для подключения клиента скачайте конфиг командой config <имя>")
 
 def cmd_restart():
     """Перезапускает VPN runtime без полного init."""
@@ -237,7 +258,7 @@ def cmd_remove(args):
     remove_packages(purge=False)
 
     log.info("Remove завершён. Данные /opt/vpn-admin и /etc/wireguard сохранены.")
-    log.info("Рекомендация: для повторного развёртывания выполните init. Для полного удаления используйте purge PURGE")
+    add_advice("Для повторного развёртывания выполните init. Для полного удаления используйте purge PURGE")
 
 
 def cmd_purge(args):
@@ -259,7 +280,7 @@ def cmd_purge(args):
     log.info("Удаление каталога LanFabric. Серверный модуль будет удалён вместе с каталогом.")
     run_cmd(f"rm -rf {REMOTE_DIR} 2>/dev/null || true", check=False)
     print("Purge завершён. LanFabric полностью удалён с сервера.")
-    print("Рекомендация: для новой установки заново выполните init с клиента")
+    add_advice("Для новой установки заново выполните init с клиента")
 
 def init_db():
     """Создаёт или подключается к SQLite базе."""
@@ -448,7 +469,7 @@ ListenPort = {WG_BASE_PORT}
     run_cmd("netfilter-persistent save")
 
     log.info("Инициализация завершена. Интерфейс поднят, правила сохранены.")
-    log.info("Рекомендация: выполните add <имя> для создания пользователя или health для проверки системы")
+    add_advice("Выполните add <имя> для создания пользователя или health для проверки системы")
 
 def cmd_status():
     """Быстрая проверка состояния."""
@@ -499,11 +520,11 @@ def cmd_status():
 
     log.info(f"Состояние VPN: {state}")
     if state == "RUNNING":
-        log.info("Рекомендация: можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
+        add_advice("Можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
     elif state == "STOPPED":
-        log.info("Рекомендация: выполните start для запуска VPN runtime")
+        add_advice("Выполните start для запуска VPN runtime")
     elif state == "BROKEN":
-        log.warning("Рекомендация: выполните health для подробной диагностики, затем restart или init при необходимости")
+        add_advice("Выполните health для подробной диагностики, затем restart или init при необходимости")
 
     conn = init_db()
     total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
@@ -632,9 +653,8 @@ def cmd_health():
         for err in errors:
             log.warning(f"- {err}")
         if advices:
-            log.info("Рекомендации:")
             for advice in dict.fromkeys(advices):
-                log.info(f"- {advice}")
+                add_advice(advice)
     else:
         log.info("Система работает штатно, нарушений не выявлено")
 
@@ -668,12 +688,12 @@ def cmd_sync():
             ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
     run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
-    log.info("Рекомендация: выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
+    add_advice("Выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
 
-def build_client_config(row):
+def build_client_config(row, endpoint=None):
     """Формирует клиентский конфиг из данных БД."""
     server_pub = open(f"/etc/wireguard/{WG_IF}.public").read().strip()
-    server_ip = run_cmd("hostname -I | awk '{print $1}'").strip()
+    server_ip = str(endpoint).strip() if endpoint else run_cmd("hostname -I | awk '{print $1}'").strip()
     allowed_ips = "0.0.0.0/0" if row["internet"] else VPN_NET
 
     return f"""[Interface]
@@ -707,7 +727,7 @@ def cmd_config(args):
     if not row:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
 
-    sys.stdout.write(build_client_config(row))
+    sys.stdout.write(build_client_config(row, args.endpoint))
 
 def cmd_add(args):
     """Добавление учётной записи."""
@@ -743,9 +763,9 @@ def cmd_add(args):
     log.info(f"Учётная запись '{args.name}' создана. IP: {ip}, Админ: {bool(admin_val)}, Интернет: {bool(internet_val)}")
     log.info(f"Конфиг сохранён: {cfg_path}")
     if internet_val:
-        log.info("Рекомендация: скачайте конфиг командой config и импортируйте его в клиент. Интернет-трафик будет направлен через VPN")
+        add_advice("Скачайте конфиг командой config и импортируйте его в клиент. Интернет-трафик будет направлен через VPN")
     else:
-        log.info("Рекомендация: скачайте конфиг командой config. По умолчанию будет доступна только VPN-сеть")
+        add_advice("Скачайте конфиг командой config. По умолчанию будет доступна только VPN-сеть")
 
 def cmd_edit(args):
     """Редактирование учётной записи."""
@@ -773,7 +793,7 @@ def cmd_edit(args):
     conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE name=?", params)
     conn.commit()
     log.info("Параметры учётной записи обновлены")
-    log.info("Рекомендация: выполните sync для применения сетевых правил. Если менялся интернет-доступ, заново скачайте config <имя>")
+    add_advice("Выполните sync для применения сетевых правил. Если менялся интернет-доступ, заново скачайте config <имя>")
 
 def cmd_block(args):
     """Блокировка учётной записи."""
@@ -793,7 +813,7 @@ def cmd_block(args):
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
     log.info(f"Учётная запись '{args.name}' заблокирована. Соединение разорвано.")
-    log.info("Рекомендация: выполните list для проверки статуса или sync для полной пересборки runtime-правил")
+    add_advice("Выполните list для проверки статуса или sync для полной пересборки runtime-правил")
 
 def cmd_delete(args):
     """Удаление учётной записи с подтверждением."""
@@ -820,7 +840,7 @@ def cmd_delete(args):
         cfg.unlink()
         
     log.info(f"Учётная запись '{args.name}' полностью удалена.")
-    log.info("Рекомендация: выполните list для проверки списка пользователей")
+    add_advice("Выполните list для проверки списка пользователей")
 
 def cmd_list():
     """Список учётных записей."""
@@ -885,6 +905,7 @@ def main():
     
     p_cfg = subparsers.add_parser("config", help="Вывод клиентского .conf в stdout")
     p_cfg.add_argument("name", help="Имя учётной записи")
+    p_cfg.add_argument("--endpoint", default=None, help="Публичный IP или DNS-имя сервера для Endpoint")
 
     subparsers.add_parser("list", help="Вывод списка учётных записей")
     subparsers.add_parser("help", help="Подробная справка")
@@ -928,8 +949,10 @@ def main():
             cmd_remove(args)
         elif args.command == "purge":
             cmd_purge(args)
+        flush_advice()
     except Exception as e:
         log.error(str(e))
+        flush_advice()
         sys.exit(1)
 
 if __name__ == "__main__":

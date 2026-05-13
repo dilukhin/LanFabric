@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.9"
+__version__ = "0.0.11"
 
 import sys
 import os
@@ -12,6 +12,7 @@ import argparse
 import logging
 import shlex
 import platform
+import locale
 import re
 
 # Константы
@@ -25,6 +26,47 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("vcli")
+ADVICE_LINES = []
+
+class VersionMismatchError(RuntimeError):
+    """Ошибка несовпадения версий клиента и сервера."""
+    def __init__(self, message, advice_lines):
+        super().__init__(message)
+        self.advice_lines = advice_lines
+
+def add_advice(*lines):
+    """Добавляет рекомендации, которые будут напечатаны в конце вывода."""
+    for line in lines:
+        if not line:
+            continue
+        for part in str(line).splitlines():
+            part = part.strip()
+            if part and part not in ADVICE_LINES:
+                ADVICE_LINES.append(part)
+
+def flush_advice():
+    """Печатает накопленные рекомендации заметным блоком."""
+    if not ADVICE_LINES:
+        return
+    log.info("*** РЕКОМЕНДАЦИИ ***")
+    for line in ADVICE_LINES:
+        log.info(line)
+    log.info("*** КОНЕЦ РЕКОМЕНДАЦИЙ ***")
+    ADVICE_LINES.clear()
+
+def format_current_command(args, command):
+    """Формирует команду клиента с текущими параметрами подключения."""
+    parts = ["python", os.path.basename(__file__)]
+    if getattr(args, "host", None):
+        parts.extend(["--host", args.host])
+    if getattr(args, "user", None):
+        parts.extend(["--user", args.user])
+    if getattr(args, "auth", None):
+        parts.extend(["--auth", args.auth])
+    if getattr(args, "key", None):
+        parts.extend(["--key", args.key])
+    parts.append(command)
+    return " ".join(shlex.quote(str(part)) for part in parts)
 
 def print_intro():
     """Выводит краткую информацию о клиентском инструменте."""
@@ -51,7 +93,7 @@ def build_ssh_cmd(args, use_tty=False, force_no_debug=False):
     base.append(f"{args.user}@{args.host}")
     return base
 
-def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_no_debug=False):
+def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_no_debug=False, timeout=30):
     """Выполняет команду на удалённом сервере с потоковым выводом или захватом stdout."""
     ssh_cmd = build_ssh_cmd(args, use_tty, force_no_debug=force_no_debug)
     safe_remote_cmd = " ".join(shlex.quote(str(c)) for c in remote_cmd_list)
@@ -67,15 +109,37 @@ def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_
             raise RuntimeError(f"Ошибка SSH (TTY): код возврата {res.returncode}")
         return ""
 
-    # Потоковый режим
+    # Непотоковый режим нужен для служебных команд с чистым stdout:
+    # version, backend, config. Здесь нельзя зависать на readline().
+    if not stream_output:
+        try:
+            res = subprocess.run(
+                ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"SSH-команда не завершилась за {timeout} секунд: {safe_remote_cmd}")
+        captured_output = (res.stdout or "").strip()
+        if res.returncode != 0:
+            if captured_output:
+                raise RuntimeError(f"Ошибка SSH: {captured_output}")
+            raise RuntimeError("Ошибка SSH без вывода")
+        return captured_output
+
+    # Потоковый режим для длинных серверных операций.
     process = subprocess.Popen(
         ssh_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        encoding='utf-8',
-        errors='replace'
+        encoding="utf-8",
+        errors="replace"
     )
 
     output_lines = []
@@ -83,8 +147,7 @@ def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_
     for line in iter(process.stdout.readline, ''):
         line = line.rstrip()
         if line:
-            if stream_output:
-                print(line)          # сразу в консоль
+            print(line)
             output_lines.append(line)
 
     process.stdout.close()
@@ -99,22 +162,138 @@ def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_
 
     return captured_output
 
+def local_output_encodings():
+    """Возвращает список вероятных кодировок вывода локальных команд."""
+    encodings = []
+
+    for enc in (
+        locale.getpreferredencoding(False),
+        getattr(sys.stdout, "encoding", None),
+        getattr(sys.stderr, "encoding", None),
+    ):
+        if enc and enc not in encodings:
+            encodings.append(enc)
+
+    if platform.system() == "Windows":
+        for enc in ("utf-8-sig", "utf-8", "cp866", "cp1251", "mbcs"):
+            if enc not in encodings:
+                encodings.append(enc)
+    else:
+        for enc in ("utf-8", "utf-8-sig"):
+            if enc not in encodings:
+                encodings.append(enc)
+
+    return encodings
+
+def decode_local_output(data, stream_name):
+    """Декодирует bytes-вывод локальной команды с fallback по кодировкам."""
+    if not data:
+        return ""
+
+    for enc in local_output_encodings():
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        except LookupError:
+            continue
+
+    fallback = locale.getpreferredencoding(False) or "utf-8"
+    log.warning(
+        f"Не удалось строго декодировать {stream_name} локальной команды. "
+        f"Вывод будет показан с заменой нечитаемых символов"
+    )
+    return data.decode(fallback, errors="replace")
+
+def safe_print(text, file=None):
+    """Печатает текст, не прерывая команду из-за неподдерживаемых символов."""
+    if not text:
+        return
+
+    stream = file or sys.stdout
+    try:
+        print(text, file=stream)
+        return
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or locale.getpreferredencoding(False) or "utf-8"
+        log.warning(
+            "Кодировка текущего вывода не поддерживает часть символов. "
+            "Они будут заменены при печати"
+        )
+        safe_text = str(text).encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(safe_text, file=stream)
+
+
+def is_console_output():
+    """Проверяет, что stdout и stderr подключены к консоли, а не к файлу."""
+    return bool(sys.stdout.isatty() and sys.stderr.isatty())
+
+def looks_like_winget_progress_line(line):
+    """Определяет служебные строки прогресса winget, которые не надо писать в лог."""
+    stripped = str(line).strip()
+    if not stripped:
+        return True
+
+    if stripped in ("-", "\\", "|", "/"):
+        return True
+
+    # Прогресс winget часто содержит только псевдографику, проценты и размеры.
+    # В неправильной кодировке блоки могут выглядеть как последовательности "в–".
+    if " / " in stripped and ("MB" in stripped or "KB" in stripped or " B" in stripped):
+        if "█" in stripped or "▒" in stripped or "░" in stripped or "в–" in stripped:
+            return True
+
+    if stripped.endswith("%") and ("█" in stripped or "▒" in stripped or "░" in stripped or "в–" in stripped):
+        return True
+
+    return False
+
+def clean_winget_output(text):
+    """Удаляет из вывода winget строки spinner/progress, оставляя смысловые сообщения."""
+    if not text:
+        return ""
+
+    lines = []
+    for line in str(text).splitlines():
+        if looks_like_winget_progress_line(line):
+            continue
+        lines.append(line.rstrip())
+
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    return "\n".join(lines)
+
+def run_local_passthrough(cmd_list, debug=False):
+    """Выполняет локальную команду с прямым выводом в консоль."""
+    if debug:
+        log.debug(f"Локальная команда: {' '.join(shlex.quote(c) for c in cmd_list)}")
+    try:
+        res = subprocess.run(cmd_list)
+        return res.returncode
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+
 def run_local(cmd_list, debug=False):
     """Выполняет команду локально."""
     if debug:
         log.debug(f"Локальная команда: {' '.join(shlex.quote(c) for c in cmd_list)}")
-    res = subprocess.run(cmd_list, capture_output=True, encoding='utf-8', errors='replace')
-    if res.returncode != 0:
-        raise RuntimeError(f"Локальная ошибка: {res.stderr.strip() or res.stdout.strip()}")
-    return res.stdout.strip()
+    code, out, err = run_local_result(cmd_list, debug=False)
+    if code != 0:
+        raise RuntimeError(f"Локальная ошибка: {err or out}")
+    return out.strip()
 
 def run_local_result(cmd_list, debug=False):
     """Выполняет локальную команду и возвращает код, stdout, stderr без исключения."""
     if debug:
         log.debug(f"Локальная команда: {' '.join(shlex.quote(c) for c in cmd_list)}")
     try:
-        res = subprocess.run(cmd_list, capture_output=True, encoding='utf-8', errors='replace')
-        return res.returncode, res.stdout.strip(), res.stderr.strip()
+        res = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = decode_local_output(res.stdout, "stdout").strip()
+        err = decode_local_output(res.stderr, "stderr").strip()
+        return res.returncode, out, err
     except FileNotFoundError as e:
         return 127, "", str(e)
 
@@ -171,13 +350,21 @@ def ensure_remote_version_compatible(args):
     if state == "equal":
         return remote_ver
     if state == "patch_mismatch":
-        raise RuntimeError(
-            f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. "
-            "Отличается только patch-версия. Выполните команду patch, затем повторите действие"
+        raise VersionMismatchError(
+            f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. Отличается только patch-версия",
+            [
+                "Выполните обновление серверного модуля:",
+                format_current_command(args, "patch"),
+                "Затем повторите исходную команду.",
+            ]
         )
-    raise RuntimeError(
-        f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. "
-        "Отличается major или minor-версия. Разрешена только команда init"
+    raise VersionMismatchError(
+        f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. Отличается major или minor-версия",
+        [
+            "Разрешена только повторная инициализация серверной части:",
+            format_current_command(args, "init"),
+            "После init повторите нужную команду.",
+        ]
     )
 
 def get_remote_backend(args):
@@ -284,11 +471,16 @@ def cmd_patch(args):
     state = compare_versions(__version__, remote_ver)
     if state == "equal":
         log.info(f"Версии уже совпадают: {__version__}. Patch не требуется")
+        add_advice("Patch не требуется. Можно выполнять обычные команды управления сервером")
         return
     if state == "incompatible":
-        raise RuntimeError(
-            f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. "
-            "Отличается major или minor-версия. Разрешена только команда init"
+        raise VersionMismatchError(
+            f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. Отличается major или minor-версия",
+            [
+                "Patch запрещён при отличии major или minor-версии.",
+                "Выполните повторную инициализацию серверной части:",
+                format_current_command(args, "init"),
+            ]
         )
 
     log.info(f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. Обновление patch-версии")
@@ -297,7 +489,7 @@ def cmd_patch(args):
     new_remote_ver = get_remote_version(args)
     if compare_versions(__version__, new_remote_ver) != "equal":
         raise RuntimeError(f"После patch версия сервера осталась несовместимой: {new_remote_ver}")
-    log.info("Patch завершён. Теперь можно повторить исходную команду")
+    add_advice("Patch завершён. Теперь можно повторить исходную команду")
 
 def manual_client_instruction(client_type):
     """Возвращает инструкцию по ручной установке VPN-клиента."""
@@ -389,59 +581,82 @@ def install_windows_client(args, client_type):
     log.info(f"winget package id: {package['id']}")
 
     if not is_winget_available(args):
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     try:
         winget_show_package(args, package["id"])
     except RuntimeError as e:
         log.warning(str(e))
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     installed, installed_version = winget_list_package(args, package["id"])
     if installed:
         log.info(f"Клиент уже установлен: {package['name']} {installed_version or 'версия не определена'}")
-        log.info("Дальше: импортируйте .conf в клиент и включите туннель")
+        add_advice("Дальше: импортируйте .conf в клиент и включите туннель")
         return
 
     if args.check_only:
-        log.info("Клиент не установлен. Режим --check-only: установка не выполняется")
+        add_advice("Клиент не установлен. Режим --check-only: установка не выполняется")
         return
 
     if args.manual:
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     if not args.yes:
-        answer = input(f"Установить {package['name']} через winget? [y/N]: ").strip().lower()
+
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            add_advice(
+                "Запустите команду с --yes для автоматической установки:",
+                format_current_command(args, "install-client") + " --yes",
+                "Или используйте --manual, чтобы вывести инструкцию без установки:",
+                format_current_command(args, "install-client") + " --manual",
+            )
+            raise RuntimeError("Интерактивное подтверждение невозможно при перенаправлении вывода")
+
+        answer = input(
+            f"Установить {package['name']} через winget? [y/N]: "
+        ).strip().lower()
+
         if answer not in ("y", "yes", "д", "да"):
             log.info("Установка отменена пользователем")
-            log.info(manual_client_instruction(client_type))
+            add_advice(
+                "Можно выполнить install-client --yes для автоматической установки "
+                "или install-client --manual для ручной установки"
+            )
             return
 
     cmd = [
         "winget", "install", "-e", "--id", package["id"],
         "--accept-package-agreements", "--accept-source-agreements"
     ]
-    code, out, err = run_local_result(cmd, args.debug)
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
+
+    if is_console_output():
+        code = run_local_passthrough(cmd, args.debug)
+    else:
+        code, out, err = run_local_result(cmd, args.debug)
+        clean_out = clean_winget_output(out)
+        clean_err = clean_winget_output(err)
+        if clean_out:
+            safe_print(clean_out)
+        if clean_err:
+            safe_print(clean_err, file=sys.stderr)
+
     if code != 0:
         log.warning(f"winget install завершился ошибкой: {code}")
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     installed, installed_version = winget_list_package(args, package["id"])
     if not installed:
         log.warning("Установка завершилась без ошибки, но повторная проверка пакет не нашла")
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     log.info(f"Клиент установлен: {package['name']} {installed_version or 'версия не определена'}")
-    log.info("Дальше: импортируйте .conf в клиент, включите туннель и проверьте ping 10.8.0.1")
+    add_advice("Дальше: импортируйте .conf в клиент, включите туннель и проверьте ping 10.8.0.1")
 
 def cmd_install_client(args):
     """Устанавливает или проверяет локальный VPN-клиент."""
@@ -458,7 +673,7 @@ def cmd_install_client(args):
     log.info(f"ОС: {system}")
     if system != "Windows":
         log.info("Автоматическая установка клиента сейчас реализована только для Windows")
-        log.info(manual_client_instruction(client_type))
+        add_advice(manual_client_instruction(client_type))
         return
 
     install_windows_client(args, client_type)
@@ -480,7 +695,7 @@ def cmd_config(args):
     local_file = f"{args.name}.conf"
     log.info(f"Загрузка конфигурации для {args.name}")
 
-    remote_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "config", args.name]
+    remote_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "config", args.name, "--endpoint", args.host]
 
     try:
         # Для конфига нужен чистый stdout: без потоковой печати и без ssh -v даже при --debug.
@@ -493,8 +708,9 @@ def cmd_config(args):
                 f.write("\n")
         os.chmod(local_file, 0o600)
         log.info(f"Конфиг сохранён: {os.path.abspath(local_file)}")
-        log.info("Дальше: импортируйте конфиг в WireGuard/AmneziaWG-клиент и включите туннель")
-        log.info("Проверка: ping 10.8.0.1, затем проверьте внешний IP через браузер или curl ifconfig.me")
+        add_advice("Проверьте, что Endpoint в конфиге равен публичному адресу сервера: " + args.host,
+                   "Дальше: импортируйте конфиг в WireGuard/AmneziaWG-клиент и включите туннель",
+                   "Проверка: ping 10.8.0.1, затем проверьте внешний IP через браузер или curl ifconfig.me")
     except RuntimeError as e:
         raise RuntimeError(f"Не удалось скачать конфиг. Проверьте имя учётки: {e}")
 
@@ -631,14 +847,21 @@ def main():
             cmd_config(args)
         else:
             cmd_forward(args)
+        flush_advice()
+    except VersionMismatchError as e:
+        log.error(str(e))
+        add_advice(*e.advice_lines)
+        flush_advice()
+        sys.exit(1)
     except Exception as e:
         log.error(str(e))
-        log.info("Проверьте:")
-        log.info("1) доступ сервера в интернет")
-        log.info("2) наличие sudo без пароля или используйте --tty")
-        log.info("3) если отличается только patch-версия, выполните patch")
-        log.info("4) при несовместимых major/minor-версиях выполните init")
-        log.info("5) при проблемах с AmneziaWG используйте init --no-amnezia")
+        if not ADVICE_LINES:
+            add_advice(
+                "Проверьте доступность сервера и SSH-доступ.",
+                "Проверьте наличие sudo без пароля или используйте --tty.",
+                "Если проблема связана с backend AmneziaWG, используйте init --no-amnezia только при явном выборе WireGuard."
+            )
+        flush_advice()
         sys.exit(1)
 
 if __name__ == "__main__":
