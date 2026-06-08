@@ -2,3 +2,7 @@ log*.txt
 *.conf
 *.log
 *.diff
+
+# BMad
+_bmad-output/
+_bmad/config.user.toml

@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.14"
+__version__ = "0.0.15"
 
 import sys
 import os
@@ -26,6 +26,7 @@ WG_BASE_PORT = 51820
 BACKEND_PATH = "/opt/vpn-admin/backend"
 REMOTE_DIR = "/opt/vpn-admin"
 SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
+SUDOERS_LANFABRIC_GLOB = "/etc/sudoers.d/lanfabric-*"
 AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
 AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
 
@@ -415,6 +416,7 @@ def cmd_purge(args):
     log.info("Удаление конфигураций и данных LanFabric")
     run_cmd("rm -rf /etc/wireguard 2>/dev/null || true", check=False)
     run_cmd(f"rm -f {SUDOERS_PATH} 2>/dev/null || true", check=False)
+    run_cmd(f"rm -f {SUDOERS_LANFABRIC_GLOB} 2>/dev/null || true", check=False)
     run_cmd("rm -f /etc/sysctl.d/99-vpn-forward.conf 2>/dev/null || true", check=False)
 
     log.info("Удаление каталога LanFabric. Серверный модуль будет удалён вместе с каталогом.")

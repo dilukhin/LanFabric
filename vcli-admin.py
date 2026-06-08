@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.14"
+__version__ = "0.0.15"
 
 import sys
 import os
@@ -14,11 +14,19 @@ import shlex
 import platform
 import locale
 import re
+import tempfile
+import uuid
+import hashlib
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from pathlib import Path
 
 # Константы
 SERVER_SCRIPT = "vsrv-admin.py"
 REMOTE_DIR = "/opt/vpn-admin"
 REMOTE_SCRIPT = f"{REMOTE_DIR}/{SERVER_SCRIPT}"
+LANFABRIC_SSH_KEY = os.path.join(os.path.expanduser("~/.ssh"), "lanfabric_ed25519")
+TEMP_TRUST_TTL_SECONDS = 3600
 
 logging.basicConfig(
     level=logging.INFO,
@@ -394,36 +402,521 @@ def copy_server_module(args):
     exec_remote(args, ["sudo", "chmod", "+x", REMOTE_SCRIPT])
     log.info(f"Серверный модуль обновлён до версии {__version__}")
 
+def shell_single_quote(text):
+    """Безопасно заключает строку в одинарные кавычки для POSIX shell."""
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def current_client_id():
+    """Возвращает устойчивый идентификатор текущего клиентского компьютера."""
+    raw = "|".join([
+        platform.node() or "unknown-host",
+        os.environ.get("USERNAME") or os.environ.get("USER") or "unknown-user",
+        str(Path.home()),
+    ])
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def utc_now_text():
+    """Возвращает текущее UTC-время для маркеров LanFabric."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def lanfabric_marker(kind, args, nonce, ttl=None):
+    """Формирует комментарий-маркер для ключей и sudoers LanFabric."""
+    parts = [kind, f"host={args.host}", f"user={args.user}", f"client={current_client_id()}", f"created={utc_now_text()}"]
+    if ttl is not None:
+        parts.append(f"ttl={ttl}")
+    parts.append(f"nonce={nonce}")
+    return ":".join(parts)
+
+
+def ensure_local_keypair(private_key, marker):
+    """Создаёт локальную пару SSH-ключей LanFabric, если её ещё нет."""
+    private_key = os.path.abspath(os.path.expanduser(private_key))
+    public_key = private_key + ".pub"
+    os.makedirs(os.path.dirname(private_key), mode=0o700, exist_ok=True)
+    if os.path.exists(private_key) and os.path.exists(public_key):
+        return private_key, public_key
+    run_local(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", marker, "-f", private_key])
+    try:
+        os.chmod(private_key, 0o600)
+        os.chmod(public_key, 0o644)
+    except OSError:
+        pass
+    return private_key, public_key
+
+
+def create_temp_keypair(marker):
+    """Создаёт временную пару SSH-ключей для одной команды."""
+    temp_dir = tempfile.mkdtemp(prefix="lanfabric-ssh-")
+    private_key = os.path.join(temp_dir, "id_ed25519")
+    run_local(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", marker, "-f", private_key])
+    try:
+        os.chmod(private_key, 0o600)
+        os.chmod(private_key + ".pub", 0o644)
+    except OSError:
+        pass
+    return temp_dir, private_key, private_key + ".pub"
+
+
+def delete_temp_keypair(temp_dir):
+    """Удаляет локальный каталог с временной парой ключей."""
+    if not temp_dir:
+        return
+    try:
+        for name in os.listdir(temp_dir):
+            try:
+                os.remove(os.path.join(temp_dir, name))
+            except OSError:
+                pass
+        os.rmdir(temp_dir)
+    except OSError as e:
+        log.warning(f"Не удалось удалить временный каталог ключей {temp_dir}: {e}")
+
+
+def read_public_key_line(public_key_path, marker):
+    """Читает публичный ключ и заменяет комментарий на маркер LanFabric."""
+    text = Path(public_key_path).read_text(encoding="utf-8").strip()
+    parts = text.split()
+    if len(parts) < 2:
+        raise RuntimeError(f"Некорректный публичный SSH-ключ: {public_key_path}")
+    return f"{parts[0]} {parts[1]} {marker}"
+
+
+def ensure_remote_ssh_dir(args):
+    """Создаёт ~/.ssh на сервере с безопасными правами."""
+    exec_remote(args, ["mkdir", "-p", ".ssh"])
+    exec_remote(args, ["chmod", "700", ".ssh"])
+    exec_remote(args, ["sh", "-c", "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"])
+
+
+def add_authorized_key_line(args, line):
+    """Добавляет строку в authorized_keys, если такой строки ещё нет."""
+    ensure_remote_ssh_dir(args)
+    script = "set -eu\nak=\"$HOME/.ssh/authorized_keys\"\nline=$1\nif ! grep -Fxq -- \"$line\" \"$ak\" 2>/dev/null; then printf '%s\\n' \"$line\" >> \"$ak\"; fi\nchmod 600 \"$ak\""
+    exec_remote(args, ["sh", "-c", script, "lanfabric-add-key", line])
+
+
+def remove_authorized_key_by_marker(args, marker, all_lanfabric=False, temp_only=False):
+    """Удаляет из authorized_keys только строки LanFabric по маркеру."""
+    ensure_remote_ssh_dir(args)
+    script = """
+import os, sys
+marker = sys.argv[1]
+all_lanfabric = sys.argv[2] == '1'
+temp_only = sys.argv[3] == '1'
+ak = os.path.expanduser('~/.ssh/authorized_keys')
+try:
+    lines = open(ak, 'r', encoding='utf-8').readlines()
+except FileNotFoundError:
+    sys.exit(0)
+new = []
+removed = 0
+for line in lines:
+    if all_lanfabric:
+        drop = 'lanfabric-temp:' in line or 'lanfabric-trust:' in line
+    elif temp_only:
+        drop = 'lanfabric-temp:' in line
+    else:
+        drop = bool(marker and marker in line)
+    if drop:
+        removed += 1
+    else:
+        new.append(line)
+open(ak, 'w', encoding='utf-8').writelines(new)
+os.chmod(ak, 0o600)
+print(removed)
+""".strip()
+    out = exec_remote(args, ["python3", "-c", script, marker or "", "1" if all_lanfabric else "0", "1" if temp_only else "0"], stream_output=False)
+    lines = str(out or "0").splitlines()
+    return int(lines[-1]) if lines else 0
+
+
+def cleanup_stale_lanfabric_temp_keys(args, remove_all_temp=False):
+    """Удаляет просроченные или все временные SSH-ключи LanFabric."""
+    ensure_remote_ssh_dir(args)
+    script = """
+import os, sys, time, datetime
+remove_all = sys.argv[1] == '1'
+ak = os.path.expanduser('~/.ssh/authorized_keys')
+try:
+    lines = open(ak, 'r', encoding='utf-8').readlines()
+except FileNotFoundError:
+    sys.exit(0)
+now = time.time()
+new = []
+removed = 0
+for line in lines:
+    pos = line.find('lanfabric-temp:')
+    if pos < 0:
+        new.append(line)
+        continue
+    marker = line[pos:].strip().split()[0]
+    fields = {}
+    for part in marker.split(':')[1:]:
+        if '=' in part:
+            k, v = part.split('=', 1)
+            fields[k] = v
+    try:
+        created = fields.get('created', '').replace('Z', '+00:00')
+        ttl = int(fields.get('ttl', '0'))
+        expired = ttl > 0 and now > datetime.datetime.fromisoformat(created).timestamp() + ttl
+    except Exception:
+        expired = True
+    if remove_all or expired:
+        removed += 1
+    else:
+        new.append(line)
+open(ak, 'w', encoding='utf-8').writelines(new)
+os.chmod(ak, 0o600)
+print(removed)
+""".strip()
+    out = exec_remote(args, ["python3", "-c", script, "1" if remove_all_temp else "0"], stream_output=False)
+    lines = str(out or "0").splitlines()
+    removed = int(lines[-1]) if lines else 0
+    if removed:
+        log.info(f"Удалены временные SSH-ключи LanFabric: {removed}")
+    return removed
+
+
+def get_client_external_ip_from_ssh(args):
+    """Определяет IP клиента глазами SSH-сервера через SSH_CLIENT."""
+    try:
+        return exec_remote(args, ["sh", "-c", "printf '%s' \"${SSH_CLIENT%% *}\""], stream_output=False, force_no_debug=True).strip() or None
+    except RuntimeError:
+        return None
+
+
+def sudoers_rule_for_user(user):
+    """Возвращает sudoers-правило LanFabric для SSH-пользователя."""
+    return (
+        f"{user} ALL=(ALL) NOPASSWD: "
+        "/usr/bin/apt-get, /usr/bin/apt, /usr/bin/add-apt-repository, "
+        "/usr/bin/systemctl, /usr/sbin/iptables, /sbin/iptables, "
+        "/usr/bin/netfilter-persistent, /usr/bin/wg, /usr/bin/awg, "
+        "/usr/sbin/ip, /usr/bin/ip, /usr/sbin/modprobe, /sbin/modprobe, "
+        "/bin/mkdir, /bin/chmod, /bin/chown, /bin/rm, /usr/bin/rm, "
+        f"/usr/bin/python3 {REMOTE_SCRIPT} *"
+    )
+
+
+def write_sudoers_file(args, path, marker, use_tty=False):
+    """Создаёт sudoers-файл LanFabric и проверяет его через visudo."""
+    content = marker + "\n" + sudoers_rule_for_user(args.user) + "\n"
+    script = """
+import os, sys, subprocess
+path = sys.argv[1]
+content = sys.argv[2]
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+os.chmod(path, 0o440)
+res = subprocess.run(['visudo', '-cf', path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+if res.returncode != 0:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    sys.stdout.write(res.stdout)
+    sys.exit(res.returncode)
+""".strip()
+    exec_remote(args, ["sudo", "python3", "-c", script, path, content], use_tty=use_tty)
+
+
+def setup_temporary_sudo_trust(args, nonce):
+    """Создаёт временный sudoers-файл LanFabric для текущей команды."""
+    marker = "# " + lanfabric_marker("lanfabric-temp-sudo", args, nonce, ttl=TEMP_TRUST_TTL_SECONDS)
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
+    path = f"/etc/sudoers.d/lanfabric-temp-{safe_user}-{nonce}"
+    log.info("Настройка временного sudo trust LanFabric")
+    write_sudoers_file(args, path, marker, use_tty=True)
+    exec_remote(args, ["sudo", "-n", "true"], stream_output=False)
+    return path
+
+
+def cleanup_temporary_sudo_trust(args, path):
+    """Удаляет временный sudoers-файл LanFabric."""
+    if not path:
+        return
+    try:
+        exec_remote(args, ["sudo", "-n", "rm", "-f", path], stream_output=False, timeout=10)
+        log.info("Временный sudo trust LanFabric удалён")
+    except RuntimeError as e:
+        log.warning(f"Не удалось удалить временный sudo trust: {e}")
+        add_advice("Удалите временные записи LanFabric вручную:", format_current_command(args, "untrust") + " --temp")
+
+
+def cleanup_stale_temporary_sudo_trust(args, remove_all_temp=False, allow_tty=False):
+    """Удаляет просроченные или все временные sudoers-файлы LanFabric."""
+    script = """
+import os, sys, glob, time, datetime
+remove_all = sys.argv[1] == '1'
+removed = 0
+for path in glob.glob('/etc/sudoers.d/lanfabric-temp-*'):
+    try:
+        text = open(path, 'r', encoding='utf-8').read(4096)
+    except OSError:
+        continue
+    pos = text.find('lanfabric-temp-sudo:')
+    if pos < 0:
+        continue
+    marker = text[pos:].split()[0]
+    fields = {}
+    for part in marker.split(':')[1:]:
+        if '=' in part:
+            k, v = part.split('=', 1)
+            fields[k] = v
+    try:
+        created = fields.get('created', '').replace('Z', '+00:00')
+        ttl = int(fields.get('ttl', '0'))
+        expired = ttl > 0 and time.time() > datetime.datetime.fromisoformat(created).timestamp() + ttl
+    except Exception:
+        expired = True
+    if remove_all or expired:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+print(removed)
+""".strip()
+    try:
+        sudo_cmd = ["sudo", "python3", "-c", script, "1" if remove_all_temp else "0"] if allow_tty else ["sudo", "-n", "python3", "-c", script, "1" if remove_all_temp else "0"]
+        out = exec_remote(args, sudo_cmd, stream_output=False, timeout=15, use_tty=allow_tty)
+    except RuntimeError as e:
+        log.warning(f"Не удалось очистить временные sudoers LanFabric: {e}")
+        return 0
+    lines = str(out or "0").splitlines()
+    removed = int(lines[-1]) if lines else 0
+    if removed:
+        log.info(f"Удалены временные sudoers LanFabric: {removed}")
+    return removed
+
+
+def setup_permanent_sudo_trust(args):
+    """Создаёт постоянный sudoers-файл LanFabric после явного trust."""
+    marker = "# " + lanfabric_marker("lanfabric-trust-sudo", args, uuid.uuid4().hex[:12])
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
+    path = f"/etc/sudoers.d/lanfabric-trust-{safe_user}"
+    write_sudoers_file(args, path, marker, use_tty=True)
+    log.info(f"Постоянный sudo trust LanFabric настроен: {path}")
+
+
+def cleanup_permanent_sudo_trust(args, all_lanfabric=False, allow_tty=False):
+    """Удаляет постоянные sudoers-файлы LanFabric."""
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
+    if all_lanfabric:
+        script = "for f in /etc/sudoers.d/lanfabric-* /etc/sudoers.d/vpn-admin; do [ -f \"$f\" ] && grep -q 'lanfabric-' \"$f\" && rm -f \"$f\"; done"
+        exec_remote(args, (["sudo", "sh", "-c", script] if allow_tty else ["sudo", "-n", "sh", "-c", script]), use_tty=allow_tty)
+    else:
+        exec_remote(args, (["sudo", "rm", "-f", f"/etc/sudoers.d/lanfabric-trust-{safe_user}"] if allow_tty else ["sudo", "-n", "rm", "-f", f"/etc/sudoers.d/lanfabric-trust-{safe_user}"]), use_tty=allow_tty)
+
+
+
+def add_temporary_authorized_key_line(args, key_line):
+    """Одним SSH-подключением чистит старые временные ключи и добавляет новый временный ключ."""
+    script = """
+import os, sys, time, datetime
+base_key = sys.argv[1]
+ak_dir = os.path.expanduser('~/.ssh')
+ak = os.path.join(ak_dir, 'authorized_keys')
+os.makedirs(ak_dir, mode=0o700, exist_ok=True)
+try:
+    os.chmod(ak_dir, 0o700)
+except OSError:
+    pass
+try:
+    lines = open(ak, 'r', encoding='utf-8').readlines()
+except FileNotFoundError:
+    lines = []
+now = time.time()
+new = []
+removed = 0
+for line in lines:
+    pos = line.find('lanfabric-temp:')
+    if pos < 0:
+        new.append(line)
+        continue
+    marker = line[pos:].strip().split()[0]
+    fields = {}
+    for part in marker.split(':')[1:]:
+        if '=' in part:
+            k, v = part.split('=', 1)
+            fields[k] = v
+    try:
+        created = fields.get('created', '').replace('Z', '+00:00')
+        ttl = int(fields.get('ttl', '0'))
+        expired = ttl > 0 and now > datetime.datetime.fromisoformat(created).timestamp() + ttl
+    except Exception:
+        expired = True
+    if expired:
+        removed += 1
+    else:
+        new.append(line)
+client_ip = (os.environ.get('SSH_CLIENT') or '').split()[0] if os.environ.get('SSH_CLIENT') else ''
+if client_ip:
+    full_key = 'from="{}",no-agent-forwarding,no-X11-forwarding,no-port-forwarding {}'.format(client_ip, base_key)
+else:
+    full_key = 'no-agent-forwarding,no-X11-forwarding,no-port-forwarding ' + base_key
+if not any(line.strip() == full_key for line in new):
+    new.append(full_key + '\n')
+open(ak, 'w', encoding='utf-8').writelines(new)
+os.chmod(ak, 0o600)
+print('CLIENT_IP=' + client_ip)
+print('REMOVED=' + str(removed))
+""".strip()
+    out = exec_remote(args, ["python3", "-c", script, key_line], stream_output=False, force_no_debug=True)
+    client_ip = None
+    removed = 0
+    for line in str(out).splitlines():
+        if line.startswith("CLIENT_IP="):
+            client_ip = line.split("=", 1)[1] or None
+        elif line.startswith("REMOVED="):
+            try:
+                removed = int(line.split("=", 1)[1])
+            except ValueError:
+                removed = 0
+    if removed:
+        log.info(f"Удалены просроченные временные SSH-ключи LanFabric: {removed}")
+    return client_ip
+
+def setup_temporary_ssh_trust(args, nonce):
+    """Добавляет временный SSH-ключ LanFabric и переключает args на key."""
+    marker = lanfabric_marker("lanfabric-temp", args, nonce, ttl=TEMP_TRUST_TTL_SECONDS)
+    temp_dir, private_key, public_key = create_temp_keypair(marker)
+    original_auth = args.auth
+    original_key = args.key
+    key_line = read_public_key_line(public_key, marker)
+    client_ip = add_temporary_authorized_key_line(args, key_line)
+    if client_ip:
+        log.info(f"IP клиента по данным SSH-сервера: {client_ip}")
+    else:
+        log.warning("Не удалось определить IP клиента через SSH_CLIENT. Временный SSH trust добавлен без ограничения from=")
+        add_advice("Проверьте SSH-сервер: переменная SSH_CLIENT не определилась, временный ключ был добавлен без from=")
+    args.auth = "key"
+    args.key = private_key
+    log.info("Временный SSH trust LanFabric включён для текущей команды")
+    return {"marker": marker, "temp_dir": temp_dir, "original_auth": original_auth, "original_key": original_key}
+
+
+def cleanup_temporary_ssh_trust(args, state):
+    """Удаляет временный SSH-ключ LanFabric и локальные временные файлы."""
+    if not state:
+        return
+    try:
+        remove_authorized_key_by_marker(args, state.get("marker"))
+        log.info("Временный SSH trust LanFabric удалён")
+    except RuntimeError as e:
+        log.warning(f"Не удалось удалить временный SSH trust: {e}")
+        add_advice("Удалите временные ключи LanFabric вручную:", format_current_command(args, "untrust") + " --temp")
+    finally:
+        delete_temp_keypair(state.get("temp_dir"))
+        args.auth = state.get("original_auth")
+        args.key = state.get("original_key")
+
+
+def server_command_needs_password_session(args):
+    """Определяет, нужна ли временная password-сессия для серверной команды."""
+    if args.auth != "password":
+        return False
+    if args.command == "endpoint-route":
+        return False
+    if args.command == "install-client" and getattr(args, "client_type", "auto") != "auto":
+        return False
+    return args.command in (
+        "init", "patch", "install-client", "start", "stop", "restart", "remove", "purge",
+        "add", "edit", "block", "delete", "list", "config", "status", "health", "sync",
+    )
+
+
+@contextmanager
+def temporary_password_session_if_needed(args):
+    """Создаёт временный SSH/sudo trust для одной команды с гарантированной очисткой."""
+    ssh_state = None
+    sudo_path = None
+    if not server_command_needs_password_session(args):
+        if getattr(args, "host", None) and args.command not in ("endpoint-route", "help"):
+            try:
+                cleanup_stale_lanfabric_temp_keys(args)
+                cleanup_stale_temporary_sudo_trust(args)
+            except Exception as e:
+                log.debug(f"Фоновая очистка временных записей LanFabric не выполнена: {e}")
+        yield
+        return
+    nonce = uuid.uuid4().hex[:12]
+    try:
+        ssh_state = setup_temporary_ssh_trust(args, nonce)
+        sudo_path = setup_temporary_sudo_trust(args, nonce)
+        cleanup_stale_temporary_sudo_trust(args)
+        yield
+    finally:
+        if sudo_path:
+            cleanup_temporary_sudo_trust(args, sudo_path)
+        if ssh_state:
+            cleanup_temporary_ssh_trust(args, ssh_state)
+
+
 def ensure_sudo_nopasswd(args):
-    """Автоматическая настройка sudo без пароля. При отказе переключается в TTY-режим."""
+    """Проверяет sudo без пароля или выполняет явную разовую настройку через TTY."""
     log.info("Проверка прав sudo...")
     try:
-        exec_remote(args, ["sudo", "-n", "true"])
+        exec_remote(args, ["sudo", "-n", "true"], stream_output=False, timeout=10)
         log.info("Доступ к sudo без пароля подтверждён.")
+        cleanup_stale_temporary_sudo_trust(args)
         return
     except RuntimeError:
         pass
 
-    log.warning("Требуется пароль sudo. Запуск одноразовой настройки...")
-    sudoers_rule = (
-        f"{args.user} ALL=(ALL) NOPASSWD: "
-        "/usr/bin/apt-get, /usr/bin/systemctl, /sbin/iptables, "
-        "/usr/bin/netfilter-persistent, /usr/bin/wg, /usr/bin/awg, "
-        "/usr/bin/ip, /bin/mkdir, /bin/chmod, /bin/chown, /bin/rm, "
-        f"/usr/bin/python3 {REMOTE_SCRIPT} *"
-    )
-    setup_cmd = (
-        f"sudo sh -c 'echo \"{sudoers_rule}\" > /etc/sudoers.d/vpn-admin && "
-        "chmod 0440 /etc/sudoers.d/vpn-admin && "
-        "visudo -cf /etc/sudoers.d/vpn-admin'"
-    )
+    log.warning("Требуется пароль sudo. Будет выполнена настройка sudoers через интерактивный TTY")
+    marker = "# " + lanfabric_marker("lanfabric-trust-sudo", args, uuid.uuid4().hex[:12])
     try:
-        exec_remote(args, [setup_cmd], use_tty=True)
-        log.info("Настройка sudoers завершена. Пароль больше не потребуется.")
+        write_sudoers_file(args, "/etc/sudoers.d/vpn-admin", marker, use_tty=True)
+        exec_remote(args, ["sudo", "-n", "true"], stream_output=False, timeout=10)
+        log.info("Настройка sudoers завершена. Пароль sudo больше не потребуется.")
     except RuntimeError as e:
         log.error(f"Не удалось настроить sudo автоматически: {e}")
         log.info("Включён режим интерактивного ввода пароля (--tty) для текущей сессии.")
         args.ssh_tty = True
+
+
+def cmd_trust(args):
+    """Постоянно доверяет текущий клиентский компьютер данному серверу."""
+    require_host(args)
+    if args.confirm != "TRUST":
+        raise RuntimeError("Для подтверждения постоянного trust укажите: trust TRUST")
+    log.warning("Этот компьютер получит постоянный доступ к управлению LanFabric на сервере без SSH-пароля")
+    nonce = uuid.uuid4().hex[:12]
+    marker = lanfabric_marker("lanfabric-trust", args, nonce)
+    private_key, public_key = ensure_local_keypair(LANFABRIC_SSH_KEY, marker)
+    cleanup_stale_lanfabric_temp_keys(args)
+    add_authorized_key_line(args, read_public_key_line(public_key, marker))
+    args.auth = "key"
+    args.key = private_key
+    setup_permanent_sudo_trust(args)
+    log.info(f"Постоянный trust LanFabric настроен. Ключ: {private_key}")
+    add_advice("Дальше используйте подключение по ключу:", format_current_command(args, "status"))
+
+
+def cmd_untrust(args):
+    """Удаляет постоянные или временные доверенные записи LanFabric."""
+    require_host(args)
+    cleanup_stale_lanfabric_temp_keys(args)
+    if args.temp:
+        removed_keys = cleanup_stale_lanfabric_temp_keys(args, remove_all_temp=True)
+        removed_sudo = cleanup_stale_temporary_sudo_trust(args, remove_all_temp=True, allow_tty=True)
+        log.info(f"Удалены временные записи LanFabric: SSH-ключей {removed_keys}, sudoers {removed_sudo}")
+        return
+    if args.all_lanfabric:
+        if args.all_lanfabric != "REMOVE-ALL-LANFABRIC-KEYS":
+            raise RuntimeError("Для удаления всех ключей LanFabric укажите REMOVE-ALL-LANFABRIC-KEYS")
+        removed_keys = remove_authorized_key_by_marker(args, None, all_lanfabric=True)
+        cleanup_permanent_sudo_trust(args, all_lanfabric=True, allow_tty=True)
+        log.info(f"Удалены все SSH-ключи LanFabric у пользователя {args.user}: {removed_keys}")
+        return
+    marker_prefix = f"lanfabric-trust:host={args.host}:user={args.user}:client={current_client_id()}:"
+    removed = remove_authorized_key_by_marker(args, marker_prefix)
+    cleanup_permanent_sudo_trust(args, all_lanfabric=False, allow_tty=True)
+    log.info(f"Удалён постоянный trust текущего клиента. SSH-ключей удалено: {removed}")
 
 def cmd_init(args):
     """Создание среды на сервере."""
@@ -939,7 +1432,7 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vcli-admin.py {init|patch|install-client|endpoint-route|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
+        print("Краткая справка: vcli-admin.py {trust|untrust|init|patch|install-client|endpoint-route|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
         sys.exit(0)
         
     if "--version" not in sys.argv:
@@ -962,6 +1455,13 @@ def main():
     p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
 
     subparsers.add_parser("patch", help="Обновить серверный модуль при отличии только patch-версии")
+
+    p_trust = subparsers.add_parser("trust", help="Постоянно доверить текущий клиент этому серверу")
+    p_trust.add_argument("confirm", help="Для подтверждения введите TRUST")
+
+    p_untrust = subparsers.add_parser("untrust", help="Удалить постоянные или временные доверенные записи LanFabric")
+    p_untrust.add_argument("--temp", action="store_true", help="Удалить временные SSH-ключи и временные sudoers LanFabric")
+    p_untrust.add_argument("--all-lanfabric", default=None, metavar="REMOVE-ALL-LANFABRIC-KEYS", help="Удалить все ключи и sudoers LanFabric у SSH-пользователя")
 
     p_install_client = subparsers.add_parser("install-client", help="Проверить или установить локальный VPN-клиент")
     p_install_client.add_argument("--client-type", choices=["auto", "wg", "awg"], default="auto", help="Тип клиента: auto по backend сервера, wg или awg; wg/awg не требуют --host")
@@ -1018,20 +1518,25 @@ def main():
         sys.exit(0)
         
     try:
-        if args.command == "init":
-            cmd_init(args)
-        elif args.command == "patch":
-            cmd_patch(args)
-        elif args.command == "install-client":
-            cmd_install_client(args)
-        elif args.command == "endpoint-route":
-            cmd_endpoint_route(args)
-        elif args.command in ("remove", "purge"):
-            cmd_remove(args)
-        elif args.command == "config":
-            cmd_config(args)
-        else:
-            cmd_forward(args)
+        with temporary_password_session_if_needed(args):
+            if args.command == "init":
+                cmd_init(args)
+            elif args.command == "patch":
+                cmd_patch(args)
+            elif args.command == "trust":
+                cmd_trust(args)
+            elif args.command == "untrust":
+                cmd_untrust(args)
+            elif args.command == "install-client":
+                cmd_install_client(args)
+            elif args.command == "endpoint-route":
+                cmd_endpoint_route(args)
+            elif args.command in ("remove", "purge"):
+                cmd_remove(args)
+            elif args.command == "config":
+                cmd_config(args)
+            else:
+                cmd_forward(args)
         flush_advice()
     except VersionMismatchError as e:
         log.error(str(e))

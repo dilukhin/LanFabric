@@ -116,7 +116,7 @@ __version__ = "major.minor.patch"
 Текущая версия:
 
 ```text
-0.0.14
+0.0.15
 ```
 
 Правила совместимости:
@@ -233,6 +233,93 @@ python vcli-admin.py --host <сервер> --user <ssh-user> --auth key --key <�
 ```
 
 `--host` не нужен только для `install-client --client-type wg` и `install-client --client-type awg`, когда тип клиента задан вручную и сервер не опрашивается.
+
+
+## Доверие SSH и sudo
+
+LanFabric поддерживает три режима доверия для серверов, где администратор подключается по SSH-паролю.
+
+### Постоянный trust
+
+Команда `trust` явно доверяет текущий клиентский компьютер выбранному серверу:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth password trust TRUST
+```
+
+Что делает команда:
+
+- создаёт или использует локальный ключ `~/.ssh/lanfabric_ed25519`;
+- добавляет публичный ключ в `~/.ssh/authorized_keys` SSH-пользователя на сервере;
+- добавляет только строку с маркером `lanfabric-trust:...`;
+- создаёт sudoers-файл `/etc/sudoers.d/lanfabric-trust-<ssh-user>`;
+- требует явное подтверждение `TRUST`.
+
+После этого можно выполнять команды без SSH-пароля:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key ~/.ssh/lanfabric_ed25519 status
+```
+
+### Удаление trust
+
+Удалить постоянный trust текущего клиента:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth key --key ~/.ssh/lanfabric_ed25519 untrust
+```
+
+Удалить временные ключи и временные sudoers LanFabric:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth password untrust --temp
+```
+
+Удалить все SSH-ключи и sudoers LanFabric у данного SSH-пользователя:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth password untrust --all-lanfabric REMOVE-ALL-LANFABRIC-KEYS
+```
+
+`untrust` не очищает весь `authorized_keys` и не трогает чужие ключи без маркеров LanFabric.
+
+### Временный trust для одной команды
+
+При сложной серверной команде с `--auth password` клиент автоматически создаёт временную password-сессию:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth password status
+```
+
+Порядок работы:
+
+- генерируется временная пара ключей ed25519;
+- пользователь один раз вводит SSH-пароль для добавления временного ключа;
+- временный ключ добавляется в `authorized_keys` с маркером `lanfabric-temp:...` и TTL;
+- если SSH-сервер отдаёт `SSH_CLIENT`, ключ ограничивается опцией `from="<ip>"`;
+- команда переключается на временный ключ;
+- через sudo создаётся временный файл `/etc/sudoers.d/lanfabric-temp-<user>-<nonce>`;
+- исходная команда выполняется через временный ключ и временный sudo trust;
+- в `finally` временный sudoers и временный ключ удаляются;
+- следующая команда дополнительно чистит просроченные временные записи LanFabric.
+
+Если очистка не удалась, клиент выводит рекомендацию выполнить:
+
+```bash
+python vcli-admin.py --host 198.51.100.42 --user donpedro --auth password untrust --temp
+```
+
+Пароль не сохраняется на диск, не логируется и не передаётся в командной строке процесса. Временные ключи имеют маркеры вида:
+
+```text
+lanfabric-temp:host=<host>:user=<user>:client=<client_id>:created=<utc>:ttl=<seconds>:nonce=<nonce>
+```
+
+Постоянные ключи имеют маркеры вида:
+
+```text
+lanfabric-trust:host=<host>:user=<user>:client=<client_id>:created=<utc>:nonce=<nonce>
+```
 
 ## Команды
 
