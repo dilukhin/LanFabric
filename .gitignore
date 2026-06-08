@@ -4,5 +4,10 @@ log*.txt
 *.diff
 
 # BMad
-_bmad-output/
+# BMAD generated output
+_bmad-output/*
+!_bmad-output/
+!_bmad-output/project-context.md
+
+# BMAD local user config
 _bmad/config.user.toml
