@@ -37,15 +37,14 @@ logging.disable(logging.CRITICAL)
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции-харнессы, извлекающие логику inline-скриптов
-# ВНИМАНИЕ: inline-скрипты используют split(':') для парсинга маркера.
-# Это ломается, если created-время содержит двоеточия (например, 22:10:19).
-# Поэтому в тестовых маркерах created-время указываем без двоеточий.
+# Парсинг использует re.split(r':(?=\w+=)', marker), который корректно
+# обрабатывает двоеточия внутри created (ISO-время вида 22:10:19Z).
 # ---------------------------------------------------------------------------
 
 def _parse_marker_fields(marker_text):
-    """Разбирает поля маркера, имитируя логику inline-скриптов (с багом split(':'))."""
+    """Разбирает поля маркера через re.split, устойчивый к двоеточиям в created."""
     fields = {}
-    for part in marker_text.split(":")[1:]:
+    for part in re.split(r':(?=\w+=)', marker_text)[1:]:
         if "=" in part:
             k, v = part.split("=", 1)
             fields[k] = v
@@ -119,13 +118,13 @@ def make_args(**overrides):
 
 def make_marker(kind="lanfabric-temp", host="s", user="u", client="c1234",
                 nonce="n1", ttl=3600, created=None):
-    """Собирает маркер без двоеточий в значениях полей.
+    """Собирает маркер с правильным ISO-временем (created содержит двоеточия).
 
-    created передаётся строкой без двоеточий (напр. '2026-01-01T00-00-00Z'),
-    иначе split(':') в inline-скриптах сломает парсинг.
+    Парсинг через re.split с упреждающим просмотром (lookahead)
+    корректно обрабатывает двоеточия внутри created.
     """
     if created is None:
-        created = "2026-06-09T10-00-00Z"
+        created = "2026-06-09T10:00:00Z"
     parts = [kind, f"host={host}", f"user={user}", f"client={client}",
              f"created={created}"]
     if ttl is not None:
@@ -496,19 +495,95 @@ class TestKnownDefects(unittest.TestCase):
         self.assertIn("python3 -c", rule)
 
 
-    @unittest.expectedFailure
-    def test_marker_split_by_colon_breaks_timestamp_parsing(self):
-        """Дефект: inline-скрипты используют split(':') для парсинга маркера,
-        но created-время (напр. 22:10:19) содержит двоеточия. Поле created
-        обрезается до часа, а минуты/секунды игнорируются или порождают
-        мусорные поля. Это приводит к неверному расчёту expiry."""
+    def test_marker_split_by_colon_no_longer_breaks_timestamp_parsing(self):
+        """Исправлено: re.split вместо split(':') —
+        created с ISO-временем (22:10:19Z) парсится целиком."""
         marker_text = "lanfabric-temp:host=s:user=u:client=c1:created=2026-06-09T22:10:19Z:ttl=3600:nonce=abc"
         fields = _parse_marker_fields(marker_text)
-        self.assertEqual(
-            fields.get("created"),
-            "2026-06-09T22:10:19Z",
-            "split(':') обрезает created до '2026-06-09T22', теряя :10:19Z"
+        self.assertEqual(fields.get("created"), "2026-06-09T22:10:19Z")
+        self.assertEqual(fields.get("ttl"), "3600")
+        self.assertEqual(fields.get("nonce"), "abc")
+
+
+# ===================================================================
+# G. Marker parsing with ISO-time (created содержит двоеточия)
+# ===================================================================
+
+class TestMarkerParsingWithIsoTime(unittest.TestCase):
+
+    def test_temp_marker_with_iso_time_parsed_correctly(self):
+        """Marker с ISO-временем (двоеточия в created) не ломается."""
+        marker = "lanfabric-temp:host=198.51.100.42:user=donpedro:client=abc123:created=2026-06-09T22:10:19Z:ttl=3600:nonce=n1"
+        fields = _parse_marker_fields(marker)
+        self.assertEqual(fields.get("created"), "2026-06-09T22:10:19Z")
+        self.assertEqual(fields.get("ttl"), "3600")
+        self.assertEqual(fields.get("nonce"), "n1")
+        self.assertEqual(fields.get("host"), "198.51.100.42")
+        self.assertEqual(fields.get("user"), "donpedro")
+
+    def test_expired_temp_marker_with_iso_time_removed(self):
+        """Просроченный temp marker удаляется корректно (created в ISO-формате)."""
+        created_str = "2026-06-09T10:00:00Z"
+        created_ts = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00")).timestamp()
+        now_past = created_ts + 7200  # TTL=3600, now > created + TTL
+        foreign = foreign_key_line()
+        expired = make_lanfabric_key_line(
+            "ssh-ed25519 AAAExpiredIso", kind="lanfabric-temp",
+            host="s", user="u", client="c1", nonce="exp-iso", ttl=3600,
+            created=created_str
         )
+        fresh = make_lanfabric_key_line(
+            "ssh-ed25519 AAAFreshIso", kind="lanfabric-temp",
+            host="s", user="u", client="c1", nonce="fresh-iso", ttl=3600,
+            created="2026-06-09T11:50:00Z"
+        )
+        lines = [foreign, expired, fresh]
+        new, removed = filter_stale_temp_keys(lines, remove_all=False, now=now_past)
+        self.assertIn(foreign, new, "Foreign key должен сохраниться")
+        self.assertIn(fresh, new, "Свежий temp marker должен сохраниться")
+        self.assertNotIn(expired, new, "Просроченный temp marker должен быть удалён")
+        self.assertEqual(removed, 1)
+
+    def test_fresh_temp_marker_with_iso_time_preserved(self):
+        """Непросроченный temp marker с двоеточиями в created сохраняется."""
+        created_str = "2026-06-09T10:30:00Z"
+        created_ts = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00")).timestamp()
+        now_fresh = created_ts + 600  # TTL=3600, now < created + TTL (600s < 3600s)
+        valid_line = make_lanfabric_key_line(
+            "ssh-ed25519 AAAFreshIso", kind="lanfabric-temp",
+            host="s", user="u", client="c1", nonce="fresh-iso", ttl=3600,
+            created=created_str
+        )
+        lines = [foreign_key_line(), valid_line]
+        new, removed = filter_stale_temp_keys(lines, remove_all=False, now=now_fresh)
+        self.assertIn(valid_line, new, "Свежий temp marker не должен удаляться")
+        self.assertEqual(removed, 0)
+
+    def test_corrupted_temp_marker_without_iso_removed(self):
+        """Повреждённый temp marker удаляется (created содержит непарсибельное значение)."""
+        now_val = datetime.datetime.fromisoformat("2026-06-09T11:00:00Z".replace("Z", "+00:00")).timestamp()
+        corrupted = "ssh-ed25519 AAAACorrupted lanfabric-temp:host=s:user=u:client=c1:created=bad-time:ttl=3600:nonce=n1\n"
+        lines = [foreign_key_line(), corrupted]
+        new, removed = filter_stale_temp_keys(lines, remove_all=False, now=now_val)
+        self.assertIn(foreign_key_line(), new, "Foreign key должен сохраниться")
+        self.assertNotIn(corrupted, new, "Повреждённый marker должен быть удалён")
+        self.assertEqual(removed, 1)
+
+    def test_temp_sudoers_marker_parsed_correctly(self):
+        """Temporary sudoers marker (# lanfabric-temp-sudo:...) парсится корректно."""
+        marker = "lanfabric-temp-sudo:host=198.51.100.42:user=donpedro:client=abc123:created=2026-06-09T22:10:19Z:ttl=3600:nonce=n1"
+        fields = _parse_marker_fields(marker)
+        self.assertEqual(fields.get("created"), "2026-06-09T22:10:19Z")
+        self.assertEqual(fields.get("ttl"), "3600")
+        self.assertEqual(fields.get("nonce"), "n1")
+
+    def test_trust_marker_with_iso_time_no_ttl(self):
+        """Trust marker (без ttl) с ISO-временем не ломается."""
+        marker = "lanfabric-trust:host=198.51.100.42:user=donpedro:client=abc123:created=2026-06-09T22:10:19Z:nonce=n1"
+        fields = _parse_marker_fields(marker)
+        self.assertEqual(fields.get("created"), "2026-06-09T22:10:19Z")
+        self.assertNotIn("ttl", fields)
+        self.assertEqual(fields.get("nonce"), "n1")
 
 
 # ===================================================================

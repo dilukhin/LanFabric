@@ -537,7 +537,7 @@ def cleanup_stale_lanfabric_temp_keys(args, remove_all_temp=False):
     """Удаляет просроченные или все временные SSH-ключи LanFabric."""
     ensure_remote_ssh_dir(args)
     script = """
-import os, sys, time, datetime
+import os, sys, time, datetime, re
 remove_all = sys.argv[1] == '1'
 ak = os.path.expanduser('~/.ssh/authorized_keys')
 try:
@@ -554,7 +554,7 @@ for line in lines:
         continue
     marker = line[pos:].strip().split()[0]
     fields = {}
-    for part in marker.split(':')[1:]:
+    for part in re.split(r':(?=\\w+=)', marker)[1:]:
         if '=' in part:
             k, v = part.split('=', 1)
             fields[k] = v
@@ -649,7 +649,7 @@ def cleanup_temporary_sudo_trust(args, path):
 def cleanup_stale_temporary_sudo_trust(args, remove_all_temp=False, allow_tty=False):
     """Удаляет просроченные или все временные sudoers-файлы LanFabric."""
     script = """
-import os, sys, glob, time, datetime
+import os, sys, glob, time, datetime, re
 remove_all = sys.argv[1] == '1'
 removed = 0
 for path in glob.glob('/etc/sudoers.d/lanfabric-temp-*'):
@@ -662,7 +662,7 @@ for path in glob.glob('/etc/sudoers.d/lanfabric-temp-*'):
         continue
     marker = text[pos:].split()[0]
     fields = {}
-    for part in marker.split(':')[1:]:
+    for part in re.split(r':(?=\\w+=)', marker)[1:]:
         if '=' in part:
             k, v = part.split('=', 1)
             fields[k] = v
@@ -716,7 +716,7 @@ def cleanup_permanent_sudo_trust(args, all_lanfabric=False, allow_tty=False):
 def add_temporary_authorized_key_line(args, key_line):
     """Одним SSH-подключением чистит старые временные ключи и добавляет новый временный ключ."""
     script = """
-import os, sys, time, datetime
+import os, sys, time, datetime, re
 base_key = sys.argv[1]
 ak_dir = os.path.expanduser('~/.ssh')
 ak = os.path.join(ak_dir, 'authorized_keys')
@@ -739,7 +739,7 @@ for line in lines:
         continue
     marker = line[pos:].strip().split()[0]
     fields = {}
-    for part in marker.split(':')[1:]:
+    for part in re.split(r':(?=\\w+=)', marker)[1:]:
         if '=' in part:
             k, v = part.split('=', 1)
             fields[k] = v
