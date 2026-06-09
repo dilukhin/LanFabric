@@ -11,3 +11,7 @@ _bmad-output/*
 
 # BMAD local user config
 _bmad/config.user.toml
+
+# Python cache
+__pycache__/
+*.pyc
