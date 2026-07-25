@@ -23,3 +23,6 @@ __pycache__/
 *service-account*.json
 lanfabric-opencode-key.json
 yc-*.json
+
+# Local agent safety journal
+.agent-safety/
