@@ -2,6 +2,7 @@ log*.txt
 *.conf
 *.log
 *.diff
+*.bak
 
 # BMad
 # BMAD generated output
@@ -15,3 +16,10 @@ _bmad/config.user.toml
 # Python cache
 __pycache__/
 *.pyc
+
+# Yandex Cloud local secrets
+.yc/
+*.key.json
+*service-account*.json
+lanfabric-opencode-key.json
+yc-*.json
