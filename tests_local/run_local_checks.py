@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_local_checks.py — скрипт запуска локальных проверок LanFabric v0.0.15.
+run_local_checks.py — скрипт запуска локальных проверок LanFabric v0.0.17.
 
 Выполняет:
 1. py_compile обоих модулей
@@ -22,6 +22,22 @@ import traceback
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI_PATH = os.path.join(PROJECT_DIR, "vcli-admin.py")
 SRV_PATH = os.path.join(PROJECT_DIR, "vsrv-admin.py")
+EXPECTED_VERSION = "0.0.17"
+
+
+def configure_utf8_output():
+    """Настраивает собственный вывод runner на UTF-8 в Windows-консоли."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def utf8_subprocess_env():
+    """Возвращает окружение для стабильного UTF-8 вывода дочернего Python."""
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def print_header(title):
@@ -36,7 +52,8 @@ def run_py_compile(path, label):
     print(f"  py_compile {label}... ", end="", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "py_compile", path],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=utf8_subprocess_env()
     )
     if result.returncode == 0:
         print("OK")
@@ -51,10 +68,14 @@ def run_module_version(path, label):
     print(f"  --version {label}... ", end="", flush=True)
     result = subprocess.run(
         [sys.executable, path, "--version"],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=utf8_subprocess_env()
     )
     if result.returncode == 0:
         version = result.stdout.strip()
+        if not version:
+            print("FAIL: пустой вывод версии")
+            return False, None
         print(f"OK: {version}")
         return True, version
     else:
@@ -67,10 +88,19 @@ def run_help(path, *args):
     cmd = [sys.executable, path] + list(args) + ["--help"]
     label = " ".join(args) if args else "main"
     print(f"  --help {label}... ", end="", flush=True)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_subprocess_env(),
+    )
     if result.returncode == 0:
         lines = (result.stdout or result.stderr or "").strip().splitlines()
-        summary = lines[-1] if lines else "(empty)"
+        if not lines:
+            print("FAIL: пустой вывод справки")
+            return False
         print(f"OK ({len(lines)} строк)")
         return True
     else:
@@ -87,7 +117,7 @@ def run_unittest():
 
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=test_dir, pattern="test_*.py")
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
     result = runner.run(suite)
 
     print()
@@ -100,11 +130,25 @@ def run_unittest():
 
     # Успех: нет неожиданных failures и errors
     # expected failures и skipped — OK
-    return len(result.failures) == 0 and len(result.errors) == 0
+    return unittest_result_ok(result)
+
+
+def unittest_result_ok(result):
+    """Проверяет отсутствие неожиданных результатов unittest."""
+    return (
+        len(result.failures) == 0
+        and len(result.errors) == 0
+        and len(result.unexpectedSuccesses) == 0
+    )
+
+
+def expected_module_version(module_name):
+    """Возвращает ожидаемую строку --version для модуля."""
+    return f"{module_name} {EXPECTED_VERSION}"
 
 
 def main():
-    print("LanFabric Local Checks v0.0.15")
+    print("LanFabric Local Checks v0.0.17")
     print(f"Python: {sys.version}")
     print(f"Каталог проекта: {PROJECT_DIR}")
 
@@ -122,10 +166,16 @@ def main():
     print_header("VERSION CHECK")
     ok3, cli_ver = run_module_version(CLI_PATH, "vcli-admin.py")
     ok4, srv_ver = run_module_version(SRV_PATH, "vsrv-admin.py")
-    if cli_ver and cli_ver != "vcli-admin 0.0.15":
-        print(f"  WARNING: ожидалась версия 0.0.15, получено: {cli_ver}")
-    if srv_ver and srv_ver != "vsrv-admin 0.0.15":
-        print(f"  WARNING: ожидалась версия 0.0.15, получено: {srv_ver}")
+    expected_cli = expected_module_version("vcli-admin")
+    expected_srv = expected_module_version("vsrv-admin")
+    if not (ok3 and ok4):
+        all_ok = False
+    if cli_ver and cli_ver != expected_cli:
+        print(f"  FAIL: ожидалась версия {EXPECTED_VERSION}, получено: {cli_ver}")
+        all_ok = False
+    if srv_ver and srv_ver != expected_srv:
+        print(f"  FAIL: ожидалась версия {EXPECTED_VERSION}, получено: {srv_ver}")
+        all_ok = False
 
     # --- 3. --help ---
     print_header("HELP CHECKS")
@@ -162,6 +212,7 @@ def main():
 
 
 if __name__ == "__main__":
+    configure_utf8_output()
     try:
         sys.exit(main())
     except Exception as e:
