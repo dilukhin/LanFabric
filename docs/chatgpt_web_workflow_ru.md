@@ -55,7 +55,8 @@ OpenCode не должен получать неразрешённую архи�
 - перед `update_ref` перечитать HEAD;
 - после write выполнить GitHub-side read-back;
 - self-review — `COMMENT`;
-- неизвестный новый Connector issue публиковать в knowledge repo отдельным incident PR либо создавать pending incident при реальной невозможности записи.
+- общую GitHub knowledge base заполнять только новым переносимым межпроектным знанием о Connector/API/общем workflow, которого ещё нет в policy/catalog/incidents; project-local рабочие ошибки и недоработки исправлять в самом проекте и не публиковать как knowledge incident;
+- если такое переносимое наблюдение уже квалифицировано для knowledge base, но запись через Connector действительно недоступна, создавать pending incident согласно runtime policy.
 
 ## 4. Делегирование локальному агенту
 
