@@ -22,6 +22,7 @@ WG_IF = "wg0"
 SERVER_IP = "10.8.0.1"
 VPN_NET = "10.8.0.0/24"
 CONF_DIR = "/opt/vpn-admin/configs"
+WG_DIR = "/etc/wireguard"
 WG_BASE_PORT = 51820
 BACKEND_PATH = "/opt/vpn-admin/backend"
 REMOTE_DIR = "/opt/vpn-admin"
@@ -196,11 +197,23 @@ ListenPort = {WG_BASE_PORT}
         conf += format_awg_params(get_or_create_awg_params()) + "\n"
     return conf
 
+def write_private_file(path, content):
+    """Записывает файл с приватными данными с правами 0600."""
+    fd = os.open(os.fspath(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        file_obj = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with file_obj:
+            file_obj.write(content)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
 def write_setconf(priv, backend):
     """Сохраняет конфиг для wg/awg setconf."""
     setconf_path = Path(f"/etc/wireguard/{WG_IF}.setconf")
-    setconf_path.write_text(build_setconf(priv, backend), encoding="utf-8")
-    setconf_path.chmod(0o600)
+    write_private_file(setconf_path, build_setconf(priv, backend))
     return setconf_path
 
 def ensure_awg_setconf():
@@ -461,6 +474,9 @@ def allocate_ip(conn):
 def ensure_dirs():
     """Создаёт необходимые директории."""
     Path(CONF_DIR).mkdir(parents=True, exist_ok=True)
+    wg_dir = Path(WG_DIR)
+    wg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    wg_dir.chmod(0o700)
 
 def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
@@ -501,7 +517,11 @@ def cmd_init(args):
             run_cmd("apt-get install -y software-properties-common gnupg2")
             run_cmd("add-apt-repository -y ppa:amnezia/ppa")
             run_cmd("apt-get update -qq")
-            run_cmd("apt-get install -y amneziawg")
+            run_cmd(
+                "DEBIAN_FRONTEND=noninteractive apt-get "
+                "-o Dpkg::Options::=--force-confdef "
+                "-o Dpkg::Options::=--force-confold install -y amneziawg"
+            )
             backend = "awg"
         except RuntimeError as e:
             run_cmd("rm -f /etc/apt/sources.list.d/amnezia-ubuntu-ppa*.list || true", check=False)
@@ -559,8 +579,7 @@ def cmd_init(args):
     pub_path = "/etc/wireguard/wg0.public"
 
     priv = run_cmd(f"{wg_bin} genkey")
-    with open(priv_path, "w") as f:
-        f.write(priv)
+    write_private_file(priv_path, priv)
 
     server_pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey").strip()
     with open(pub_path, "w") as f:
@@ -576,7 +595,7 @@ ListenPort = {WG_BASE_PORT}
 PostUp = iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -A FORWARD -i {WG_IF} -j DROP
 PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORWARD -i {WG_IF} -j DROP || true
 """
-    Path(f"/etc/wireguard/{WG_IF}.conf").write_text(conf)
+    write_private_file(f"/etc/wireguard/{WG_IF}.conf", conf)
 
     write_setconf(priv, backend)
 
