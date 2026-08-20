@@ -124,11 +124,14 @@ Security-sensitive области:
 
 Используется Web-first workflow:
 
-- ChatGPT Web выполняет архитектуру, research, анализ репозитория, проектирование, review, подготовку bounded task и GitHub remote writes через Connector.
-- OpenCode выполняет только то, что требует локальной Windows-среды, локальных инструментов, SSH к тестовой ВМ, `yc` через guard либо локального тестового запуска.
-- Архитектурные решения остаются за ChatGPT Web.
-- Для нетривиальной задачи применяется BMAD/OpenSpec-lite task card.
-- Результат агента возвращается в Web как отчёт + минимально необходимые артефакты.
+- ChatGPT Web выполняет архитектуру, research, анализ репозитория, проектирование, review, декомпозицию, подготовку compact bounded task и GitHub remote writes через Connector.
+- Архитектурные, product и security-решения остаются за ChatGPT Web.
+- BMAD/OpenSpec и `_bmad-output/project-context.md` используются Web как инструменты проектирования и источник обязательных project constraints.
+- OpenCode — простой bounded local executor для Windows-среды, локальных инструментов, SSH к тестовой ВМ, `yc` через guard, локальных тестов и явно делегированного GitHub fallback.
+- Локальному агенту не требуется выполнять полный BMAD/OpenSpec workflow или загружать весь `_bmad/`; он получает уже принятые решения и минимально достаточный bounded execution contract.
+- Для нетривиальной локальной работы task card содержит только необходимые: цель, контекст, allowed/forbidden scope, действия, проверки, timeout, acceptance criteria, stop conditions и отчёт.
+- Если Connector-операция недоступна в Web, Web готовит пользователю точный ручной fallback либо отдельную task card локальному агенту с необходимыми файлами/архивом и явным разрешением конкретных `git`/`gh`-операций.
+- Результат агента или ручного fallback возвращается в Web как evidence для review/read-back.
 
 Подробности: `docs/chatgpt_web_workflow_ru.md`, `docs/local_agent_workflow_ru.md`, `docs/task_report_protocol_ru.md`.
 
