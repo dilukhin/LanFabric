@@ -16,10 +16,13 @@ ChatGPT Web — основной engineering/reasoning слой проекта.
 - декомпозиция задач;
 - подготовка точных изменений;
 - GitHub reads/writes через GitHub Connector;
+- подготовка ручного/агентского fallback, если нужная Connector-операция недоступна;
 - анализ результатов локальных тестов и E2E;
 - решение, закрыт ли gate и что делать дальше.
 
 OpenCode не должен получать неразрешённую архитектурную задачу вида «разберись и сделай следующий этап».
+
+BMAD/OpenSpec и project-context относятся прежде всего к уровню проектирования Web. Локальному исполнителю передаётся уже принятое решение и минимально достаточный execution contract.
 
 ## 2. Загрузка контекста
 
@@ -44,30 +47,50 @@ OpenCode не должен получать неразрешённую архи�
 1. Прочитать настроенный `github_project_bootstrap.md` из Project Sources.
 2. Через GitHub Connector прочитать runtime bundle из `dilukhin/github-connector-knowledge`.
 3. Проверить, что bundle относится к `dilukhin/LanFabric`.
-4. Использовать Connector как первичный remote-транспорт.
+4. Использовать Connector как единственный штатный remote-транспорт ChatGPT Web.
 
 Правила:
 
-- не пробовать `git`/`gh` как remote «на всякий случай»;
-- локальный Git использовать только для подтверждённого checkout, diff/history/tests;
+- не использовать и не предлагать `git`/`gh` как Web remote fallback;
+- наличие shell/`git`/`gh` не считать доказательством доступного и аутентифицированного GitHub remote;
 - многофайловый write через Connector: `blob -> tree -> commit -> ref`;
 - работать через feature/task branch, не писать прямо в `master`;
 - перед `update_ref` перечитать HEAD;
 - после write выполнить GitHub-side read-back;
 - self-review — `COMMENT`;
 - общую GitHub knowledge base заполнять только новым переносимым межпроектным знанием о Connector/API/общем workflow, которого ещё нет в policy/catalog/incidents; project-local рабочие ошибки и недоработки исправлять в самом проекте и не публиковать как knowledge incident;
-- если такое переносимое наблюдение уже квалифицировано для knowledge base, но запись через Connector действительно недоступна, создавать pending incident согласно runtime policy.
+- квалифицированные knowledge incidents и изменения policy/catalog/schema/profile публиковать в `dilukhin/github-connector-knowledge`, а не в `dilukhin/LanFabric`.
+
+### Если Connector-операция недоступна
+
+Не пытаться заменить её `git`/`gh` внутри Web.
+
+ChatGPT Web должен:
+
+1. Зафиксировать точную недоступную операцию и ошибку.
+2. Прекратить соответствующую remote mutation.
+3. Подготовить пользователю исполнимый fallback:
+   - либо точную ручную инструкцию;
+   - либо bounded task card локальному/внешнему агенту.
+4. Приложить необходимые файлы или архив, если операция требует подготовленного контента.
+5. После выполнения получить evidence/report и выполнить Web-side read-back/review.
+
+Ручная инструкция должна включать repository, branch/expected HEAD, точные команды/операции, проверки результата и stop conditions при необходимости.
+
+Для агентского fallback task card дополнительно должна явно разрешать только нужные `git`/`gh`-операции и содержать repository/workspace, branch/HEAD, allowed/forbidden scope, проверки, timeout, stop conditions и запрет destructive recovery.
 
 ## 4. Делегирование локальному агенту
 
 Делегировать только локально необходимую часть.
 
-Хороший task содержит:
+OpenCode — простой bounded executor, а не второй архитектор и не обязательный BMAD/OpenSpec-агент.
+
+Task должен быть компактным и самодостаточным. Он содержит только необходимые поля:
 
 1. Task ID.
 2. Exact workspace/repository path.
 3. Expected branch/HEAD или правило синхронизации.
-4. Файлы/документы, которые нужно прочитать.
+4. Минимальный список файлов/документов для чтения.
 5. Цель.
 6. Allowed scope.
 7. Forbidden scope.
@@ -78,24 +101,26 @@ OpenCode не должен получать неразрешённую архи�
 12. Stop conditions.
 13. Формат и путь итогового отчёта.
 
-Если задача затрагивает SSH, server state, YC, backup, firewall или destructive action — отдельно указать gate и требуемое подтверждение.
+Не требовать от агента читать весь `_bmad/`, `.agents/`, `.opencode/` или выполнять BMAD/OpenSpec workflow, если конкретная локальная задача этого не требует.
 
-## 5. Цикл Web -> Agent -> Web
+Если задача затрагивает SSH, server state, YC, backup, firewall, destructive action или GitHub remote fallback — отдельно указать gate и точные разрешённые операции.
+
+## 5. Цикл Web -> Agent/User -> Web
 
 ```text
 ChatGPT Web
-  -> решение / branch / bounded task
-OpenCode
-  -> локальная синхронизация / выполнение / проверки
-  -> report + artifacts
+  -> решение / branch / compact bounded task или ручная инструкция
+Local Agent / User
+  -> выполнение разрешённых локальных/ручных действий
+  -> report/evidence + artifacts
 ChatGPT Web
   -> review evidence
-  -> GitHub write / correction / gate closure / next task
+  -> GitHub read-back / correction / gate closure / next task
 ```
 
-Пользователь не должен вручную переносить между моделями архитектурные решения. Пользователю остаются операции, которые действительно требуют его UI/credential/physical approval.
+Пользователь не должен вручную переносить между моделями архитектурные решения. Пользователю остаются операции, которые действительно требуют UI/credential/physical approval или ручного fallback из-за ограничения Connector.
 
-## 6. Review результатов агента
+## 6. Review результатов агента/ручного fallback
 
 Не принимать фразу «готово» без evidence.
 
