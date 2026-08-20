@@ -5,7 +5,7 @@
 
 ## 1. Роль агента
 
-OpenCode — bounded local executor, а не основной архитектор проекта.
+OpenCode — простой bounded local executor, а не основной архитектор проекта и не обязательный BMAD/OpenSpec-агент.
 
 ChatGPT Web уже должен определить цель, архитектурные решения, границы и критерии готовности.
 
@@ -15,6 +15,7 @@ ChatGPT Web уже должен определить цель, архитект�
 - не расширяет scope;
 - не выбирает самостоятельно новую архитектуру/зависимости;
 - не продолжает в «следующий логичный этап»;
+- не запускает BMAD/OpenSpec workflow без явной необходимости;
 - при новой развилке возвращает решение в ChatGPT Web.
 
 ## 2. Канонический workspace
@@ -42,9 +43,11 @@ C:\Users\Dima\Projects\LanFabricRoot\
 1. workspace `AGENTS.md`;
 2. repo `AGENTS.md`;
 3. `_bmad-output/project-context.md`;
-4. документы, явно указанные в task card.
+4. только документы, явно указанные в task card.
 
-Не загружать весь BMAD-корпус без необходимости.
+`_bmad-output/project-context.md` читается как компактный набор обязательных implementation constraints. Не загружать весь `_bmad/`, `.agents/`, `.opencode/` или другие методологические материалы без конкретной необходимости из task card.
+
+Task card должна быть самодостаточной: архитектурные решения и необходимый контекст уже переданы Web.
 
 ## 4. Git
 
@@ -66,6 +69,10 @@ git rev-parse HEAD
 - если expected HEAD/ancestry не совпадает — остановиться и отчитаться.
 
 GitHub remote publication по умолчанию выполняет ChatGPT Web через Connector.
+
+Исключение — явный GitHub fallback task от ChatGPT Web. В таком task должны быть точно перечислены разрешённые `git`/`gh`-операции, repository, branch/expected HEAD, проверки и stop conditions. Разрешение действует только в рамках этой задачи и не даёт права на дополнительные push/merge/rebase/force/delete операции.
+
+Перед fallback-agent remote write агент обязан подтвердить, что локальный remote реально настроен и аутентифицирован безопасным способом, не раскрывая credentials в отчёте.
 
 ## 5. Универсальная безопасность действий
 
@@ -145,6 +152,8 @@ C:\Users\Dima\Projects\LanFabricRoot\temp\
 C:\Users\Dima\Projects\LanFabricRoot\stash\
 ```
 
+Если Web подготовил файл/архив для fallback, использовать именно его как входной артефакт и не пересобирать содержимое по догадке.
+
 Не создавать служебные отчёты внутри repository worktree, если task явно не требует repository documentation.
 
 ## 10. Stop conditions
@@ -155,6 +164,7 @@ C:\Users\Dima\Projects\LanFabricRoot\stash\
 - branch/HEAD/worktree не соответствует task assumptions;
 - нужен новый architecture/security/product decision;
 - требуется изменить forbidden scope;
+- для GitHub fallback нужна remote-операция, не перечисленная явно в task card;
 - реальный cloud/server state неожидан;
 - потерян независимый SSH-доступ;
 - backup/rollback не подтверждён;
