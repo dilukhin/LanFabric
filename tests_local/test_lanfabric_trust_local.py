@@ -9,6 +9,7 @@ import unittest
 import importlib.util
 import sys
 import os
+import subprocess
 import tempfile
 import time
 import datetime
@@ -454,6 +455,25 @@ class TestSudoersRule(unittest.TestCase):
 
 class TestKnownDefects(unittest.TestCase):
 
+    def _add_trust(self, home, line, calls=None):
+        def fake_exec(_args, command, **kwargs):
+            if calls is not None:
+                calls.append(command)
+            env = os.environ.copy()
+            env["HOME"] = home
+            env["USERPROFILE"] = home
+            result = subprocess.run(
+                [sys.executable, "-c", command[2], *command[3:]],
+                env=env, capture_output=True, text=True
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr or result.stdout)
+            return result.stdout
+
+        with patch.object(cli, "ensure_remote_ssh_dir"), \
+             patch.object(cli, "exec_remote", side_effect=fake_exec):
+            cli.add_authorized_key_line(make_args(), line)
+
     def test_trust_potential_duplicate(self):
         """RISK: повторный trust с тем же public key и новым nonce
         может создать дубликат в authorized_keys, потому что
@@ -469,6 +489,70 @@ class TestKnownDefects(unittest.TestCase):
             key_line_1, key_line_2,
             "Строки различаются из-за nonce: grep -Fxq не обнаружит дубликат"
         )
+
+        key = "ssh-ed25519 AAAAB3NzaC1test"
+        first = make_lanfabric_key_line(key, kind="lanfabric-trust", nonce="first")
+        second = make_lanfabric_key_line(key, kind="lanfabric-trust", nonce="second")
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".ssh"))
+            path = os.path.join(home, ".ssh", "authorized_keys")
+            open(path, "w", encoding="utf-8").close()
+            calls = []
+            self._add_trust(home, first, calls)
+            self._add_trust(home, second, calls)
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            owned = [line for line in content.splitlines()
+                     if "lanfabric-trust:" in line and line.split()[:2] == key.split()]
+            self.assertEqual(owned, [second.rstrip("\n")])
+            self.assertEqual(len([c for c in calls if c[0] == "python3"]), 2)
+
+    def test_trust_collapses_existing_duplicates_and_preserves_other_lines(self):
+        key = "ssh-ed25519 AAAAB3NzaC1test"
+        old = make_lanfabric_key_line(key, kind="lanfabric-trust", nonce="old")
+        duplicate = make_lanfabric_key_line(key, kind="lanfabric-trust", nonce="duplicate")
+        current = make_lanfabric_key_line(key, kind="lanfabric-trust", nonce="current")
+        foreign_other = foreign_key_line("ssh-rsa AAAAforeign-other")
+        foreign_same = foreign_key_line(key)
+        temp_same = make_lanfabric_key_line(key, kind="lanfabric-temp", nonce="temp")
+        trust_other = make_lanfabric_key_line(
+            "ssh-ed25519 AAAAother-trust", kind="lanfabric-trust", nonce="other"
+        )
+        original = old + duplicate + foreign_other + foreign_same + temp_same + trust_other
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".ssh"))
+            path = os.path.join(home, ".ssh", "authorized_keys")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(original)
+            self._add_trust(home, current)
+            with open(path, encoding="utf-8", newline="") as f:
+                content = f.read()
+            owned = [line for line in content.splitlines()
+                     if "lanfabric-trust:" in line and line.split()[:2] == key.split()]
+            self.assertEqual(owned, [current.rstrip("\n")])
+            normalized = content.replace("\r\n", "\n")
+            self.assertIn(foreign_other, normalized)
+            self.assertIn(foreign_same, normalized)
+            self.assertIn(temp_same, normalized)
+            self.assertIn(trust_other, normalized)
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_invalid_trust_line_does_not_change_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".ssh"))
+            path = os.path.join(home, ".ssh", "authorized_keys")
+            original = "ssh-ed25519 AAAAexisting foreign\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+            with patch.object(cli, "ensure_remote_ssh_dir") as ensure, \
+                 patch.object(cli, "exec_remote") as execute:
+                with self.assertRaises(RuntimeError):
+                    cli.add_authorized_key_line(make_args(), "ssh-ed25519 AAAAexisting foreign")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), original)
+            ensure.assert_not_called()
+            execute.assert_not_called()
 
     def test_untrust_two_separate_ssh_calls(self):
         """Обычный untrust сначала отзывает passwordless sudo trust."""
