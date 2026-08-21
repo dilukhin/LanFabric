@@ -492,10 +492,42 @@ def ensure_remote_ssh_dir(args):
 
 
 def add_authorized_key_line(args, line):
-    """Добавляет строку в authorized_keys, если такой строки ещё нет."""
+    """Идемпотентно записывает permanent trust для identity публичного ключа."""
+    parts = line.split()
+    if len(parts) < 3 or "lanfabric-trust:" not in line:
+        raise RuntimeError("Некорректная строка permanent trust")
     ensure_remote_ssh_dir(args)
-    script = "set -eu\nak=\"$HOME/.ssh/authorized_keys\"\nline=$1\nif ! grep -Fxq -- \"$line\" \"$ak\" 2>/dev/null; then printf '%s\\n' \"$line\" >> \"$ak\"; fi\nchmod 600 \"$ak\""
-    exec_remote(args, ["sh", "-c", script, "lanfabric-add-key", line])
+    script = """
+import os, sys
+line = sys.argv[1]
+parts = line.split()
+if len(parts) < 3 or 'lanfabric-trust:' not in line:
+    raise SystemExit('Некорректная строка permanent trust')
+identity = tuple(parts[:2])
+ak = os.path.expanduser('~/.ssh/authorized_keys')
+try:
+    lines = open(ak, 'r', encoding='utf-8').readlines()
+except FileNotFoundError:
+    lines = []
+new = []
+replaced = False
+for current in lines:
+    current_parts = current.split()
+    managed = ('lanfabric-trust:' in current and
+               len(current_parts) >= 2 and
+               tuple(current_parts[:2]) == identity)
+    if managed:
+        if not replaced:
+            new.append(line.rstrip('\\r\\n') + '\\n')
+            replaced = True
+    else:
+        new.append(current)
+if not replaced:
+    new.append(line.rstrip('\\r\\n') + '\\n')
+open(ak, 'w', encoding='utf-8').writelines(new)
+os.chmod(ak, 0o600)
+""".strip()
+    exec_remote(args, ["python3", "-c", script, line], stream_output=False)
 
 
 def remove_authorized_key_by_marker(args, marker, all_lanfabric=False, temp_only=False):
