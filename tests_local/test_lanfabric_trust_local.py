@@ -437,10 +437,8 @@ class TestSudoersRule(unittest.TestCase):
         self.assertNotIn("/bin/sh *", rule)
         self.assertNotIn("/bin/bash *", rule)
 
-    def test_cleanup_stale_sudoers_uses_python3_c_not_vsrv(self):
-        """RISK: cleanup_stale_temporary_sudo_trust использует sudo python3 -c,
-        но sudoers allowlist разрешает только /usr/bin/python3 /opt/vpn-admin/vsrv-admin.py *.
-        Автоматическая очистка stale sudoers не гарантирована."""
+    def test_sudoers_allowlist_excludes_python3_c(self):
+        """Sudoers allowlist не разрешает произвольный python3 -c."""
         rule = cli.sudoers_rule_for_user("donpedro")
         self.assertIn("/usr/bin/python3 /opt/vpn-admin/vsrv-admin.py *", rule)
         self.assertNotIn("python3 -c", rule)
@@ -472,27 +470,61 @@ class TestKnownDefects(unittest.TestCase):
             "Строки различаются из-за nonce: grep -Fxq не обнаружит дубликат"
         )
 
-    @unittest.expectedFailure
     def test_untrust_two_separate_ssh_calls(self):
-        """Дефект: cmd_untrust сначала удаляет authorized_keys marker
-        (remove_authorized_key_by_marker), затем отдельным SSH-вызовом
-        удаляет sudoers (cleanup_permanent_sudo_trust). При падении второго
-        SSH-вызова SSH-trust уже удалён, а sudo-trust остаётся."""
-        self.fail(
-            "cmd_untrust выполняет два последовательных SSH-вызова: "
-            "(1) remove_authorized_key_by_marker, "
-            "(2) cleanup_permanent_sudo_trust. "
-            "При ошибке на шаге 2 sudo-trust не будет удалён."
-        )
+        """Обычный untrust сначала отзывает passwordless sudo trust."""
+        args = make_args(confirm="", temp=False, all_lanfabric=None)
+        calls = []
+        with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
+             patch.object(cli, "cleanup_permanent_sudo_trust", side_effect=lambda *a, **k: calls.append("sudo")), \
+             patch.object(cli, "remove_authorized_key_by_marker", side_effect=lambda *a, **k: calls.append("ssh") or 1):
+            cli.cmd_untrust(args)
+        self.assertEqual(calls, ["sudo", "ssh"])
 
-    @unittest.expectedFailure
+        with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
+             patch.object(cli, "cleanup_permanent_sudo_trust", side_effect=RuntimeError("sudo failed")), \
+             patch.object(cli, "remove_authorized_key_by_marker") as remove_key:
+            with self.assertRaises(RuntimeError):
+                cli.cmd_untrust(args)
+        remove_key.assert_not_called()
+
     def test_cleanup_stale_sudoers_not_in_sudoers_allowlist(self):
-        """Дефект: cleanup_stale_temporary_sudo_trust выполняет
-        sudo python3 -c '...' на сервере, но sudoers allowlist
-        разрешает только /usr/bin/python3 /opt/vpn-admin/vsrv-admin.py *.
-        Команда python3 -c будет отклонена sudo."""
+        """Scan выполняется без sudo, а allowlist остаётся без python3 -c."""
         rule = cli.sudoers_rule_for_user("donpedro")
-        self.assertIn("python3 -c", rule)
+        self.assertNotIn("python3 -c", rule)
+
+        args = make_args(user="donpedro")
+        valid = "/etc/sudoers.d/lanfabric-temp-donpedro-0123456789ab"
+        foreign = "/etc/sudoers.d/lanfabric-temp-other-0123456789ab"
+        invalid = "/etc/sudoers.d/lanfabric-temp-donpedro-not-a-nonce"
+        commands = []
+
+        def fake_exec(_args, command, **kwargs):
+            commands.append(command)
+            if command[0] == "python3":
+                return "\n".join([valid, foreign, invalid])
+            return ""
+
+        with patch.object(cli, "exec_remote", side_effect=fake_exec):
+            self.assertEqual(cli.cleanup_stale_temporary_sudo_trust(args), 1)
+        self.assertEqual(commands[0][0:2], ["python3", "-c"])
+        self.assertNotIn("sudo", commands[0])
+        self.assertEqual(commands[1], ["sudo", "-n", "rm", "-f", valid])
+
+    def test_untrust_all_and_temp_are_sudoers_first(self):
+        for mode in ("all", "temp"):
+            args = make_args(
+                confirm="REMOVE-ALL-LANFABRIC-KEYS" if mode == "all" else "",
+                temp=mode == "temp",
+                all_lanfabric="REMOVE-ALL-LANFABRIC-KEYS" if mode == "all" else None,
+            )
+            calls = []
+            with patch.object(cli, "cleanup_stale_lanfabric_temp_keys", side_effect=lambda *a, **k: calls.append("keys") or 0), \
+                 patch.object(cli, "cleanup_stale_temporary_sudo_trust", side_effect=lambda *a, **k: calls.append("temp-sudo") or 0), \
+                 patch.object(cli, "cleanup_permanent_sudo_trust", side_effect=lambda *a, **k: calls.append("sudo") or 0), \
+                 patch.object(cli, "remove_authorized_key_by_marker", side_effect=lambda *a, **k: calls.append("ssh") or 0):
+                cli.cmd_untrust(args)
+            expected = ["temp-sudo", "keys"] if mode == "temp" else ["sudo", "ssh"]
+            self.assertEqual(calls, expected)
 
 
     def test_marker_split_by_colon_no_longer_breaks_timestamp_parsing(self):
