@@ -648,46 +648,51 @@ def cleanup_temporary_sudo_trust(args, path):
 
 def cleanup_stale_temporary_sudo_trust(args, remove_all_temp=False, allow_tty=False):
     """Удаляет просроченные или все временные sudoers-файлы LanFabric."""
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
+    prefix = f"/etc/sudoers.d/lanfabric-temp-{safe_user}-"
     script = """
-import os, sys, glob, time, datetime, re
-remove_all = sys.argv[1] == '1'
-removed = 0
-for path in glob.glob('/etc/sudoers.d/lanfabric-temp-*'):
+import os, sys, time, re
+safe_user = sys.argv[1]
+ttl = int(sys.argv[2])
+remove_all = sys.argv[3] == '1'
+prefix = '/etc/sudoers.d/lanfabric-temp-' + re.sub(r'[^A-Za-z0-9_.-]', '_', safe_user) + '-'
+pattern = re.compile(r'^' + re.escape(prefix) + r'[0-9a-f]{12}$')
+now = time.time()
+for name in os.listdir('/etc/sudoers.d'):
+    path = '/etc/sudoers.d/' + name
+    if not pattern.fullmatch(path):
+        continue
     try:
-        text = open(path, 'r', encoding='utf-8').read(4096)
+        stale = os.stat(path).st_mtime + ttl < now
     except OSError:
         continue
-    pos = text.find('lanfabric-temp-sudo:')
-    if pos < 0:
-        continue
-    marker = text[pos:].split()[0]
-    fields = {}
-    for part in re.split(r':(?=\\w+=)', marker)[1:]:
-        if '=' in part:
-            k, v = part.split('=', 1)
-            fields[k] = v
-    try:
-        created = fields.get('created', '').replace('Z', '+00:00')
-        ttl = int(fields.get('ttl', '0'))
-        expired = ttl > 0 and time.time() > datetime.datetime.fromisoformat(created).timestamp() + ttl
-    except Exception:
-        expired = True
-    if remove_all or expired:
-        try:
-            os.remove(path)
-            removed += 1
-        except OSError:
-            pass
-print(removed)
+    if remove_all or stale:
+        print(path)
 """.strip()
     try:
-        sudo_cmd = ["sudo", "python3", "-c", script, "1" if remove_all_temp else "0"] if allow_tty else ["sudo", "-n", "python3", "-c", script, "1" if remove_all_temp else "0"]
-        out = exec_remote(args, sudo_cmd, stream_output=False, timeout=15, use_tty=allow_tty)
+        out = exec_remote(
+            args,
+            ["python3", "-c", script, safe_user, str(TEMP_TRUST_TTL_SECONDS), "1" if remove_all_temp else "0"],
+            stream_output=False,
+            timeout=15,
+        )
     except RuntimeError as e:
         log.warning(f"Не удалось очистить временные sudoers LanFabric: {e}")
         return 0
-    lines = str(out or "0").splitlines()
-    removed = int(lines[-1]) if lines else 0
+    candidate_re = re.compile(r"^" + re.escape(prefix) + r"[0-9a-f]{12}$")
+    candidates = []
+    for line in str(out or "").splitlines():
+        path = line.strip()
+        if candidate_re.fullmatch(path):
+            candidates.append(path)
+    removed = 0
+    for path in candidates:
+        sudo_cmd = ["sudo", "rm", "-f", path] if allow_tty else ["sudo", "-n", "rm", "-f", path]
+        try:
+            exec_remote(args, sudo_cmd, stream_output=False, timeout=10, use_tty=allow_tty)
+            removed += 1
+        except RuntimeError as e:
+            log.warning(f"Не удалось удалить временный sudoers {path}: {e}")
     if removed:
         log.info(f"Удалены временные sudoers LanFabric: {removed}")
     return removed
@@ -900,22 +905,22 @@ def cmd_trust(args):
 def cmd_untrust(args):
     """Удаляет постоянные или временные доверенные записи LanFabric."""
     require_host(args)
-    cleanup_stale_lanfabric_temp_keys(args)
     if args.temp:
-        removed_keys = cleanup_stale_lanfabric_temp_keys(args, remove_all_temp=True)
         removed_sudo = cleanup_stale_temporary_sudo_trust(args, remove_all_temp=True, allow_tty=True)
+        removed_keys = cleanup_stale_lanfabric_temp_keys(args, remove_all_temp=True)
         log.info(f"Удалены временные записи LanFabric: SSH-ключей {removed_keys}, sudoers {removed_sudo}")
         return
     if args.all_lanfabric:
         if args.all_lanfabric != "REMOVE-ALL-LANFABRIC-KEYS":
             raise RuntimeError("Для удаления всех ключей LanFabric укажите REMOVE-ALL-LANFABRIC-KEYS")
-        removed_keys = remove_authorized_key_by_marker(args, None, all_lanfabric=True)
         cleanup_permanent_sudo_trust(args, all_lanfabric=True, allow_tty=True)
+        removed_keys = remove_authorized_key_by_marker(args, None, all_lanfabric=True)
         log.info(f"Удалены все SSH-ключи LanFabric у пользователя {args.user}: {removed_keys}")
         return
     marker_prefix = f"lanfabric-trust:host={args.host}:user={args.user}:client={current_client_id()}:"
-    removed = remove_authorized_key_by_marker(args, marker_prefix)
     cleanup_permanent_sudo_trust(args, all_lanfabric=False, allow_tty=True)
+    cleanup_stale_lanfabric_temp_keys(args)
+    removed = remove_authorized_key_by_marker(args, marker_prefix)
     log.info(f"Удалён постоянный trust текущего клиента. SSH-ключей удалено: {removed}")
 
 def cmd_init(args):
