@@ -2,7 +2,7 @@
 
 ## 1. Назначение
 
-План предназначен для ручной проверки LanFabric `0.0.16` на существующей
+План предназначен для ручной проверки LanFabric `0.0.17` на существующей
 виртуальной машине Yandex Cloud. Основной проход проверяет AmneziaWG, SSH/SCP,
 `sudo`, systemd, iptables, SQLite, управление пользователями и реальное
 VPN-соединение. Разрушающие сценарии вынесены в отдельные этапы и выполняются
@@ -169,8 +169,8 @@ git status --short
 
 Ожидается:
 
-- `vcli-admin 0.0.16`;
-- `vsrv-admin 0.0.16`;
+- `vcli-admin 0.0.17`;
+- `vsrv-admin 0.0.17`;
 - failures: 0;
 - errors: 0;
 - expected failures: 0;
@@ -256,7 +256,7 @@ python vcli-admin.py --host $HostIp --user dilukhin --auth key --key $Key init
 - созданы AWG-параметры;
 - интерфейс `wg0` поднят;
 - включён IPv4 forwarding;
-- серверный модуль имеет версию `0.0.16`.
+- серверный модуль имеет версию `0.0.17`.
 
 После init:
 

@@ -50,8 +50,8 @@ class TestResultValidation(unittest.TestCase):
         self.assertFalse(checks.unittest_result_ok(result))
 
     def test_expected_versions_are_synchronized(self):
-        self.assertEqual(checks.expected_module_version("vcli-admin"), "vcli-admin 0.0.16")
-        self.assertEqual(checks.expected_module_version("vsrv-admin"), "vsrv-admin 0.0.16")
+        self.assertEqual(checks.expected_module_version("vcli-admin"), "vcli-admin 0.0.17")
+        self.assertEqual(checks.expected_module_version("vsrv-admin"), "vsrv-admin 0.0.17")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.16"
+__version__ = "0.0.17"
 
 import sys
 import os
@@ -14,6 +14,8 @@ import logging
 import shlex
 import ipaddress
 import secrets
+import re
+import time
 from pathlib import Path
 
 # Константы
@@ -65,6 +67,44 @@ def flush_advice():
 def print_intro():
     """Выводит краткую информацию о серверном инструменте."""
     print(f"LanFabric SRV v{__version__} — сервер управления VPN")
+
+
+def _cleanup_temp_sudoers(user, ttl, remove_all=False, sudoers_dir="/etc/sudoers.d"):
+    """Удаляет только принадлежащие LanFabric временные sudoers-файлы."""
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", user)
+    pattern = re.compile(r"^lanfabric-temp-" + re.escape(safe_user) + r"-[0-9a-f]{12}$")
+    now = time.time()
+    removed = 0
+    for entry in os.scandir(sudoers_dir):
+        if not entry.is_file(follow_symlinks=False) or not pattern.fullmatch(entry.name):
+            continue
+        try:
+            stale = entry.stat(follow_symlinks=False).st_mtime + ttl < now
+            if remove_all or stale:
+                os.unlink(entry.path)
+                removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def _run_internal_cleanup_temp_sudoers(argv):
+    """Проверяет sudo caller и запускает закрытую cleanup-операцию."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--user", required=True)
+    parser.add_argument("--ttl", type=int, default=3600)
+    parser.add_argument("--all", action="store_true", dest="remove_all")
+    args = parser.parse_args(argv)
+    if args.ttl < 0:
+        parser.error("--ttl не может быть отрицательным")
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        raise RuntimeError("Внутренняя cleanup-операция разрешена только через sudo")
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
+    safe_sudo_user = re.sub(r"[^A-Za-z0-9_.-]", "_", sudo_user)
+    if safe_user != safe_sudo_user:
+        raise RuntimeError("Пользователь cleanup не совпадает с SUDO_USER")
+    return _cleanup_temp_sudoers(args.user, args.ttl, args.remove_all)
 
 def get_backend():
     path = "/opt/vpn-admin/backend"
@@ -1049,6 +1089,9 @@ def cmd_list():
         log.info(f"{r[0]:<15} {r[1]:<12} {'ДА' if r[2] else 'НЕТ':<6} {'ДА' if r[3] else 'НЕТ':<6} {status:<10} {r[5]}")
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "_cleanup-temp-sudoers":
+        print(_run_internal_cleanup_temp_sudoers(sys.argv[2:]))
+        return
     
     if len(sys.argv) == 1:
         print_intro()

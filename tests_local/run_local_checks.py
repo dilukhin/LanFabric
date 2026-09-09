@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_local_checks.py — скрипт запуска локальных проверок LanFabric v0.0.16.
+run_local_checks.py — скрипт запуска локальных проверок LanFabric v0.0.17.
 
 Выполняет:
 1. py_compile обоих модулей
@@ -22,7 +22,7 @@ import traceback
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI_PATH = os.path.join(PROJECT_DIR, "vcli-admin.py")
 SRV_PATH = os.path.join(PROJECT_DIR, "vsrv-admin.py")
-EXPECTED_VERSION = "0.0.16"
+EXPECTED_VERSION = "0.0.17"
 
 
 def configure_utf8_output():
@@ -148,7 +148,7 @@ def expected_module_version(module_name):
 
 
 def main():
-    print("LanFabric Local Checks v0.0.16")
+    print("LanFabric Local Checks v0.0.17")
     print(f"Python: {sys.version}")
     print(f"Каталог проекта: {PROJECT_DIR}")
 

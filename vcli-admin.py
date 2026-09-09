@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.16"
+__version__ = "0.0.17"
 
 import sys
 import os
@@ -351,11 +351,19 @@ def get_remote_version(args):
     )
     return extract_remote_version(out)
 
+def try_cleanup_stale_temporary_sudo_trust(args):
+    """Выполняет фоновую очистку sudoers без остановки основной команды."""
+    try:
+        cleanup_stale_temporary_sudo_trust(args)
+    except Exception as e:
+        log.warning(f"Не удалось выполнить фоновую очистку временных sudoers LanFabric: {e}")
+
 def ensure_remote_version_compatible(args):
     """Запрещает работу с сервером при несовместимых версиях модулей."""
     remote_ver = get_remote_version(args)
     state = compare_versions(__version__, remote_ver)
     if state == "equal":
+        try_cleanup_stale_temporary_sudo_trust(args)
         return remote_ver
     if state == "patch_mismatch":
         raise VersionMismatchError(
@@ -681,50 +689,30 @@ def cleanup_temporary_sudo_trust(args, path):
 def cleanup_stale_temporary_sudo_trust(args, remove_all_temp=False, allow_tty=False):
     """Удаляет просроченные или все временные sudoers-файлы LanFabric."""
     safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", args.user)
-    prefix = f"/etc/sudoers.d/lanfabric-temp-{safe_user}-"
-    script = """
-import os, sys, time, re
-safe_user = sys.argv[1]
-ttl = int(sys.argv[2])
-remove_all = sys.argv[3] == '1'
-prefix = '/etc/sudoers.d/lanfabric-temp-' + re.sub(r'[^A-Za-z0-9_.-]', '_', safe_user) + '-'
-pattern = re.compile(r'^' + re.escape(prefix) + r'[0-9a-f]{12}$')
-now = time.time()
-for name in os.listdir('/etc/sudoers.d'):
-    path = '/etc/sudoers.d/' + name
-    if not pattern.fullmatch(path):
-        continue
-    try:
-        stale = os.stat(path).st_mtime + ttl < now
-    except OSError:
-        continue
-    if remove_all or stale:
-        print(path)
-""".strip()
+    command = ["sudo"] if allow_tty else ["sudo", "-n"]
+    command.extend(["python3", REMOTE_SCRIPT, "_cleanup-temp-sudoers", "--user", safe_user])
+    if remove_all_temp:
+        command.append("--all")
+    else:
+        command.extend(["--ttl", str(TEMP_TRUST_TTL_SECONDS)])
     try:
         out = exec_remote(
             args,
-            ["python3", "-c", script, safe_user, str(TEMP_TRUST_TTL_SECONDS), "1" if remove_all_temp else "0"],
+            command,
             stream_output=False,
             timeout=15,
+            use_tty=allow_tty,
         )
     except RuntimeError as e:
         log.warning(f"Не удалось очистить временные sudoers LanFabric: {e}")
         return 0
-    candidate_re = re.compile(r"^" + re.escape(prefix) + r"[0-9a-f]{12}$")
-    candidates = []
-    for line in str(out or "").splitlines():
-        path = line.strip()
-        if candidate_re.fullmatch(path):
-            candidates.append(path)
-    removed = 0
-    for path in candidates:
-        sudo_cmd = ["sudo", "rm", "-f", path] if allow_tty else ["sudo", "-n", "rm", "-f", path]
-        try:
-            exec_remote(args, sudo_cmd, stream_output=False, timeout=10, use_tty=allow_tty)
-            removed += 1
-        except RuntimeError as e:
-            log.warning(f"Не удалось удалить временный sudoers {path}: {e}")
+    try:
+        removed = int(str(out or "0").strip())
+        if removed < 0:
+            raise ValueError
+    except ValueError:
+        log.warning(f"Сервер вернул некорректный count очистки sudoers: {out!r}")
+        return 0
     if removed:
         log.info(f"Удалены временные sudoers LanFabric: {removed}")
     return removed
@@ -875,7 +863,6 @@ def temporary_password_session_if_needed(args):
         if getattr(args, "host", None) and args.command not in ("endpoint-route", "help"):
             try:
                 cleanup_stale_lanfabric_temp_keys(args)
-                cleanup_stale_temporary_sudo_trust(args)
             except Exception as e:
                 log.debug(f"Фоновая очистка временных записей LanFabric не выполнена: {e}")
         yield
@@ -884,7 +871,6 @@ def temporary_password_session_if_needed(args):
     try:
         ssh_state = setup_temporary_ssh_trust(args, nonce)
         sudo_path = setup_temporary_sudo_trust(args, nonce)
-        cleanup_stale_temporary_sudo_trust(args)
         yield
     finally:
         if sudo_path:
@@ -899,7 +885,6 @@ def ensure_sudo_nopasswd(args):
     try:
         exec_remote(args, ["sudo", "-n", "true"], stream_output=False, timeout=10)
         log.info("Доступ к sudo без пароля подтверждён.")
-        cleanup_stale_temporary_sudo_trust(args)
         return
     except RuntimeError:
         pass
@@ -1001,6 +986,7 @@ def cmd_patch(args):
     state = compare_versions(__version__, remote_ver)
     if state == "equal":
         log.info(f"Версии уже совпадают: {__version__}. Patch не требуется")
+        try_cleanup_stale_temporary_sudo_trust(args)
         add_advice("Patch не требуется. Можно выполнять обычные команды управления сервером")
         return
     if state == "incompatible":
@@ -1019,6 +1005,7 @@ def cmd_patch(args):
     new_remote_ver = get_remote_version(args)
     if compare_versions(__version__, new_remote_ver) != "equal":
         raise RuntimeError(f"После patch версия сервера осталась несовместимой: {new_remote_ver}")
+    try_cleanup_stale_temporary_sudo_trust(args)
     add_advice("Patch завершён. Теперь можно повторить исходную команду")
 
 def manual_client_instruction(client_type):

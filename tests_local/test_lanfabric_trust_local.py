@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Локальные unit/smoke тесты для vcli-admin.py версии 0.0.16.
+Локальные unit/smoke тесты для vcli-admin.py версии 0.0.17.
 Без SSH/SCP/sudo/systemd/iptables/WireGuard/AmneziaWG.
 Без внешних библиотек, только стандартная библиотека Python.
 """
@@ -16,10 +16,17 @@ import datetime
 import re
 import hashlib
 import platform
+import importlib.util
+import inspect
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
 from contextlib import contextmanager
+
+_SRV_PATH = os.path.join(os.path.dirname(__file__), "..", "vsrv-admin.py")
+_srv_spec = importlib.util.spec_from_file_location("vsrv_admin_for_trust_tests", _SRV_PATH)
+srv = importlib.util.module_from_spec(_srv_spec)
+_srv_spec.loader.exec_module(srv)
 
 # ---------------------------------------------------------------------------
 # Импортируем vcli-admin.py через importlib.util (имя файла содержит дефис)
@@ -404,6 +411,24 @@ class TestTemporaryPasswordSession(unittest.TestCase):
         self.assertEqual(self.args.auth, "password")
         self.assertIsNone(self.args.key)
 
+    def test_password_session_does_not_call_new_helper_before_server_patch(self):
+        with patch.object(cli, "server_command_needs_password_session", return_value=True), \
+             patch.object(cli, "setup_temporary_ssh_trust", side_effect=self._setup_ssh_side_effect), \
+             patch.object(cli, "setup_temporary_sudo_trust", return_value="/tmp/sudo"), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup, \
+             patch.object(cli, "cleanup_temporary_sudo_trust"), \
+             patch.object(cli, "cleanup_temporary_ssh_trust", side_effect=self._cleanup_ssh_side_effect):
+            with cli.temporary_password_session_if_needed(self.args):
+                cleanup.assert_not_called()
+
+    def test_key_auth_patch_only_cleans_stale_ssh_keys_before_body(self):
+        args = make_args(auth="key", command="patch", host="srv")
+        with patch.object(cli, "cleanup_stale_lanfabric_temp_keys") as cleanup_keys, \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup_sudo:
+            with cli.temporary_password_session_if_needed(args):
+                cleanup_keys.assert_called_once_with(args)
+                cleanup_sudo.assert_not_called()
+
     def test_cleanup_called_on_exception(self):
         with patch.object(cli, "server_command_needs_password_session", return_value=True):
             with patch.object(cli, "setup_temporary_ssh_trust",
@@ -572,27 +597,141 @@ class TestKnownDefects(unittest.TestCase):
         remove_key.assert_not_called()
 
     def test_cleanup_stale_sudoers_not_in_sudoers_allowlist(self):
-        """Scan выполняется без sudo, а allowlist остаётся без python3 -c."""
+        """Cleanup использует существующий узкий server allowlist."""
         rule = cli.sudoers_rule_for_user("donpedro")
         self.assertNotIn("python3 -c", rule)
 
         args = make_args(user="donpedro")
-        valid = "/etc/sudoers.d/lanfabric-temp-donpedro-0123456789ab"
-        foreign = "/etc/sudoers.d/lanfabric-temp-other-0123456789ab"
-        invalid = "/etc/sudoers.d/lanfabric-temp-donpedro-not-a-nonce"
         commands = []
 
         def fake_exec(_args, command, **kwargs):
             commands.append(command)
-            if command[0] == "python3":
-                return "\n".join([valid, foreign, invalid])
-            return ""
+            return "1\n"
 
         with patch.object(cli, "exec_remote", side_effect=fake_exec):
             self.assertEqual(cli.cleanup_stale_temporary_sudo_trust(args), 1)
-        self.assertEqual(commands[0][0:2], ["python3", "-c"])
-        self.assertNotIn("sudo", commands[0])
-        self.assertEqual(commands[1], ["sudo", "-n", "rm", "-f", valid])
+        self.assertEqual(commands[0], ["sudo", "-n", "python3", cli.REMOTE_SCRIPT,
+                                       "_cleanup-temp-sudoers", "--user", "donpedro",
+                                       "--ttl", "3600"])
+
+    def test_cleanup_stale_sudoers_uses_privileged_internal_helper(self):
+        args = make_args(user="donpedro")
+        commands = []
+
+        def fake_exec(_args, command, **kwargs):
+            commands.append(command)
+            return "2\n"
+
+        with patch.object(cli, "exec_remote", side_effect=fake_exec):
+            self.assertEqual(cli.cleanup_stale_temporary_sudo_trust(args), 2)
+        self.assertEqual(
+            commands,
+            [["sudo", "-n", "python3", cli.REMOTE_SCRIPT,
+              "_cleanup-temp-sudoers", "--user", "donpedro", "--ttl", "3600"]],
+        )
+
+    def test_cleanup_stale_sudoers_all_uses_only_internal_all(self):
+        args = make_args(user="donpedro")
+        with patch.object(cli, "exec_remote", return_value="1\n") as execute:
+            self.assertEqual(cli.cleanup_stale_temporary_sudo_trust(args, remove_all_temp=True), 1)
+        self.assertEqual(
+            execute.call_args.args[1],
+            ["sudo", "-n", "python3", cli.REMOTE_SCRIPT,
+             "_cleanup-temp-sudoers", "--user", "donpedro", "--all"],
+        )
+
+    def test_cleanup_stale_sudoers_does_not_use_client_python_scan(self):
+        source = inspect.getsource(cli.cleanup_stale_temporary_sudo_trust)
+        self.assertNotIn("os.listdir('/etc/sudoers.d')", source)
+        self.assertNotIn("os.listdir(\"/etc/sudoers.d\")", source)
+        self.assertNotIn("[\"sudo\", \"python3\", \"-c\"", source)
+
+    def test_patch_runs_new_cleanup_only_after_copy_and_version_check(self):
+        args = make_args(command="patch")
+        events = []
+        with patch.object(cli, "get_remote_version", side_effect=["0.0.16", "0.0.17"]), \
+             patch.object(cli, "ensure_sudo_nopasswd", side_effect=lambda a: events.append("sudo")), \
+             patch.object(cli, "copy_server_module", side_effect=lambda a: events.append("copy")), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust", side_effect=lambda a: events.append("cleanup") or 0), \
+             patch.object(cli, "add_advice"):
+            cli.cmd_patch(args)
+        self.assertEqual(events, ["sudo", "copy", "cleanup"])
+
+    def test_key_auth_equal_flow_cleans_sudoers_once(self):
+        args = make_args(auth="key", command="status", host="srv")
+        with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
+             patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
+            with cli.temporary_password_session_if_needed(args):
+                self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.17")
+        cleanup.assert_called_once_with(args)
+
+    def test_key_auth_mismatch_flow_does_not_clean_sudoers(self):
+        args = make_args(auth="key", command="status", host="srv")
+        with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
+             patch.object(cli, "get_remote_version", return_value="0.0.16"), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
+            with cli.temporary_password_session_if_needed(args):
+                with self.assertRaises(cli.VersionMismatchError):
+                    cli.ensure_remote_version_compatible(args)
+        cleanup.assert_not_called()
+
+    def test_equal_version_runs_background_cleanup_once(self):
+        args = make_args()
+        with patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
+            self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.17")
+        cleanup.assert_called_once_with(args)
+
+    def test_patch_mismatch_does_not_run_background_cleanup(self):
+        args = make_args()
+        with patch.object(cli, "get_remote_version", return_value="0.0.16"), \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
+            with self.assertRaises(cli.VersionMismatchError):
+                cli.ensure_remote_version_compatible(args)
+        cleanup.assert_not_called()
+
+    def test_patch_equal_is_noop_and_cleans_sudoers_once(self):
+        args = make_args(command="patch")
+        with patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+             patch.object(cli, "copy_server_module") as copy, \
+             patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup, \
+             patch.object(cli, "add_advice"):
+            cli.cmd_patch(args)
+        copy.assert_not_called()
+        cleanup.assert_called_once_with(args)
+
+    def test_internal_cleanup_requires_matching_sudo_user(self):
+        with patch.dict(srv.os.environ, {"SUDO_USER": "donpedro"}):
+            with patch.object(srv, "_cleanup_temp_sudoers", return_value=1) as cleanup:
+                self.assertEqual(
+                    srv._run_internal_cleanup_temp_sudoers(["--user", "donpedro", "--all"]),
+                    1,
+                )
+        cleanup.assert_called_once_with("donpedro", 3600, True)
+
+    def test_internal_cleanup_rejects_other_sudo_user(self):
+        with patch.dict(srv.os.environ, {"SUDO_USER": "other"}):
+            with patch.object(srv, "_cleanup_temp_sudoers") as cleanup:
+                with self.assertRaises(RuntimeError):
+                    srv._run_internal_cleanup_temp_sudoers(["--user", "donpedro"])
+        cleanup.assert_not_called()
+
+    def test_internal_cleanup_requires_sudo_user(self):
+        with patch.dict(srv.os.environ, {}, clear=True):
+            with patch.object(srv, "_cleanup_temp_sudoers") as cleanup:
+                with self.assertRaises(RuntimeError):
+                    srv._run_internal_cleanup_temp_sudoers(["--user", "donpedro"])
+        cleanup.assert_not_called()
+
+    def test_internal_cleanup_compares_sanitized_users(self):
+        with patch.dict(srv.os.environ, {"SUDO_USER": "don/pedro"}):
+            with patch.object(srv, "_cleanup_temp_sudoers", return_value=0) as cleanup:
+                self.assertEqual(
+                    srv._run_internal_cleanup_temp_sudoers(["--user", "don_pedro"]),
+                    0,
+                )
+        cleanup.assert_called_once_with("don_pedro", 3600, False)
 
     def test_untrust_all_and_temp_are_sudoers_first(self):
         for mode in ("all", "temp"):
@@ -734,8 +873,8 @@ class TestVersionParsing(unittest.TestCase):
 
 class TestAdditionalChecks(unittest.TestCase):
 
-    def test_version_is_0_0_16(self):
-        self.assertEqual(cli.__version__, "0.0.16")
+    def test_version_is_0_0_17(self):
+        self.assertEqual(cli.__version__, "0.0.17")
 
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",
@@ -754,6 +893,63 @@ class TestAdditionalChecks(unittest.TestCase):
         rule = cli.sudoers_rule_for_user("donpedro")
         for cmd in ["apt-get", "systemctl", "iptables", "ip", "mkdir", "chmod", "rm"]:
             self.assertIn(cmd, rule)
+
+
+class TestServerTemporarySudoersCleanup(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = self.directory.name
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def touch(self, name, age=7200):
+        path = os.path.join(self.path, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("SECRET MUST NOT BE READ")
+        os.utime(path, (time.time() - age, time.time() - age))
+        return path
+
+    def test_stale_exact_file_removed_and_fresh_preserved(self):
+        stale = self.touch("lanfabric-temp-donpedro-0123456789ab")
+        fresh = self.touch("lanfabric-temp-donpedro-abcdefabcdef", age=10)
+        self.assertEqual(srv._cleanup_temp_sudoers("donpedro", 3600, False, self.path), 1)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_all_removes_only_exact_files_for_sanitized_user(self):
+        target = self.touch("lanfabric-temp-don_pedro-0123456789ab", age=10)
+        other = self.touch("lanfabric-temp-other-0123456789ab", age=10)
+        self.assertEqual(srv._cleanup_temp_sudoers("don/pedro", 3600, True, self.path), 1)
+        self.assertFalse(os.path.exists(target))
+        self.assertTrue(os.path.exists(other))
+
+    def test_foreign_permanent_and_invalid_files_survive(self):
+        names = [
+            "lanfabric-trust-donpedro",
+            "vpn-admin",
+            "foreign-file",
+            "lanfabric-temp-donpedro-not-a-nonce",
+            "lanfabric-temp-donpedro-0123456789aG",
+        ]
+        for name in names:
+            self.touch(name)
+        self.assertEqual(srv._cleanup_temp_sudoers("donpedro", 3600, True, self.path), 0)
+        for name in names:
+            self.assertTrue(os.path.exists(os.path.join(self.path, name)))
+
+    def test_cleanup_does_not_read_file_contents(self):
+        self.touch("lanfabric-temp-donpedro-0123456789ab")
+        with patch.object(srv, "open", side_effect=AssertionError("content read")):
+            self.assertEqual(srv._cleanup_temp_sudoers("donpedro", 3600, True, self.path), 1)
+
+    def test_public_help_does_not_advertise_internal_command(self):
+        result = subprocess.run(
+            [sys.executable, srv.__file__, "help"],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("_cleanup-temp-sudoers", result.stdout + result.stderr)
 
 
 # ===================================================================
