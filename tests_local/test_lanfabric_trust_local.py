@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Локальные unit/smoke тесты для vcli-admin.py версии 0.0.15.
+Локальные unit/smoke тесты для vcli-admin.py версии 0.0.16.
 Без SSH/SCP/sudo/systemd/iptables/WireGuard/AmneziaWG.
 Без внешних библиотек, только стандартная библиотека Python.
 """
@@ -734,8 +734,8 @@ class TestVersionParsing(unittest.TestCase):
 
 class TestAdditionalChecks(unittest.TestCase):
 
-    def test_version_is_0_0_15(self):
-        self.assertEqual(cli.__version__, "0.0.15")
+    def test_version_is_0_0_16(self):
+        self.assertEqual(cli.__version__, "0.0.16")
 
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",

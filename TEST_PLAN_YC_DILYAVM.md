@@ -2,7 +2,7 @@
 
 ## 1. Назначение
 
-План предназначен для ручной проверки LanFabric `0.0.15` на существующей
+План предназначен для ручной проверки LanFabric `0.0.16` на существующей
 виртуальной машине Yandex Cloud. Основной проход проверяет AmneziaWG, SSH/SCP,
 `sudo`, systemd, iptables, SQLite, управление пользователями и реальное
 VPN-соединение. Разрушающие сценарии вынесены в отдельные этапы и выполняются
@@ -169,8 +169,8 @@ git status --short
 
 Ожидается:
 
-- `vcli-admin 0.0.15`;
-- `vsrv-admin 0.0.15`;
+- `vcli-admin 0.0.16`;
+- `vsrv-admin 0.0.16`;
 - failures: 0;
 - errors: 0;
 - expected failures: 0;
@@ -256,7 +256,7 @@ python vcli-admin.py --host $HostIp --user dilukhin --auth key --key $Key init
 - созданы AWG-параметры;
 - интерфейс `wg0` поднят;
 - включён IPv4 forwarding;
-- серверный модуль имеет версию `0.0.15`.
+- серверный модуль имеет версию `0.0.16`.
 
 После init:
 
@@ -343,6 +343,14 @@ python vcli-admin.py --host $HostIp endpoint-route status
 
 После импорта `bob.conf`:
 
+Для Windows эффективный локальный конфиг full-tunnel должен содержать:
+
+```ini
+AllowedIPs = 0.0.0.0/1, 128.0.0.0/1
+```
+
+Серверная canonical-семантика остаётся `AllowedIPs = 0.0.0.0/0`; `/1 + /1` считается PASS для Windows и предотвращает restrictive kill-switch. Маршрут `/32` к Endpoint через обычный LAN gateway обязателен.
+
 ```powershell
 ping 10.8.0.1
 ping 8.8.8.8
@@ -354,7 +362,7 @@ curl.exe https://ifconfig.me/ip
 - доступен VPN-шлюз `10.8.0.1`;
 - доступен интернет;
 - внешний IP равен актуальному публичному IP ВМ;
-- SSH к Endpoint не уходит внутрь ещё не поднятого full-tunnel;
+- strict SSH к публичному IP ВМ остаётся доступен при включённом Bob;
 - после выключения туннеля исходная маршрутизация восстанавливается.
 
 Проверить UDP 51820 с внешней стороны по факту успешного handshake. Открытый
