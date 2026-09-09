@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.15"
+__version__ = "0.0.16"
 
 import sys
 import os
@@ -1374,6 +1374,25 @@ def cmd_endpoint_route(args):
     )
 
 
+def is_ipv4_full_tunnel(content):
+    """Проверяет точный IPv4 full-tunnel AllowedIPs в конфиге."""
+    return bool(re.search(
+        r"^[ \t]*AllowedIPs[ \t]*=[ \t]*0\.0\.0\.0/0[ \t]*$",
+        content,
+        re.MULTILINE,
+    ))
+
+
+def adapt_windows_full_tunnel(content):
+    """Заменяет только exact IPv4 /0 на две половины IPv4-пространства."""
+    return re.sub(
+        r"(^[ \t]*AllowedIPs[ \t]*=[ \t]*)0\.0\.0\.0/0([ \t]*$)",
+        r"\g<1>0.0.0.0/1, 128.0.0.0/1\g<2>",
+        content,
+        flags=re.MULTILINE,
+    )
+
+
 def cmd_config(args):
     """Скачивание конфигурации клиента через серверный модуль с sudo-доступом."""
     ensure_remote_version_compatible(args)
@@ -1387,20 +1406,27 @@ def cmd_config(args):
         content = exec_remote(args, remote_cmd, stream_output=False, force_no_debug=True)
         if not content.strip():
             raise RuntimeError("сервер вернул пустой конфиг")
+        full_tunnel = is_ipv4_full_tunnel(content)
+        local_content = content
+        if platform.system() == "Windows" and full_tunnel:
+            local_content = adapt_windows_full_tunnel(content)
+
         with open(local_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-            if not content.endswith("\n"):
+            f.write(local_content)
+            if not local_content.endswith("\n"):
                 f.write("\n")
         os.chmod(local_file, 0o600)
         log.info(f"Конфиг сохранён: {os.path.abspath(local_file)}")
 
-        full_tunnel = bool(re.search(r"^\s*AllowedIPs\s*=\s*0\.0\.0\.0/0\s*$", content, re.MULTILINE))
         endpoint_route_ok = True
 
         if platform.system() == "Windows" and full_tunnel:
             try:
                 ensure_windows_endpoint_route(args, allow_elevate=True)
-                add_advice("Маршрут к Endpoint добавлен автоматически. Теперь можно включать full-tunnel VPN")
+                add_advice(
+                    "Windows full-tunnel адаптирован без kill-switch: AllowedIPs заменён на 0.0.0.0/1, 128.0.0.0/1",
+                    "Маршрут к Endpoint добавлен автоматически. Теперь можно включать full-tunnel VPN",
+                )
             except RuntimeError as route_error:
                 endpoint_route_ok = False
                 log.warning(str(route_error))
