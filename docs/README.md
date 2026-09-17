@@ -5,6 +5,7 @@
 AI/workflow-документы:
 
 - `project_baseline_ru.md` — устойчивые инварианты и source-of-truth.
+- `current_status_ru.md` — текущий operational/E2E status, закрытые gates, известные ограничения и следующие задачи.
 - `chatgpt_web_workflow_ru.md` — роль ChatGPT Web и GitHub Connector.
 - `local_agent_workflow_ru.md` — bounded execution для OpenCode.
 - `task_report_protocol_ru.md` — task card/report contract.
