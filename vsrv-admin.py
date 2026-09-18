@@ -176,6 +176,27 @@ def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
+def derive_public_key(private_key, wg_bin):
+    """Вычисляет public key через stdin, не помещая private key в shell/diagnostics."""
+    try:
+        result = subprocess.run(
+            [wg_bin, "pubkey"],
+            input=str(private_key).strip() + "\n",
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        raise RuntimeError(f"Не удалось запустить {wg_bin} pubkey: {e}")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Не удалось вычислить публичный ключ через {wg_bin}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    public_key = result.stdout.strip()
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", public_key):
+        raise RuntimeError(f"{wg_bin} вернул публичный ключ некорректного формата")
+    return public_key
+
 def generate_awg_params():
     """Генерирует параметры маскировки AmneziaWG для сервера и клиентов."""
     s1 = 15 + secrets.randbelow(136)
@@ -318,13 +339,7 @@ def read_server_key_material(backend):
     if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pub or ""):
         raise RuntimeError("Публичный ключ сервера имеет некорректный формат")
     wg_bin = "awg" if backend == "awg" else "wg"
-    try:
-        result = subprocess.run([wg_bin, "pubkey"], input=priv + "\n", capture_output=True, text=True)
-    except OSError as e:
-        raise RuntimeError(f"Не удалось запустить {wg_bin} для проверки ключа: {e}")
-    if result.returncode != 0:
-        raise RuntimeError(f"Не удалось проверить пару ключей сервера через {wg_bin}: {result.stderr.strip() or result.stdout.strip()}")
-    if result.stdout.strip() != pub:
+    if derive_public_key(priv, wg_bin) != pub:
         raise RuntimeError("Сохранённые приватный и публичный ключи сервера не соответствуют друг другу")
     return priv, pub
 
@@ -763,8 +778,26 @@ def _atomic_write_root_file(path, content, mode=0o644):
         except FileNotFoundError:
             pass
 
-def awg_autostart_unit_text():
+def trusted_python_path():
+    """Возвращает реальный доверенный путь текущего Python 3.12+."""
+    if sys.version_info < (3, 12):
+        raise RuntimeError("Для root-службы требуется Python 3.12+")
+    path = Path(os.path.realpath(sys.executable))
+    if not path.is_file():
+        raise RuntimeError(f"Интерпретатор Python не найден: {path}")
+    for parent in [path, *path.parents]:
+        st = parent.stat()
+        if st.st_uid != 0:
+            raise RuntimeError(f"Путь Python не принадлежит root: {parent}")
+        if st.st_mode & 0o022:
+            raise RuntimeError(f"Путь Python доступен для записи группе или остальным: {parent}")
+        if str(parent) == "/":
+            break
+    return str(path)
+
+def awg_autostart_unit_text(python_path=None):
     """Возвращает узкий boot-only systemd contract для AWG."""
+    python_path = python_path or "/usr/bin/python3"
     return f"""[Unit]
 Description=LanFabric AWG boot restore
 After=systemd-sysctl.service netfilter-persistent.service
@@ -772,7 +805,7 @@ Wants=netfilter-persistent.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -u {REMOTE_DIR}/vsrv-admin.py _boot-awg
+ExecStart={python_path} -u {REMOTE_DIR}/vsrv-admin.py _boot-awg
 TimeoutStartSec={AWG_AUTOSTART_TIMEOUT_SECONDS}s
 Restart=no
 UMask=0077
@@ -785,7 +818,10 @@ WantedBy=multi-user.target
 def state_permission_errors():
     """Проверяет доверенную цепочку root entrypoint без исправления состояния."""
     errors = []
-    for path_text in ("/", "/opt", REMOTE_DIR, "/etc", WG_DIR):
+    for path_text in (
+        "/", "/opt", REMOTE_DIR,
+        "/etc", "/etc/systemd", "/etc/systemd/system", WG_DIR,
+    ):
         path = Path(path_text)
         try:
             st = path.stat()
@@ -812,15 +848,10 @@ def state_permission_errors():
         if st.st_mode & 0o077:
             errors.append(f"Файл {path} доступен группе или остальным")
 
-    python_path = Path(os.path.realpath("/usr/bin/python3"))
     try:
-        st = python_path.stat()
-        if st.st_uid != 0 or (st.st_mode & 0o022):
-            errors.append(f"Интерпретатор {python_path} не имеет доверенных root-only прав на запись")
-    except OSError as e:
-        errors.append(f"Не удалось проверить /usr/bin/python3: {e}")
-    if sys.version_info < (3, 12):
-        errors.append("Для root-службы требуется Python 3.12+")
+        trusted_python_path()
+    except Exception as e:
+        errors.append(str(e))
     return errors
 
 def ensure_awg_autostart_unit():
@@ -830,7 +861,12 @@ def ensure_awg_autostart_unit():
     errors = state_permission_errors()
     if errors:
         raise RuntimeError("Нельзя включить AWG autostart: " + "; ".join(errors))
-    _atomic_write_root_file(AWG_AUTOSTART_PATH, awg_autostart_unit_text(), mode=0o644)
+    python_path = trusted_python_path()
+    _atomic_write_root_file(
+        AWG_AUTOSTART_PATH,
+        awg_autostart_unit_text(python_path=python_path),
+        mode=0o644,
+    )
     run_cmd("systemctl daemon-reload")
     run_cmd(f"systemctl enable {AWG_AUTOSTART_UNIT}")
     enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
@@ -1156,7 +1192,7 @@ def cmd_init(args):
     priv = run_cmd(f"{wg_bin} genkey")
     write_private_file(priv_path, priv)
 
-    server_pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey").strip()
+    server_pub = derive_public_key(priv, wg_bin)
     with open(pub_path, "w") as f:
         f.write(server_pub)
 
@@ -1406,7 +1442,7 @@ def cmd_add(args):
     ip = allocate_ip(conn)
     wg_bin = get_wg_cmd()
     priv = run_cmd(f"{wg_bin} genkey")
-    pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey")
+    pub = derive_public_key(priv, wg_bin)
     
     admin_val = 1 if args.admin else 0
     internet_val = 1 if (args.admin or args.internet) else 0

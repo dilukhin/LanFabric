@@ -52,9 +52,10 @@ class TestStrictState(unittest.TestCase):
 class TestAutostartContract(unittest.TestCase):
 
     def test_unit_is_boot_only_oneshot(self):
-        text = srv.awg_autostart_unit_text()
+        text = srv.awg_autostart_unit_text(python_path="/usr/bin/python3.12")
         self.assertIn("Type=oneshot", text)
         self.assertIn("_boot-awg", text)
+        self.assertIn("ExecStart=/usr/bin/python3.12", text)
         self.assertIn("TimeoutStartSec=60s", text)
         self.assertIn("After=systemd-sysctl.service netfilter-persistent.service", text)
         self.assertNotIn("RemainAfterExit=yes", text)
@@ -91,6 +92,19 @@ class TestFirewallGuard(unittest.TestCase):
         self.assertFalse(any("-D FORWARD" in command for command in commands))
         self.assertTrue(any(f"-I {srv.FW_GUARD_CHAIN} 1 -j DROP" in command for command in commands))
 
+
+
+class TestSecretHandling(unittest.TestCase):
+
+    def test_public_key_derivation_does_not_use_shell(self):
+        fake = SimpleNamespace(returncode=0, stdout="A" * 43 + "=\n", stderr="")
+        with patch.object(srv.subprocess, "run", return_value=fake) as run:
+            result = srv.derive_public_key("B" * 43 + "=", "awg")
+        self.assertEqual(result, "A" * 43 + "=")
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["awg", "pubkey"])
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual(kwargs["input"], "B" * 43 + "=\n")
 
 
 class TestFailureSemantics(unittest.TestCase):
