@@ -1536,6 +1536,9 @@ def cmd_forward(args):
             
     if hasattr(args, "comment") and args.comment:
         remote_cmd.extend(["--comment", str(args.comment)])
+
+    if hasattr(args, "autostart_action") and args.autostart_action:
+        remote_cmd.append(args.autostart_action)
         
     log.info(f"Выполнение на сервере: {' '.join(shlex.quote(c) for c in remote_cmd)}")
     exec_remote(args, remote_cmd)
@@ -1557,7 +1560,7 @@ def main():
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vcli-admin.py {trust|untrust|init|patch|install-client|endpoint-route|start|stop|restart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
+        print("Краткая справка: vcli-admin.py {trust|untrust|init|patch|install-client|endpoint-route|start|stop|restart|autostart|remove|purge|add|edit|block|delete|list|config|status|health|sync} [опции] [--help]")
         sys.exit(0)
         
     if "--version" not in sys.argv:
@@ -1625,6 +1628,8 @@ def main():
     subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
     subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
     subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
+    p_autostart = subparsers.add_parser("autostart", help="Управление автозапуском AWG после загрузки")
+    p_autostart.add_argument("autostart_action", choices=["enable", "disable", "status"], help="Включить, отключить или проверить AWG autostart")
     subparsers.add_parser("list", help="Список учётных записей")
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика")

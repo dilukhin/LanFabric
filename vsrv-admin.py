@@ -40,6 +40,9 @@ LOCK_TIMEOUT_SECONDS = 20
 FW_GUARD_CHAIN = "LANFABRIC-GUARD"
 FW_FORWARD_CHAIN = "LANFABRIC-FWD"
 FW_NAT_CHAIN = "LANFABRIC-NAT"
+AWG_AUTOSTART_UNIT = "lanfabric-awg.service"
+AWG_AUTOSTART_PATH = f"/etc/systemd/system/{AWG_AUTOSTART_UNIT}"
+AWG_AUTOSTART_TIMEOUT_SECONDS = 60
 
 # Логирование
 logging.basicConfig(
@@ -720,6 +723,156 @@ def cleanup_runtime():
     if backend == "awg":
         run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
 
+def _atomic_write_root_file(path, content, mode=0o644):
+    """Атомарно записывает root-owned служебный файл."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.new-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+        dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+def awg_autostart_unit_text():
+    """Возвращает узкий boot-only systemd contract для AWG."""
+    return f"""[Unit]
+Description=LanFabric AWG boot restore
+After=systemd-sysctl.service netfilter-persistent.service
+Wants=netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u {REMOTE_DIR}/vsrv-admin.py _boot-awg
+TimeoutStartSec={AWG_AUTOSTART_TIMEOUT_SECONDS}s
+Restart=no
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def state_permission_errors():
+    """Проверяет доверенную цепочку root entrypoint без исправления состояния."""
+    errors = []
+    for path_text in ("/", "/opt", REMOTE_DIR, "/etc", WG_DIR):
+        path = Path(path_text)
+        try:
+            st = path.stat()
+        except OSError as e:
+            errors.append(f"Не удалось проверить права {path}: {e}")
+            continue
+        if st.st_uid != 0:
+            errors.append(f"Каталог {path} не принадлежит root")
+        if st.st_mode & 0o022:
+            errors.append(f"Каталог {path} доступен для записи группе или остальным")
+
+    for path_text in (
+        f"{REMOTE_DIR}/vsrv-admin.py", DB_PATH, BACKEND_PATH,
+        AWG_PARAMS_PATH, f"{WG_DIR}/{WG_IF}.private",
+    ):
+        path = Path(path_text)
+        try:
+            st = path.stat()
+        except OSError as e:
+            errors.append(f"Не удалось проверить защищённый файл {path}: {e}")
+            continue
+        if st.st_uid != 0:
+            errors.append(f"Файл {path} не принадлежит root")
+        if st.st_mode & 0o077:
+            errors.append(f"Файл {path} доступен группе или остальным")
+
+    python_path = Path(os.path.realpath("/usr/bin/python3"))
+    try:
+        st = python_path.stat()
+        if st.st_uid != 0 or (st.st_mode & 0o022):
+            errors.append(f"Интерпретатор {python_path} не имеет доверенных root-only прав на запись")
+    except OSError as e:
+        errors.append(f"Не удалось проверить /usr/bin/python3: {e}")
+    if sys.version_info < (3, 12):
+        errors.append("Для root-службы требуется Python 3.12+")
+    return errors
+
+def ensure_awg_autostart_unit():
+    """Устанавливает и разрешает boot-only unit без запуска/перезапуска VPN."""
+    load_state_snapshot(expected_backend="awg")
+    ensure_state_permissions()
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нельзя включить AWG autostart: " + "; ".join(errors))
+    _atomic_write_root_file(AWG_AUTOSTART_PATH, awg_autostart_unit_text(), mode=0o644)
+    run_cmd("systemctl daemon-reload")
+    run_cmd(f"systemctl enable {AWG_AUTOSTART_UNIT}")
+    enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
+    if enabled != "enabled":
+        raise RuntimeError(f"AWG autostart не включён после установки unit: {enabled or 'unknown'}")
+
+def disable_awg_autostart(remove_unit=False):
+    """Отключает будущий boot restore; текущий wg0 отдельно не останавливает."""
+    run_cmd(f"systemctl disable --now {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+    if remove_unit:
+        run_cmd(f"rm -f {AWG_AUTOSTART_PATH}", check=False)
+        run_cmd("systemctl daemon-reload")
+        run_cmd(f"systemctl reset-failed {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+
+def awg_autostart_state():
+    installed = os.path.isfile(AWG_AUTOSTART_PATH)
+    enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
+    result = run_cmd(
+        f"systemctl show {AWG_AUTOSTART_UNIT} -p Result --value 2>/dev/null",
+        check=False
+    ).strip()
+    return {
+        "installed": installed,
+        "enabled": enabled == "enabled",
+        "enabled_raw": enabled or "not-found",
+        "last_result": result or "unknown",
+    }
+
+def cmd_autostart(args):
+    """Явно управляет persistent AWG autostart, не меняя текущий runtime."""
+    if args.autostart_action == "enable":
+        ensure_awg_autostart_unit()
+        log.info("AWG autostart установлен и разрешён. Текущий runtime не перезапускался.")
+    elif args.autostart_action == "disable":
+        disable_awg_autostart(remove_unit=False)
+        log.info("AWG autostart отключён. Текущий runtime не останавливался.")
+    else:
+        state = awg_autostart_state()
+        log.info(f"AWG autostart unit установлен: {'ДА' if state['installed'] else 'НЕТ'}")
+        log.info(f"AWG autostart enabled: {'ДА' if state['enabled'] else 'НЕТ'} ({state['enabled_raw']})")
+        log.info(f"Результат последней systemd-попытки: {state['last_result']}")
+        try:
+            snapshot = load_state_snapshot(expected_backend="awg")
+            errors = runtime_readiness_errors(snapshot, check_firewall=True)
+            log.info(f"Фактический AWG runtime готов: {'ДА' if not errors else 'НЕТ'}")
+        except Exception as e:
+            log.warning(f"Фактический AWG runtime готов: НЕТ ({e})")
+
+def cmd_boot_awg():
+    """Внутренняя точка входа systemd: только строгий restore, без init/fallback."""
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нарушена доверенная граница AWG autostart: " + "; ".join(errors))
+    snapshot = load_state_snapshot(expected_backend="awg")
+    _restore_awg_runtime_locked(snapshot)
+    log.info("AWG runtime автоматически восстановлен после загрузки")
+
 def remove_packages(purge=False):
     """Удаляет установленные VPN-пакеты."""
     action = "purge" if purge else "remove"
@@ -759,6 +912,7 @@ def cmd_remove(args):
 
     log.info("Начало remove: удаление runtime и пакетов, данные сохраняются")
 
+    disable_awg_autostart(remove_unit=True)
     cleanup_runtime()
     remove_packages(purge=False)
 
@@ -773,6 +927,7 @@ def cmd_purge(args):
 
     log.info("Начало purge: полное удаление LanFabric с сервера")
 
+    disable_awg_autostart(remove_unit=True)
     cleanup_runtime()
     remove_packages(purge=True)
     cleanup_amnezia_repo()
@@ -842,8 +997,9 @@ def allocate_ip(conn):
 
 def ensure_dirs():
     """Создаёт необходимые директории."""
-    Path(CONF_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
-    Path(CONF_DIR).chmod(0o700)
+    conf_dir = Path(CONF_DIR)
+    conf_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    conf_dir.chmod(0o700)
     wg_dir = Path(WG_DIR)
     wg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     wg_dir.chmod(0o700)
@@ -887,20 +1043,21 @@ def cmd_init(args):
 
     # --- Очистка предыдущего состояния ---
     log.info("Очистка предыдущего состояния VPN (если есть)")
+    disable_awg_autostart(remove_unit=True)
 
-    run_cmd("systemctl disable --now wg-quick@wg0 2>/dev/null || true", check=False)
-    run_cmd("ip link del wg0 2>/dev/null || true", check=False)
-
-    run_cmd("iptables -D FORWARD -i wg0 -o wg0 -j ACCEPT 2>/dev/null || true", check=False)
-    run_cmd("iptables -D FORWARD -i wg0 -j DROP 2>/dev/null || true", check=False)
-    run_cmd("iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true", check=False)
+    if os.path.exists(BACKEND_PATH):
+        cleanup_runtime()
+    elif interface_exists():
+        raise RuntimeError(
+            f"Интерфейс {WG_IF} существует без сохранённого backend; "
+            "его принадлежность LanFabric не подтверждена, init остановлен"
+        )
+    else:
+        cleanup_owned_firewall()
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
 
     run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
     run_cmd("rm -f /etc/wireguard/wg0.private /etc/wireguard/wg0.public", check=False)
-
-    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
-    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
-
     run_cmd("rm -f /opt/vpn-admin/backend", check=False)
 
     # --- Установка пакетов ---
@@ -1018,6 +1175,9 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 
     # --- Сохранение правил ---
     run_cmd("netfilter-persistent save")
+    ensure_state_permissions()
+    if backend == "awg":
+        ensure_awg_autostart_unit()
 
     log.info("Инициализация завершена. Интерфейс поднят, правила сохранены.")
     add_advice("Выполните add <имя> для создания пользователя или health для проверки системы")
@@ -1053,6 +1213,14 @@ def cmd_status():
     if snapshot_error:
         log.warning("Сохранённое состояние некорректно: " + snapshot_error)
     log.info(f"Состояние VPN: {state}")
+    if backend == "awg":
+        auto = awg_autostart_state()
+        log.info(
+            "AWG autostart: "
+            f"installed={'yes' if auto['installed'] else 'no'}, "
+            f"enabled={'yes' if auto['enabled'] else 'no'}, "
+            f"last_result={auto['last_result']}"
+        )
     if state == "RUNNING":
         add_advice("Можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
     elif state == "STOPPED":
@@ -1344,10 +1512,19 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_cleanup-temp-sudoers":
         print(_run_internal_cleanup_temp_sudoers(sys.argv[2:]))
         return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_boot-awg":
+        try:
+            with runtime_lock():
+                cmd_boot_awg()
+        except Exception as e:
+            log.error(str(e))
+            sys.exit(1)
+        return
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vsrv-admin.py {init|backend|start|stop|restart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
+        print("Краткая справка: vsrv-admin.py {init|backend|start|stop|restart|autostart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
         sys.exit(0)
         
     if "--version" not in sys.argv and (len(sys.argv) < 2 or sys.argv[1] not in ("config", "backend")):
@@ -1361,6 +1538,8 @@ def main():
     subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
     subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
     subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
+    p_autostart = subparsers.add_parser("autostart", help="Управление автозапуском AWG после загрузки")
+    p_autostart.add_argument("autostart_action", choices=["enable", "disable", "status"], help="Включить, отключить или проверить AWG autostart")
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика системы")
     subparsers.add_parser("sync", help="Пересборка состояния из базы данных")
@@ -1406,7 +1585,7 @@ def main():
         
     try:
         mutating_commands = {
-            "init", "start", "stop", "restart", "sync",
+            "init", "start", "stop", "restart", "sync", "autostart",
             "add", "edit", "block", "delete", "remove", "purge",
         }
 
@@ -1421,6 +1600,8 @@ def main():
                 cmd_stop()
             elif args.command == "restart":
                 cmd_restart()
+            elif args.command == "autostart":
+                cmd_autostart(args)
             elif args.command == "status":
                 cmd_status()
             elif args.command == "health":

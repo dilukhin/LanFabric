@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Локальные unit/smoke тесты для vcli-admin.py версии 0.0.17.
+Локальные unit/smoke тесты для vcli-admin.py версии 0.0.18.
 Без SSH/SCP/sudo/systemd/iptables/WireGuard/AmneziaWG.
 Без внешних библиотек, только стандартная библиотека Python.
 """
@@ -649,7 +649,7 @@ class TestKnownDefects(unittest.TestCase):
     def test_patch_runs_new_cleanup_only_after_copy_and_version_check(self):
         args = make_args(command="patch")
         events = []
-        with patch.object(cli, "get_remote_version", side_effect=["0.0.16", "0.0.17"]), \
+        with patch.object(cli, "get_remote_version", side_effect=["0.0.17", "0.0.18"]), \
              patch.object(cli, "ensure_sudo_nopasswd", side_effect=lambda a: events.append("sudo")), \
              patch.object(cli, "copy_server_module", side_effect=lambda a: events.append("copy")), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust", side_effect=lambda a: events.append("cleanup") or 0), \
@@ -660,16 +660,16 @@ class TestKnownDefects(unittest.TestCase):
     def test_key_auth_equal_flow_cleans_sudoers_once(self):
         args = make_args(auth="key", command="status", host="srv")
         with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
-             patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+             patch.object(cli, "get_remote_version", return_value="0.0.18"), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
             with cli.temporary_password_session_if_needed(args):
-                self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.17")
+                self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.18")
         cleanup.assert_called_once_with(args)
 
     def test_key_auth_mismatch_flow_does_not_clean_sudoers(self):
         args = make_args(auth="key", command="status", host="srv")
         with patch.object(cli, "cleanup_stale_lanfabric_temp_keys"), \
-             patch.object(cli, "get_remote_version", return_value="0.0.16"), \
+             patch.object(cli, "get_remote_version", return_value="0.0.17"), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
             with cli.temporary_password_session_if_needed(args):
                 with self.assertRaises(cli.VersionMismatchError):
@@ -678,14 +678,14 @@ class TestKnownDefects(unittest.TestCase):
 
     def test_equal_version_runs_background_cleanup_once(self):
         args = make_args()
-        with patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+        with patch.object(cli, "get_remote_version", return_value="0.0.18"), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
-            self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.17")
+            self.assertEqual(cli.ensure_remote_version_compatible(args), "0.0.18")
         cleanup.assert_called_once_with(args)
 
     def test_patch_mismatch_does_not_run_background_cleanup(self):
         args = make_args()
-        with patch.object(cli, "get_remote_version", return_value="0.0.16"), \
+        with patch.object(cli, "get_remote_version", return_value="0.0.17"), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup:
             with self.assertRaises(cli.VersionMismatchError):
                 cli.ensure_remote_version_compatible(args)
@@ -693,7 +693,7 @@ class TestKnownDefects(unittest.TestCase):
 
     def test_patch_equal_is_noop_and_cleans_sudoers_once(self):
         args = make_args(command="patch")
-        with patch.object(cli, "get_remote_version", return_value="0.0.17"), \
+        with patch.object(cli, "get_remote_version", return_value="0.0.18"), \
              patch.object(cli, "copy_server_module") as copy, \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust") as cleanup, \
              patch.object(cli, "add_advice"):
@@ -874,7 +874,7 @@ class TestVersionParsing(unittest.TestCase):
 class TestAdditionalChecks(unittest.TestCase):
 
     def test_version_is_0_0_17(self):
-        self.assertEqual(cli.__version__, "0.0.17")
+        self.assertEqual(cli.__version__, "0.0.18")
 
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",

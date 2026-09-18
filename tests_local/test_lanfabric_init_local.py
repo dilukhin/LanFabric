@@ -28,7 +28,9 @@ class TestAmneziaInstall(unittest.TestCase):
                 raise StopAfterPackages
             return ""
 
-        with patch.object(srv, "ensure_dirs"), patch.object(srv, "run_cmd", side_effect=run_cmd):
+        with patch.object(srv, "ensure_dirs"), patch.object(srv, "init_db"), \
+             patch.object(srv, "ensure_state_permissions"), patch.object(srv, "disable_awg_autostart"), \
+             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "run_cmd", side_effect=run_cmd):
             with self.assertRaises(StopAfterPackages):
                 srv.cmd_init(SimpleNamespace(no_amnezia=False))
 
@@ -53,7 +55,9 @@ class TestAmneziaInstall(unittest.TestCase):
                 raise StopAfterPackages
             return ""
 
-        with patch.object(srv, "ensure_dirs"), patch.object(srv, "run_cmd", side_effect=run_cmd):
+        with patch.object(srv, "ensure_dirs"), patch.object(srv, "init_db"), \
+             patch.object(srv, "ensure_state_permissions"), patch.object(srv, "disable_awg_autostart"), \
+             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "run_cmd", side_effect=run_cmd):
             with self.assertRaises(StopAfterPackages):
                 srv.cmd_init(SimpleNamespace(no_amnezia=True))
 
@@ -73,7 +77,8 @@ class TestInitDirectories(unittest.TestCase):
             [call(srv.CONF_DIR), call(srv.WG_DIR)],
             path_mock.call_args_list,
         )
-        state_dir.mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        state_dir.mkdir.assert_called_once_with(parents=True, exist_ok=True, mode=0o700)
+        state_dir.chmod.assert_called_once_with(0o700)
         wireguard_dir.mkdir.assert_called_once_with(parents=True, exist_ok=True, mode=0o700)
         wireguard_dir.chmod.assert_called_once_with(0o700)
 
