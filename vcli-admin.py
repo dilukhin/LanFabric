@@ -470,6 +470,7 @@ except FileNotFoundError:
                 "sudo", "python3", "-c", installer,
                 remote_upload, REMOTE_SCRIPT, local_sha256, __version__,
             ],
+            stream_output=False,
             timeout=30,
         )
     finally:

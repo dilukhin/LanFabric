@@ -876,6 +876,15 @@ class TestAdditionalChecks(unittest.TestCase):
     def test_version_is_0_0_17(self):
         self.assertEqual(cli.__version__, "0.0.18")
 
+    def test_server_copy_uses_atomic_root_install(self):
+        source = inspect.getsource(cli.copy_server_module)
+        self.assertIn("/tmp/lanfabric-vsrv-", source)
+        self.assertIn("hashlib.sha256", source)
+        self.assertIn("compile(text", source)
+        self.assertIn("os.replace", source)
+        self.assertIn("os.chown(parent, 0, 0)", source)
+        self.assertNotIn("sudo\", \"chown\", f\"{args.user}", source)
+
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",
                       "sudoers_rule_for_user", "temporary_password_session_if_needed",

@@ -126,7 +126,7 @@ def get_backend():
 
 def get_wg_cmd(allow_missing=False):
     try:
-        backend = get_backend()
+        backend = require_backend()
         return "awg" if backend == "awg" else "wg"
     except Exception:
         if allow_missing:
@@ -460,6 +460,14 @@ def close_firewall_guard(persist=True):
     current_rules = _chain_rule_lines("filter", "FORWARD")
     if not current_rules or current_rules[0] != hook:
         run_cmd(f"iptables -I FORWARD 1 -i {WG_IF} -j {FW_GUARD_CHAIN}")
+        current_rules = _chain_rule_lines("filter", "FORWARD")
+
+    duplicate_positions = [
+        index + 1 for index, rule in enumerate(current_rules)
+        if rule == hook and index != 0
+    ]
+    for position in reversed(duplicate_positions):
+        run_cmd(f"iptables -D FORWARD {position}")
 
     if persist:
         run_cmd("netfilter-persistent save")
@@ -563,6 +571,8 @@ def firewall_readiness_errors(snapshot, guard_open=True):
     hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
     if not forward_rules or forward_rules[0] != hook:
         errors.append("Hook LanFabric не является первым правилом FORWARD для wg0")
+    if forward_rules.count(hook) != 1:
+        errors.append("Hook LanFabric присутствует в FORWARD не ровно один раз")
 
     guard_rules = _chain_rule_lines("filter", FW_GUARD_CHAIN)
     if guard_open:
@@ -1038,7 +1048,6 @@ def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
     log.info("Начало инициализации сервера")
     ensure_dirs()
-    init_db(create=True).close()
     ensure_state_permissions()
 
     # --- Очистка предыдущего состояния ---
@@ -1059,6 +1068,8 @@ def cmd_init(args):
     run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
     run_cmd("rm -f /etc/wireguard/wg0.private /etc/wireguard/wg0.public", check=False)
     run_cmd("rm -f /opt/vpn-admin/backend", check=False)
+    init_db(create=True).close()
+    ensure_state_permissions()
 
     # --- Установка пакетов ---
     log.info("Обновление списка пакетов")
@@ -1244,11 +1255,13 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
     backend = snapshot["backend"]
     wg_bin = snapshot["wg_bin"]
     detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
-    brief = run_cmd(f"ip -brief link show {WG_IF}", check=False)
-    if not detail:
+    link_state = run_cmd(f"ip link show {WG_IF}", check=False)
+    if not detail or not link_state:
         return [f"Интерфейс {WG_IF} отсутствует"]
-    if "UP" not in brief.split():
-        errors.append(f"Интерфейс {WG_IF} не находится в состоянии UP")
+    flags_match = re.search(r"<([^>]*)>", link_state)
+    flags = set(flags_match.group(1).split(",")) if flags_match else set()
+    if "UP" not in flags:
+        errors.append(f"Интерфейс {WG_IF} не находится в административном состоянии UP")
     if backend == "awg" and "amneziawg" not in detail.lower():
         errors.append(f"Интерфейс {WG_IF} не имеет тип amneziawg")
     actual_pub = run_cmd(f"{wg_bin} show {WG_IF} public-key", check=False).strip()

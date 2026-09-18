@@ -92,5 +92,40 @@ class TestFirewallGuard(unittest.TestCase):
         self.assertTrue(any(f"-I {srv.FW_GUARD_CHAIN} 1 -j DROP" in command for command in commands))
 
 
+
+class TestFailureSemantics(unittest.TestCase):
+
+    def test_unknown_backend_never_falls_back_to_wg(self):
+        with patch.object(srv, "get_backend", return_value="broken"):
+            with self.assertRaises(RuntimeError):
+                srv.get_wg_cmd()
+
+    def test_health_returns_error_when_runtime_not_ready(self):
+        snapshot = {"backend": "awg", "users": []}
+        with patch.object(srv, "load_state_snapshot", return_value=snapshot), \
+             patch.object(srv, "runtime_readiness_errors", return_value=["ошибка"]):
+            with self.assertRaises(RuntimeError):
+                srv.cmd_health()
+
+    def test_sync_failure_keeps_guard_closed_and_never_opens_it(self):
+        snapshot = {"backend": "awg", "users": []}
+        with patch.object(srv, "awg_interface_ownership", return_value="owned"), \
+             patch.object(srv, "close_firewall_guard") as close_guard, \
+             patch.object(srv, "_apply_awg_peers", side_effect=RuntimeError("peer failure")), \
+             patch.object(srv, "open_firewall_guard") as open_guard:
+            with self.assertRaises(RuntimeError):
+                srv._sync_awg_runtime_locked(snapshot)
+        self.assertGreaterEqual(close_guard.call_count, 2)
+        open_guard.assert_not_called()
+
+    def test_foreign_wg0_is_not_deleted_by_awg_stop(self):
+        with patch.object(srv, "load_runtime_identity", return_value={"server_public_key": "x"}), \
+             patch.object(srv, "awg_interface_ownership", return_value="unknown"), \
+             patch.object(srv, "run_cmd") as run:
+            with self.assertRaises(RuntimeError):
+                srv._stop_awg_runtime_locked()
+        self.assertFalse(any("ip link del" in str(call) for call in run.call_args_list))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,7 @@ def main():
         (CLI_PATH, "untrust"),
         (CLI_PATH, "init"),
         (CLI_PATH, "config"),
+        (CLI_PATH, "autostart"),
     ]:
         if not run_help(*args_list):
             help_ok = False

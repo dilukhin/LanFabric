@@ -30,7 +30,8 @@ class TestAmneziaInstall(unittest.TestCase):
 
         with patch.object(srv, "ensure_dirs"), patch.object(srv, "init_db"), \
              patch.object(srv, "ensure_state_permissions"), patch.object(srv, "disable_awg_autostart"), \
-             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "run_cmd", side_effect=run_cmd):
+             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "interface_exists", return_value=False), \
+             patch.object(srv, "run_cmd", side_effect=run_cmd):
             with self.assertRaises(StopAfterPackages):
                 srv.cmd_init(SimpleNamespace(no_amnezia=False))
 
@@ -57,7 +58,8 @@ class TestAmneziaInstall(unittest.TestCase):
 
         with patch.object(srv, "ensure_dirs"), patch.object(srv, "init_db"), \
              patch.object(srv, "ensure_state_permissions"), patch.object(srv, "disable_awg_autostart"), \
-             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "run_cmd", side_effect=run_cmd):
+             patch.object(srv, "cleanup_owned_firewall"), patch.object(srv, "interface_exists", return_value=False), \
+             patch.object(srv, "run_cmd", side_effect=run_cmd):
             with self.assertRaises(StopAfterPackages):
                 srv.cmd_init(SimpleNamespace(no_amnezia=True))
 
