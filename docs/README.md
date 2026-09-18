@@ -15,3 +15,8 @@ AI/workflow-документы:
 Implementation constraints для AI: `../_bmad-output/project-context.md`.
 
 E2E на тестовой Yandex Cloud VM: `../TEST_PLAN_YC_DILYAVM.md`.
+
+Архитектурные проверки:
+
+- [Независимая инспекция проекта, 2026-09-18](reviews/LanFabric_project_inspection_2026-09-18.md) — прогресс, архитектура, проверенные риски и связанные задачи.
+- [Замечания к AWG lifecycle, 2026-09-18](reviews/LanFabric_awg_lifecycle_corrections_2026-09-18.md) — уточнения для issue #12 и исходного диалога.

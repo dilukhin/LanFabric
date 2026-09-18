@@ -1,0 +1,31 @@
+{
+  "runtime": "0.0.17",
+  "python": "3.12.14",
+  "observations_confirmed": 7,
+  "total": 7,
+  "results": {
+    "database_permissions": {
+      "db": "0o644",
+      "parent": "0o755",
+      "group_other_can_read": true
+    },
+    "health_on_failed_runtime": {
+      "exit_code": 0,
+      "created_missing_db": true
+    },
+    "restore_creates_missing_awg_params": true,
+    "sync_partial_failure_model": {
+      "drop": false,
+      "peers": [
+        "one"
+      ],
+      "interface_up": true
+    },
+    "patch_downgrade_18_to_17_calls_copy": true,
+    "config_name_escapes_directory": true,
+    "clean_stdout_merges_stderr": {
+      "merge_enabled": true,
+      "warning_returned_as_content": true
+    }
+  }
+}
