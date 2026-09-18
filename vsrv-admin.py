@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.17"
+__version__ = "0.0.18"
 
 import sys
 import os
@@ -227,14 +227,15 @@ def format_awg_params(params):
     params = validate_awg_params(params)
     return "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS)
 
-def build_setconf(priv, backend):
-    """Формирует конфиг для wg/awg setconf."""
+def build_setconf(priv, backend, awg_params=None):
+    """Формирует конфиг для wg/awg setconf без неявного создания состояния."""
     conf = f"""[Interface]
 PrivateKey = {priv}
 ListenPort = {WG_BASE_PORT}
 """
     if backend == "awg":
-        conf += format_awg_params(get_or_create_awg_params()) + "\n"
+        params = read_awg_params_file() if awg_params is None else validate_awg_params(awg_params)
+        conf += format_awg_params(params) + "\n"
     return conf
 
 def write_private_file(path, content):
@@ -250,19 +251,99 @@ def write_private_file(path, content):
         if fd is not None:
             os.close(fd)
 
-def write_setconf(priv, backend):
-    """Сохраняет конфиг для wg/awg setconf."""
+def write_setconf(priv, backend, awg_params=None):
+    """Сохраняет производный конфиг для wg/awg setconf."""
     setconf_path = Path(f"/etc/wireguard/{WG_IF}.setconf")
-    write_private_file(setconf_path, build_setconf(priv, backend))
+    write_private_file(setconf_path, build_setconf(priv, backend, awg_params=awg_params))
     return setconf_path
 
 def ensure_awg_setconf():
-    """Обновляет setconf AmneziaWG сохранёнными параметрами маскировки."""
-    priv_path = f"/etc/wireguard/{WG_IF}.private"
-    if not os.path.exists(priv_path):
-        raise RuntimeError(f"Приватный ключ сервера отсутствует: {priv_path}. Выполните init")
-    priv = Path(priv_path).read_text(encoding="utf-8").strip()
-    return write_setconf(priv, "awg")
+    """Пересобирает setconf только из уже существующих проверенных данных."""
+    priv, _ = read_server_key_material("awg")
+    params = read_awg_params_file()
+    return write_setconf(priv, "awg", awg_params=params)
+
+def read_server_key_material(backend):
+    """Строго читает и сверяет серверную пару ключей, не выводя приватный ключ."""
+    priv_path = Path(f"/etc/wireguard/{WG_IF}.private")
+    pub_path = Path(f"/etc/wireguard/{WG_IF}.public")
+    if not priv_path.is_file():
+        raise RuntimeError(f"Приватный ключ сервера отсутствует: {priv_path}")
+    if not pub_path.is_file():
+        raise RuntimeError(f"Публичный ключ сервера отсутствует: {pub_path}")
+    priv = priv_path.read_text(encoding="utf-8").strip()
+    pub = pub_path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", priv or ""):
+        raise RuntimeError("Приватный ключ сервера имеет некорректный формат")
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pub or ""):
+        raise RuntimeError("Публичный ключ сервера имеет некорректный формат")
+    wg_bin = "awg" if backend == "awg" else "wg"
+    try:
+        result = subprocess.run([wg_bin, "pubkey"], input=priv + "\n", capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"Не удалось запустить {wg_bin} для проверки ключа: {e}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Не удалось проверить пару ключей сервера через {wg_bin}: {result.stderr.strip() or result.stdout.strip()}")
+    if result.stdout.strip() != pub:
+        raise RuntimeError("Сохранённые приватный и публичный ключи сервера не соответствуют друг другу")
+    return priv, pub
+
+def validate_user_rows(rows):
+    """Проверяет записи пользователей перед восстановлением runtime."""
+    network = ipaddress.ip_network(VPN_NET)
+    seen_ips = set()
+    seen_pubkeys = set()
+    for row in rows:
+        name = str(row["name"] or "")
+        pubkey = str(row["pubkey"] or "")
+        privkey = str(row["privkey"] or "")
+        ip_text = str(row["ip"] or "")
+        if not name:
+            raise RuntimeError("В БД обнаружена учётная запись без имени")
+        if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pubkey):
+            raise RuntimeError(f"Некорректный публичный ключ пользователя {name}")
+        if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", privkey):
+            raise RuntimeError(f"Некорректный приватный ключ пользователя {name}")
+        try:
+            address = ipaddress.ip_address(ip_text)
+        except ValueError:
+            raise RuntimeError(f"Некорректный IP пользователя {name}: {ip_text}")
+        if address not in network or ip_text == SERVER_IP or address == network.network_address or address == network.broadcast_address:
+            raise RuntimeError(f"IP пользователя {name} находится вне допустимого пула: {ip_text}")
+        if ip_text in seen_ips:
+            raise RuntimeError(f"В БД повторяется IP: {ip_text}")
+        if pubkey in seen_pubkeys:
+            raise RuntimeError(f"В БД повторяется публичный ключ пользователя {name}")
+        seen_ips.add(ip_text)
+        seen_pubkeys.add(pubkey)
+        for field in ("admin", "internet", "blocked"):
+            if int(row[field]) not in (0, 1):
+                raise RuntimeError(f"Некорректный флаг {field} у пользователя {name}")
+
+def load_state_snapshot(expected_backend=None):
+    """Строго читает сохранённое состояние без создания или исправления данных."""
+    if sys.version_info < (3, 12):
+        raise RuntimeError("Для восстановления LanFabric требуется Python 3.12+")
+    backend = require_backend()
+    if expected_backend is not None and backend != expected_backend:
+        raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
+    wg_bin = "awg" if backend == "awg" else "wg"
+    if not run_cmd(f"command -v {wg_bin}", check=False):
+        raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
+    priv, pub = read_server_key_material(backend)
+    awg_params = read_awg_params_file() if backend == "awg" else None
+    conn = init_db(read_only=True)
+    try:
+        quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
+        if str(quick_check).lower() != "ok":
+            raise RuntimeError(f"Проверка SQLite завершилась ошибкой: {quick_check}")
+        rows = [dict(row) for row in conn.execute(
+            "SELECT name, pubkey, privkey, ip, admin, internet, blocked, comment FROM users ORDER BY ip"
+        ).fetchall()]
+    finally:
+        conn.close()
+    validate_user_rows(rows)
+    return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "users": rows}
 
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
@@ -477,23 +558,41 @@ def cmd_purge(args):
     print("Purge завершён. LanFabric полностью удалён с сервера.")
     add_advice("Для новой установки заново выполните init с клиента")
 
-def init_db():
-    """Создаёт или подключается к SQLite базе."""
-    conn = sqlite3.connect(DB_PATH)
+def validate_db_schema(conn):
+    """Проверяет обязательную схему БД без её изменения."""
+    expected = ["name", "pubkey", "privkey", "ip", "admin", "internet", "blocked", "comment"]
+    rows = conn.execute("PRAGMA table_info(users)").fetchall()
+    actual = [row[1] for row in rows]
+    if actual != expected:
+        raise RuntimeError("Некорректная схема БД users: " f"ожидались поля {', '.join(expected)}, получено {', '.join(actual) or 'нет таблицы'}")
+
+def init_db(create=False, read_only=False):
+    """Открывает БД. Создание разрешено только явному init-пути."""
+    if read_only and create:
+        raise RuntimeError("Нельзя одновременно создавать БД и открывать её только для чтения")
+    if not os.path.exists(DB_PATH) and not create:
+        raise RuntimeError(f"База данных отсутствует: {DB_PATH}. Автоматическое создание запрещено")
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) if read_only else sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            name TEXT PRIMARY KEY,
-            pubkey TEXT NOT NULL,
-            privkey TEXT NOT NULL,
-            ip TEXT NOT NULL UNIQUE,
-            admin INTEGER DEFAULT 0,
-            internet INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            comment TEXT DEFAULT ''
-        )
-    """)
-    conn.commit()
+    if create:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                name TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                privkey TEXT NOT NULL,
+                ip TEXT NOT NULL UNIQUE,
+                admin INTEGER DEFAULT 0,
+                internet INTEGER DEFAULT 0,
+                blocked INTEGER DEFAULT 0,
+                comment TEXT DEFAULT ''
+            )
+        """)
+        conn.commit()
+    try:
+        validate_db_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 def allocate_ip(conn):
@@ -522,6 +621,7 @@ def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
     log.info("Начало инициализации сервера")
     ensure_dirs()
+    init_db(create=True).close()
 
     # --- Очистка предыдущего состояния ---
     log.info("Очистка предыдущего состояния VPN (если есть)")
@@ -637,7 +737,8 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 """
     write_private_file(f"/etc/wireguard/{WG_IF}.conf", conf)
 
-    write_setconf(priv, backend)
+    awg_params = get_or_create_awg_params() if backend == "awg" else None
+    write_setconf(priv, backend, awg_params=awg_params)
 
     # --- Поднятие интерфейса ---
     log.info("Запуск интерфейса")
@@ -669,219 +770,138 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
     add_advice("Выполните add <имя> для создания пользователя или health для проверки системы")
 
 def cmd_status():
-    """Быстрая проверка состояния."""
-    backend = get_backend()
-    wg_bin = get_wg_cmd()
-
+    """Быстрая немутирующая проверка фактического состояния."""
+    try:
+        backend = require_backend()
+    except Exception as e:
+        log.warning(f"Backend: ошибка ({e})")
+        log.info("Состояние VPN: BROKEN")
+        add_advice("Выполните health для подробной диагностики")
+        return
     log.info(f"Backend: {backend}")
-
-    state = "UNKNOWN"
-
-    if backend == "wg":
-        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False).strip()
-        log.info(f"Сервис wg-quick@wg0: {svc or 'unknown'}")
-        state = "RUNNING" if svc == "active" else "STOPPED"
-    elif backend == "awg":
-        log.info("Сервис wg-quick@wg0: не используется для backend awg")
-        iface_exists = subprocess.run(
-            f"ip link show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-        backend_ok = subprocess.run(
-            f"{wg_bin} show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-
-        if not iface_exists:
-            state = "STOPPED"
-        elif backend_ok:
-            state = "RUNNING"
-        else:
-            state = "BROKEN"
-    else:
-        log.warning(f"Неизвестный backend: {backend}")
+    snapshot = None
+    snapshot_error = None
+    try:
+        snapshot = load_state_snapshot(expected_backend=backend)
+    except Exception as e:
+        snapshot_error = str(e)
+    iface_exists = subprocess.run(f"ip link show {WG_IF}", shell=True, capture_output=True, text=True).returncode == 0
+    if not iface_exists:
+        state = "STOPPED" if snapshot_error is None else "BROKEN"
+    elif snapshot_error is not None:
         state = "BROKEN"
-
-    iface = run_cmd("ip -brief link show wg0 || echo 'не найден'", check=False)
-    log.info("Состояние интерфейса: " + iface)
-
-    wg_state = run_cmd(f"{wg_bin} show {WG_IF}", check=False)
-    if wg_state:
-        log.info(f"Состояние backend {backend}: OK")
+    elif backend == "wg":
+        svc = run_cmd(f"systemctl is-active wg-quick@{WG_IF}", check=False).strip()
+        state = "RUNNING" if svc == "active" and not runtime_readiness_errors(snapshot, check_firewall=False) else "BROKEN"
     else:
-        log.warning(f"Backend {backend} не вернул состояние интерфейса {WG_IF}")
-
+        state = "RUNNING" if not runtime_readiness_errors(snapshot, check_firewall=True) else "BROKEN"
+    iface = run_cmd(f"ip -brief link show {WG_IF} || echo 'не найден'", check=False)
+    log.info("Состояние интерфейса: " + iface)
+    if snapshot_error:
+        log.warning("Сохранённое состояние некорректно: " + snapshot_error)
     log.info(f"Состояние VPN: {state}")
     if state == "RUNNING":
         add_advice("Можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
     elif state == "STOPPED":
         add_advice("Выполните start для запуска VPN runtime")
-    elif state == "BROKEN":
-        add_advice("Выполните health для подробной диагностики, затем restart или init при необходимости")
+    else:
+        add_advice("Выполните health для подробной диагностики; автоматическое создание потерянных данных запрещено")
+    if snapshot is not None:
+        total = len(snapshot["users"])
+        active = sum(1 for row in snapshot["users"] if not int(row["blocked"]))
+        log.info(f"Учётные записи: всего {total}, активных {active}")
 
-    conn = init_db()
-    total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
-    active = conn.execute("SELECT count(*) FROM users WHERE blocked=0").fetchone()[0]
-    log.info(f"Учётные записи: всего {total}, активных {active}")
+def _active_users(snapshot):
+    return [row for row in snapshot["users"] if not int(row["blocked"])]
+
+def _expected_peer_map(snapshot):
+    return {row["pubkey"]: f"{row['ip']}/32" for row in _active_users(snapshot)}
+
+def runtime_readiness_errors(snapshot, check_firewall=True):
+    """Возвращает нарушения обязательных runtime-инвариантов без изменения системы."""
+    errors = []
+    backend = snapshot["backend"]
+    wg_bin = snapshot["wg_bin"]
+    detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
+    brief = run_cmd(f"ip -brief link show {WG_IF}", check=False)
+    if not detail:
+        return [f"Интерфейс {WG_IF} отсутствует"]
+    if "UP" not in brief.split():
+        errors.append(f"Интерфейс {WG_IF} не находится в состоянии UP")
+    if backend == "awg" and "amneziawg" not in detail.lower():
+        errors.append(f"Интерфейс {WG_IF} не имеет тип amneziawg")
+    actual_pub = run_cmd(f"{wg_bin} show {WG_IF} public-key", check=False).strip()
+    if actual_pub != snapshot["server_public_key"]:
+        errors.append("Публичный ключ runtime не совпадает с сохранённым ключом сервера")
+    addresses = []
+    for line in run_cmd(f"ip -4 -o addr show dev {WG_IF}", check=False).splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == "inet":
+            addresses.append(parts[3])
+    expected_address = f"{SERVER_IP}/24"
+    if addresses != [expected_address]:
+        errors.append(f"IPv4-адрес интерфейса {WG_IF}: ожидался только {expected_address}, получено {', '.join(addresses) or 'нет'}")
+    listen_port = run_cmd(f"{wg_bin} show {WG_IF} listen-port", check=False).strip()
+    if listen_port != str(WG_BASE_PORT):
+        errors.append(f"ListenPort: ожидался {WG_BASE_PORT}, получено {listen_port or 'нет'}")
+    actual_peers = set(filter(None, run_cmd(f"{wg_bin} show {WG_IF} peers", check=False).splitlines()))
+    expected_peers = set(_expected_peer_map(snapshot))
+    if actual_peers != expected_peers:
+        errors.append("Состав peers runtime не совпадает с активными пользователями БД")
+    allowed = {}
+    for line in run_cmd(f"{wg_bin} show {WG_IF} allowed-ips", check=False).splitlines():
+        parts = line.split()
+        if parts:
+            allowed[parts[0]] = " ".join(parts[1:])
+    if allowed != _expected_peer_map(snapshot):
+        errors.append("AllowedIPs peers не совпадают с адресами активных пользователей БД")
+    if not run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False):
+        errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
+    if run_cmd("sysctl -n net.ipv4.ip_forward", check=False).strip() != "1":
+        errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
+    if backend == "wg":
+        svc = run_cmd(f"systemctl is-active wg-quick@{WG_IF}", check=False).strip()
+        if svc != "active":
+            errors.append(f"Сервис wg-quick@{WG_IF} не активен (сейчас: {svc or 'unknown'})")
+    if check_firewall:
+        if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT", shell=True, capture_output=True, text=True).returncode != 0:
+            errors.append("Базовое правило ACCEPT между VPN-клиентами отсутствует")
+        if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -j DROP", shell=True, capture_output=True, text=True).returncode != 0:
+            errors.append("Базовое правило DROP для трафика из VPN отсутствует")
+        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
+        drop_rule = f"-A FORWARD -i {WG_IF} -j DROP"
+        drop_index = forward_rules.index(drop_rule) if drop_rule in forward_rules else None
+        for row in _active_users(snapshot):
+            if not int(row["internet"]):
+                continue
+            accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
+            if accept_rule not in forward_rules:
+                errors.append(f"Отсутствует FORWARD ACCEPT для пользователя {row['name']} ({row['ip']})")
+            elif drop_index is not None and forward_rules.index(accept_rule) > drop_index:
+                errors.append(f"FORWARD ACCEPT пользователя {row['name']} расположен после общего DROP")
+            if subprocess.run(f"iptables -t nat -C POSTROUTING -s {row['ip']} -o eth0 -j MASQUERADE", shell=True, capture_output=True, text=True).returncode != 0:
+                errors.append(f"Отсутствует NAT для пользователя {row['name']} ({row['ip']})")
+    return errors
 
 def cmd_health():
-    """Глубокая диагностика."""
+    """Строгая немутирующая диагностика; при нарушении инвариантов код выхода ненулевой."""
     log.info("=== Глубокая диагностика ===")
-    errors = []
-    advices = []
-
-    # Проверка backend
-    backend = None
     try:
-        backend = get_backend()
-        log.info(f"Backend: {backend}")
-        if backend not in ("wg", "awg"):
-            errors.append(f"Неизвестный backend: {backend}")
-            advices.append("Исправьте /opt/vpn-admin/backend или выполните init заново с явным выбором backend")
+        snapshot = load_state_snapshot()
     except Exception as e:
-        errors.append(f"Backend не определён: {e}")
-        advices.append("Выполните init, чтобы явно выбрать backend и создать /opt/vpn-admin/backend")
-
-    # Проверка наличия WireGuard / AmneziaWG
-    wg_bin = get_wg_cmd(allow_missing=True)
-    if not wg_bin:
-        errors.append("Backend-команда не определена: wg/awg недоступен")
-        advices.append("Проверьте backend-файл. Backend не должен угадываться по бинарникам")
-    else:
-        bin_path = run_cmd(f"command -v {wg_bin}", check=False)
-        if bin_path:
-            log.info(f"Обнаружен бинарник backend: {wg_bin} ({bin_path})")
-        else:
-            errors.append(f"Бинарник backend не найден: {wg_bin}")
-            if backend == "awg":
-                advices.append("AmneziaWG не установлен или удалён. Если это штатное удаление — выполните init; если нужен WireGuard — выполните init --no-amnezia")
-            elif backend == "wg":
-                advices.append("WireGuard не установлен или удалён. Выполните init --no-amnezia")
-
-    # Проверка интерфейса wg0
-    iface_ok = True
-    try:
-        run_cmd(f"ip link show {WG_IF}")
-    except RuntimeError:
-        iface_ok = False
-        errors.append(f"Интерфейс {WG_IF} не поднят или отсутствует")
-        if backend == "awg":
-            advices.append("Похоже, runtime AmneziaWG потерян после остановки VPS. Выполните start, полный init не требуется")
-        elif backend == "wg":
-            advices.append("Выполните start или проверьте systemd-сервис wg-quick@wg0")
-
-    # Проверка, что backend может читать состояние интерфейса
-    backend_show_ok = True
-    if wg_bin:
-        try:
-            run_cmd(f"{wg_bin} show {WG_IF}")
-            log.info(f"Backend {backend or '?'} читает состояние интерфейса {WG_IF}")
-        except RuntimeError:
-            backend_show_ok = False
-            errors.append(f"Backend {backend or '?'} не может прочитать состояние интерфейса {WG_IF}")
-            if iface_ok:
-                advices.append("Интерфейс существует, но не соответствует выбранному backend. Выполните restart; если ошибка повторится — проверьте тип интерфейса")
-
-    # Проверка порта
-    port_open = run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False)
-    if not port_open:
-        errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
-        if backend == "awg" and (not iface_ok or not backend_show_ok):
-            advices.append("После start порт должен появиться автоматически. Если нет — проверьте awg show wg0")
-        elif backend == "wg":
-            advices.append("Проверьте wg-quick@wg0 через status или выполните restart")
-
-    # Проверка iptables: базовое разрешение VPN-клиентам общаться между собой
-    accept_check = subprocess.run(
-        f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    if accept_check.returncode != 0:
-        errors.append("Базовое правило ACCEPT для FORWARD между VPN-клиентами отсутствует")
-        advices.append("Выполните start или restart для восстановления базовых iptables-правил")
-
-    drop_check = subprocess.run(
-        f"iptables -C FORWARD -i {WG_IF} -j DROP",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    if drop_check.returncode != 0:
-        errors.append("Базовое правило DROP для FORWARD отсутствует")
-        advices.append("Выполните start или restart для восстановления изоляции клиентов от интернета по умолчанию")
-
-    # Проверка IP forward
-    try:
-        ipf = run_cmd("sysctl -n net.ipv4.ip_forward", check=False)
-        if ipf.strip() != "1":
-            errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
-            advices.append("Включите net.ipv4.ip_forward или выполните init, если sysctl-конфигурация потеряна")
-    except Exception:
-        errors.append("Не удалось проверить net.ipv4.ip_forward")
-        advices.append("Проверьте доступность sysctl на сервере")
-
-    # Проверка systemd сервиса
-    if backend == "wg":
-        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False)
-        if svc.strip() != "active":
-            errors.append(f"Сервис wg-quick@wg0 не активен (сейчас: {svc.strip() or 'unknown'})")
-            advices.append("Выполните start или restart. Для WireGuard используется wg-quick@wg0")
-    elif backend == "awg":
-        log.info("Сервис wg-quick@wg0: не требуется для backend awg")
-
-    # Проверка базы данных
-    try:
-        conn = init_db()
-        total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
-        log.info(f"База данных: пользователей {total}")
-    except Exception as e:
-        errors.append(f"Ошибка базы данных: {e}")
-        advices.append("Проверьте /opt/vpn-admin/vpn.db. Если БД потеряна, потребуется восстановление из резервной копии или новый init")
-
-    # Проверка порядка правил FORWARD: пользовательские ACCEPT должны быть до общего DROP.
-    try:
-        conn = init_db()
-        internet_rows = conn.execute("SELECT name, ip FROM users WHERE internet=1 AND blocked=0").fetchall()
-        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
-        drop_index = None
-        for index, rule in enumerate(forward_rules):
-            if rule == f"-A FORWARD -i {WG_IF} -j DROP":
-                drop_index = index
-                break
-        if drop_index is not None:
-            for row in internet_rows:
-                accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
-                accept_index = None
-                for index, rule in enumerate(forward_rules):
-                    if rule == accept_rule:
-                        accept_index = index
-                        break
-                if accept_index is None:
-                    errors.append(f"Отсутствует FORWARD ACCEPT для пользователя {row['name']} ({row['ip']})")
-                    advices.append("Выполните sync для восстановления правил интернет-доступа")
-                elif accept_index > drop_index:
-                    errors.append(f"Правило ACCEPT для пользователя {row['name']} стоит после общего DROP")
-                    advices.append("Выполните sync: он переставит пользовательские ACCEPT перед общим DROP")
-    except Exception as e:
-        errors.append(f"Не удалось проверить порядок правил FORWARD: {e}")
-        advices.append("Выполните sync и затем health для повторной проверки firewall")
-
-    # Итог
+        log.warning(f"- Сохранённое состояние некорректно: {e}")
+        add_advice("Восстановите обязательные данные из резервной копии или выполните отдельный согласованный init")
+        raise RuntimeError("Health завершён с ошибкой: сохранённое состояние недостоверно")
+    errors = runtime_readiness_errors(snapshot, check_firewall=True)
     if errors:
         log.warning("Обнаружены проблемы:")
         for err in errors:
             log.warning(f"- {err}")
-        if advices:
-            for advice in dict.fromkeys(advices):
-                add_advice(advice)
-    else:
-        log.info("Система работает штатно, нарушений не выявлено")
+        add_advice("Исправьте указанное нарушение и повторите health; диагностика сама состояние не изменяет")
+        raise RuntimeError(f"Health завершён с ошибкой: нарушений {len(errors)}")
+    log.info(f"Backend: {snapshot['backend']}")
+    log.info(f"База данных: пользователей {len(snapshot['users'])}")
+    log.info("Система работает штатно, обязательные runtime-инварианты подтверждены")
 
 def cmd_sync():
     """Пересборка состояния из базы данных."""
@@ -928,7 +948,7 @@ def build_client_config(row, endpoint=None):
     backend = require_backend()
     awg_params = ""
     if backend == "awg":
-        awg_params = "\n" + format_awg_params(get_or_create_awg_params())
+        awg_params = "\n" + format_awg_params(read_awg_params_file())
 
     return f"""[Interface]
 PrivateKey = {row["privkey"]}
@@ -956,7 +976,7 @@ def cmd_backend():
 
 def cmd_config(args):
     """Выводит клиентский конфиг в stdout для безопасного скачивания через sudo."""
-    conn = init_db()
+    conn = init_db(read_only=True)
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     if not row:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
@@ -1077,7 +1097,7 @@ def cmd_delete(args):
 
 def cmd_list():
     """Список учётных записей."""
-    conn = init_db()
+    conn = init_db(read_only=True)
     rows = conn.execute("SELECT name, ip, admin, internet, blocked, comment FROM users ORDER BY ip").fetchall()
     if not rows:
         log.info("Список учётных записей пуст")
