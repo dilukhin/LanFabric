@@ -16,6 +16,8 @@ import ipaddress
 import secrets
 import re
 import time
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 
 # Константы
@@ -32,6 +34,12 @@ SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
 SUDOERS_LANFABRIC_GLOB = "/etc/sudoers.d/lanfabric-*"
 AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
 AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+LOCK_DIR = "/run/lanfabric"
+LOCK_PATH = f"{LOCK_DIR}/runtime.lock"
+LOCK_TIMEOUT_SECONDS = 20
+FW_GUARD_CHAIN = "LANFABRIC-GUARD"
+FW_FORWARD_CHAIN = "LANFABRIC-FWD"
+FW_NAT_CHAIN = "LANFABRIC-NAT"
 
 # Логирование
 logging.basicConfig(
@@ -135,6 +143,29 @@ def run_cmd(cmd, check=True):
             f"Ошибка выполнения '{cmd}': {result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout.strip()
+
+@contextmanager
+def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
+    """Сериализует все изменения желаемого и фактического состояния LanFabric."""
+    Path(LOCK_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Не удалось получить блокировку LanFabric за {timeout} секунд")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 def generate_awg_params():
     """Генерирует параметры маскировки AmneziaWG для сервера и клиентов."""
@@ -348,147 +379,343 @@ def load_state_snapshot(expected_backend=None):
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
     check_rule = rule.replace(" -A ", " -C ", 1)
-    add_rule = rule
     res = subprocess.run(check_rule, shell=True, capture_output=True, text=True)
     if res.returncode != 0:
-        run_cmd(add_rule)
+        run_cmd(rule)
 
 def delete_iptables_rule(rule):
-    """Удаляет правило iptables, если оно существует."""
+    """Удаляет одно точное правило iptables, если оно существует."""
     delete_rule = rule.replace(" -A ", " -D ", 1)
     run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
 
-def cleanup_firewall_rules():
-    """Удаляет базовые и пользовательские правила LanFabric."""
-    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+def _iptables_prefix(table):
+    return "iptables" if table == "filter" else f"iptables -t {table}"
+
+def _chain_exists(table, chain):
+    return subprocess.run(
+        f"{_iptables_prefix(table)} -S {chain}",
+        shell=True, capture_output=True, text=True
+    ).returncode == 0
+
+def _ensure_chain(table, chain):
+    if not _chain_exists(table, chain):
+        run_cmd(f"{_iptables_prefix(table)} -N {chain}")
+
+def _delete_rule_all(table, chain, spec, limit=64):
+    """Удаляет все точные копии правила с конечным пределом повторов."""
+    prefix = _iptables_prefix(table)
+    for _ in range(limit):
+        check = subprocess.run(
+            f"{prefix} -C {chain} {spec}",
+            shell=True, capture_output=True, text=True
+        )
+        if check.returncode != 0:
+            return
+        run_cmd(f"{prefix} -D {chain} {spec}")
+    raise RuntimeError(f"Слишком много повторов правила iptables: {table}/{chain} {spec}")
+
+def _chain_rule_lines(table, chain):
+    output = run_cmd(f"{_iptables_prefix(table)} -S {chain}", check=False)
+    return [line for line in output.splitlines() if line.startswith("-A ")]
+
+def _remove_legacy_firewall_rules():
+    """Удаляет только узнаваемые правила LanFabric 0.0.17 для выделенной VPN-подсети."""
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -o {WG_IF} -j ACCEPT")
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j DROP")
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j MASQUERADE")
+
+    network = ipaddress.ip_network(VPN_NET)
+    for line in run_cmd("iptables -S FORWARD", check=False).splitlines():
+        match = re.fullmatch(r"-A FORWARD -s (\d+\.\d+\.\d+\.\d+)/32 -j ACCEPT", line)
+        if match:
+            try:
+                address = ipaddress.ip_address(match.group(1))
+            except ValueError:
+                continue
+            if address in network:
+                _delete_rule_all("filter", "FORWARD", f"-s {address}/32 -j ACCEPT")
+
+    for line in run_cmd("iptables -t nat -S POSTROUTING", check=False).splitlines():
+        match = re.fullmatch(r"-A POSTROUTING -s (\d+\.\d+\.\d+\.\d+)/32 -o eth0 -j MASQUERADE", line)
+        if match:
+            try:
+                address = ipaddress.ip_address(match.group(1))
+            except ValueError:
+                continue
+            if address in network:
+                _delete_rule_all("nat", "POSTROUTING", f"-s {address}/32 -o eth0 -j MASQUERADE")
+
+def close_firewall_guard(persist=True):
+    """Закрывает трафик wg0 до любых изменений runtime и ставит свой hook первым."""
+    _ensure_chain("filter", FW_GUARD_CHAIN)
+    _ensure_chain("filter", FW_FORWARD_CHAIN)
+    _ensure_chain("nat", FW_NAT_CHAIN)
+
+    run_cmd(f"iptables -I {FW_GUARD_CHAIN} 1 -j DROP")
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j {FW_GUARD_CHAIN}")
+    run_cmd(f"iptables -I FORWARD 1 -i {WG_IF} -j {FW_GUARD_CHAIN}")
+
+    if persist:
+        run_cmd("netfilter-persistent save")
+
+def rebuild_policy_chains(snapshot):
+    """Пересобирает принадлежащие LanFabric цепочки при закрытом guard."""
+    _ensure_chain("filter", FW_FORWARD_CHAIN)
+    _ensure_chain("nat", FW_NAT_CHAIN)
+    run_cmd(f"iptables -F {FW_FORWARD_CHAIN}")
+    run_cmd(f"iptables -t nat -F {FW_NAT_CHAIN}")
+
+    run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -o {WG_IF} -j ACCEPT")
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -s {row['ip']}/32 -j ACCEPT")
+            run_cmd(f"iptables -t nat -A {FW_NAT_CHAIN} -s {row['ip']}/32 -o eth0 -j MASQUERADE")
+    run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -j DROP")
+
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
+    run_cmd(f"iptables -t nat -I POSTROUTING 1 -s {VPN_NET} -j {FW_NAT_CHAIN}")
+    _remove_legacy_firewall_rules()
+
+def open_firewall_guard():
+    """Переводит guard из DROP в проверенную рабочую policy без открытого промежутка."""
+    _delete_rule_all("filter", FW_GUARD_CHAIN, f"-j {FW_FORWARD_CHAIN}")
+    run_cmd(f"iptables -A {FW_GUARD_CHAIN} -j {FW_FORWARD_CHAIN}")
+    _delete_rule_all("filter", FW_GUARD_CHAIN, "-j DROP")
+
+def cleanup_owned_firewall():
+    """Удаляет только hook/цепочки новой схемы LanFabric и узнаваемые legacy-правила."""
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j {FW_GUARD_CHAIN}")
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
+
+    if _chain_exists("filter", FW_GUARD_CHAIN):
+        run_cmd(f"iptables -F {FW_GUARD_CHAIN}")
+    if _chain_exists("filter", FW_FORWARD_CHAIN):
+        run_cmd(f"iptables -F {FW_FORWARD_CHAIN}")
+    if _chain_exists("nat", FW_NAT_CHAIN):
+        run_cmd(f"iptables -t nat -F {FW_NAT_CHAIN}")
+
+    if _chain_exists("filter", FW_GUARD_CHAIN):
+        run_cmd(f"iptables -X {FW_GUARD_CHAIN}")
+    if _chain_exists("filter", FW_FORWARD_CHAIN):
+        run_cmd(f"iptables -X {FW_FORWARD_CHAIN}")
+    if _chain_exists("nat", FW_NAT_CHAIN):
+        run_cmd(f"iptables -t nat -X {FW_NAT_CHAIN}")
+
+    _remove_legacy_firewall_rules()
+
+def ensure_legacy_base_firewall_rules():
+    """Сохраняет прежний firewall-контракт только для backend wg."""
     delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
-    delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {VPN_NET} -j MASQUERADE")
-
-    if os.path.exists(DB_PATH):
-        try:
-            conn = init_db()
-            rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-            for row in rows:
-                ip = row[0]
-                delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-                delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-        except Exception as e:
-            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
-
-def forward_drop_rule():
-    """Возвращает базовое запрещающее правило для трафика из VPN."""
-    return f"iptables -A FORWARD -i {WG_IF} -j DROP"
-
-
-def ensure_forward_drop_last():
-    """Ставит общий DROP последним, чтобы разрешающие правила успели сработать."""
-    rule = forward_drop_rule()
-    delete_iptables_rule(rule)
-    ensure_iptables_rule(rule)
-
-
-def ensure_base_firewall_rules():
-    """Восстанавливает базовые правила LanFabric в правильном порядке."""
-    delete_iptables_rule(forward_drop_rule())
     ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    ensure_forward_drop_last()
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
 
-
-def ensure_client_internet_rules(ip):
-    """Разрешает пользователю интернет до общего DROP и включает NAT."""
-    delete_iptables_rule(forward_drop_rule())
+def ensure_legacy_client_internet_rules(ip):
+    """Сохраняет прежний internet-контракт только для backend wg."""
+    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
     ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
     ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-    ensure_forward_drop_last()
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
+
+def load_runtime_identity(expected_backend=None):
+    """Читает минимум данных для безопасной остановки/проверки владения интерфейсом."""
+    backend = require_backend()
+    if expected_backend is not None and backend != expected_backend:
+        raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
+    _, pub = read_server_key_material(backend)
+    return {"backend": backend, "wg_bin": "awg" if backend == "awg" else "wg", "server_public_key": pub}
+
+def interface_exists():
+    return subprocess.run(
+        f"ip link show {WG_IF}", shell=True, capture_output=True, text=True
+    ).returncode == 0
+
+def awg_interface_ownership(identity):
+    """Возвращает absent/owned/unknown для wg0."""
+    if not interface_exists():
+        return "absent"
+    detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
+    if "amneziawg" not in detail.lower():
+        return "unknown"
+    actual_pub = run_cmd(f"awg show {WG_IF} public-key", check=False).strip()
+    return "owned" if actual_pub == identity["server_public_key"] else "unknown"
+
+def _apply_awg_peers(snapshot):
+    current = run_cmd(f"awg show {WG_IF} peers", check=False)
+    for peer in current.splitlines():
+        if peer:
+            run_cmd(f"awg set {WG_IF} peer {peer} remove")
+    for row in _active_users(snapshot):
+        run_cmd(
+            f"awg set {WG_IF} peer {row['pubkey']} "
+            f"allowed-ips {row['ip']}/32 persistent-keepalive 25"
+        )
+
+def firewall_readiness_errors(snapshot, guard_open=True):
+    """Проверяет точную принадлежащую LanFabric firewall policy."""
+    errors = []
+    forward_rules = _chain_rule_lines("filter", "FORWARD")
+    hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
+    if not forward_rules or forward_rules[0] != hook:
+        errors.append("Hook LanFabric не является первым правилом FORWARD для wg0")
+
+    guard_rules = _chain_rule_lines("filter", FW_GUARD_CHAIN)
+    if guard_open:
+        expected_guard = [f"-A {FW_GUARD_CHAIN} -j {FW_FORWARD_CHAIN}"]
+        if guard_rules != expected_guard:
+            errors.append("Защитный guard LanFabric не находится в рабочем состоянии")
+    elif not guard_rules or guard_rules[0] != f"-A {FW_GUARD_CHAIN} -j DROP":
+        errors.append("Защитный guard LanFabric не закрыт во время применения")
+
+    expected_forward = [f"-A {FW_FORWARD_CHAIN} -o {WG_IF} -j ACCEPT"]
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            expected_forward.append(f"-A {FW_FORWARD_CHAIN} -s {row['ip']}/32 -j ACCEPT")
+    expected_forward.append(f"-A {FW_FORWARD_CHAIN} -j DROP")
+    if _chain_rule_lines("filter", FW_FORWARD_CHAIN) != expected_forward:
+        errors.append("Цепочка FORWARD LanFabric не совпадает с политиками БД")
+
+    expected_nat = []
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            expected_nat.append(f"-A {FW_NAT_CHAIN} -s {row['ip']}/32 -o eth0 -j MASQUERADE")
+    if _chain_rule_lines("nat", FW_NAT_CHAIN) != expected_nat:
+        errors.append("Цепочка NAT LanFabric не совпадает с политиками БД")
+
+    nat_rules = _chain_rule_lines("nat", "POSTROUTING")
+    nat_hook = f"-A POSTROUTING -s {VPN_NET} -j {FW_NAT_CHAIN}"
+    if nat_hook not in nat_rules:
+        errors.append("Hook NAT LanFabric отсутствует")
+    return errors
+
+def _verify_awg_before_open(snapshot):
+    errors = runtime_readiness_errors(snapshot, check_firewall=False)
+    errors.extend(firewall_readiness_errors(snapshot, guard_open=False))
+    if errors:
+        raise RuntimeError("Runtime не готов к открытию guard: " + "; ".join(errors))
+
+def _verify_awg_ready(snapshot):
+    errors = runtime_readiness_errors(snapshot, check_firewall=False)
+    errors.extend(firewall_readiness_errors(snapshot, guard_open=True))
+    if errors:
+        raise RuntimeError("Runtime AWG не прошёл финальную проверку: " + "; ".join(errors))
+
+def _restore_awg_runtime_locked(snapshot):
+    """Fail-closed восстановление AWG из одного проверенного снимка."""
+    ownership = awg_interface_ownership(snapshot)
+    if ownership == "unknown":
+        raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
+
+    close_firewall_guard(persist=True)
+    created = ownership == "absent"
+    try:
+        run_cmd("modprobe amneziawg")
+        setconf_path = str(write_setconf(
+            snapshot["server_private_key"], "awg", awg_params=snapshot["awg_params"]
+        ))
+        if created:
+            run_cmd(f"ip link add {WG_IF} type amneziawg")
+        else:
+            run_cmd(f"ip link set down dev {WG_IF}")
+        run_cmd(f"awg setconf {WG_IF} {setconf_path}")
+        run_cmd(f"ip -4 addr flush dev {WG_IF}")
+        run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
+        _apply_awg_peers(snapshot)
+        rebuild_policy_chains(snapshot)
+        run_cmd(f"ip link set up dev {WG_IF}")
+        _verify_awg_before_open(snapshot)
+        open_firewall_guard()
+        _verify_awg_ready(snapshot)
+        run_cmd("netfilter-persistent save")
+    except Exception as original:
+        try:
+            if awg_interface_ownership(snapshot) == "owned":
+                run_cmd(f"ip link set down dev {WG_IF}", check=False)
+            close_firewall_guard(persist=True)
+        except Exception as cleanup_error:
+            log.error(f"Аварийная стабилизация также завершилась ошибкой: {cleanup_error}")
+        raise original
+
+def _sync_awg_runtime_locked(snapshot):
+    """Безопасно применяет peers/policy к уже работающему собственному AWG runtime."""
+    if awg_interface_ownership(snapshot) != "owned":
+        raise RuntimeError("sync разрешён только для подтверждённого runtime LanFabric")
+    close_firewall_guard(persist=True)
+    try:
+        _apply_awg_peers(snapshot)
+        rebuild_policy_chains(snapshot)
+        _verify_awg_before_open(snapshot)
+        open_firewall_guard()
+        _verify_awg_ready(snapshot)
+        run_cmd("netfilter-persistent save")
+    except Exception as original:
+        try:
+            close_firewall_guard(persist=True)
+        except Exception as cleanup_error:
+            log.error(f"Не удалось сохранить закрытый guard после ошибки sync: {cleanup_error}")
+        raise original
+
+def _stop_awg_runtime_locked():
+    identity = load_runtime_identity(expected_backend="awg")
+    ownership = awg_interface_ownership(identity)
+    if ownership == "unknown":
+        raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
+    if ownership == "owned":
+        close_firewall_guard(persist=True)
+        run_cmd(f"ip link set down dev {WG_IF}", check=False)
+        run_cmd(f"ip link del {WG_IF}")
+        if interface_exists():
+            close_firewall_guard(persist=True)
+            raise RuntimeError(f"Не удалось подтвердить удаление интерфейса {WG_IF}; защитный guard сохранён")
+    cleanup_owned_firewall()
+    run_cmd("netfilter-persistent save")
 
 def cmd_stop():
     """Останавливает VPN runtime без удаления пакетов и данных."""
     backend = require_backend()
     log.info(f"Остановка VPN runtime. Backend: {backend}")
-
     if backend == "wg":
         run_cmd(f"systemctl stop wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+        _remove_legacy_firewall_rules()
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
     else:
-        run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
-
-    cleanup_firewall_rules()
-    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+        _stop_awg_runtime_locked()
     log.info("VPN runtime остановлен")
     add_advice("Для повторного запуска выполните start, для проверки состояния — status или health")
 
 def cmd_start():
     """Запускает VPN runtime по сохранённому backend без полного init."""
     backend = require_backend()
-    wg_bin = get_wg_cmd()
     log.info(f"Запуск VPN runtime. Backend: {backend}")
-
     if backend == "wg":
         run_cmd(f"systemctl enable wg-quick@{WG_IF}")
         run_cmd(f"systemctl restart wg-quick@{WG_IF}")
+        cmd_sync()
     else:
-        setconf_path = str(ensure_awg_setconf())
-
-        run_cmd("command -v awg")
-        run_cmd("modprobe amneziawg")
-
-        iface_exists = subprocess.run(
-            f"ip link show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-        if iface_exists:
-            backend_ok = subprocess.run(
-                f"{wg_bin} show {WG_IF}",
-                shell=True,
-                capture_output=True,
-                text=True
-            ).returncode == 0
-            if not backend_ok:
-                log.warning(f"Интерфейс {WG_IF} существует, но backend {backend} не может его прочитать. Пересоздание интерфейса")
-                run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
-                iface_exists = False
-
-        if not iface_exists:
-            run_cmd(f"ip link add {WG_IF} type amneziawg")
-
-        run_cmd(f"{wg_bin} setconf {WG_IF} {setconf_path}")
-        if not iface_exists:
-            run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
-
-        run_cmd(f"ip link set up dev {WG_IF}")
-        ensure_base_firewall_rules()
-
-    run_cmd(f"ip link show {WG_IF}")
-    run_cmd(f"{wg_bin} show {WG_IF}")
-    cmd_sync()
+        snapshot = load_state_snapshot(expected_backend="awg")
+        _restore_awg_runtime_locked(snapshot)
     log.info("VPN runtime запущен")
     add_advice("Выполните status или health. Для подключения клиента скачайте конфиг командой config <имя>")
 
 def cmd_restart():
-    """Перезапускает VPN runtime без полного init."""
+    """Перезапускает VPN runtime без полного init под общей внешней блокировкой."""
     log.info("Перезапуск VPN runtime")
     cmd_stop()
     cmd_start()
 
 def cleanup_runtime():
-    """Останавливает VPN и удаляет runtime-состояние без удаления данных."""
-    log.info("Остановка WireGuard/AmneziaWG и очистка runtime-состояния")
-
-    # systemd WireGuard
-    run_cmd(f"systemctl disable --now wg-quick@{WG_IF} 2>/dev/null || true", check=False)
-
-    # Интерфейс
-    run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
-
-    # Правила LanFabric
-    cleanup_firewall_rules()
-    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
-
-    # Модули
-    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
-    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
-
+    """Останавливает подтверждённый runtime и удаляет только принадлежащее LanFabric состояние."""
+    backend = require_backend()
+    if backend == "awg":
+        _stop_awg_runtime_locked()
+    else:
+        run_cmd(f"systemctl disable --now wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+        if interface_exists():
+            run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+        _remove_legacy_firewall_rules()
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+        run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
+    if backend == "awg":
+        run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
 
 def remove_packages(purge=False):
     """Удаляет установленные VPN-пакеты."""
@@ -747,17 +974,8 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
         run_cmd("systemctl enable wg-quick@wg0")
         run_cmd("systemctl restart wg-quick@wg0")
     else:
-        try:
-            run_cmd("ip link add wg0 type amneziawg")
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"Не удалось создать интерфейс AmneziaWG wg0: {e}. "
-                "Модуль amneziawg загружен, но тип интерфейса amneziawg недоступен"
-            )
-        run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/{WG_IF}.setconf")
-        run_cmd(f"ip addr add {SERVER_IP}/24 dev wg0")
-        run_cmd("ip link set up dev wg0")
-        ensure_base_firewall_rules()        
+        snapshot = load_state_snapshot(expected_backend="awg")
+        _restore_awg_runtime_locked(snapshot)
 
     # --- Проверка ---
     run_cmd("ip link show wg0")
@@ -864,23 +1082,13 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
         if svc != "active":
             errors.append(f"Сервис wg-quick@{WG_IF} не активен (сейчас: {svc or 'unknown'})")
     if check_firewall:
-        if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT", shell=True, capture_output=True, text=True).returncode != 0:
-            errors.append("Базовое правило ACCEPT между VPN-клиентами отсутствует")
-        if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -j DROP", shell=True, capture_output=True, text=True).returncode != 0:
-            errors.append("Базовое правило DROP для трафика из VPN отсутствует")
-        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
-        drop_rule = f"-A FORWARD -i {WG_IF} -j DROP"
-        drop_index = forward_rules.index(drop_rule) if drop_rule in forward_rules else None
-        for row in _active_users(snapshot):
-            if not int(row["internet"]):
-                continue
-            accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
-            if accept_rule not in forward_rules:
-                errors.append(f"Отсутствует FORWARD ACCEPT для пользователя {row['name']} ({row['ip']})")
-            elif drop_index is not None and forward_rules.index(accept_rule) > drop_index:
-                errors.append(f"FORWARD ACCEPT пользователя {row['name']} расположен после общего DROP")
-            if subprocess.run(f"iptables -t nat -C POSTROUTING -s {row['ip']} -o eth0 -j MASQUERADE", shell=True, capture_output=True, text=True).returncode != 0:
-                errors.append(f"Отсутствует NAT для пользователя {row['name']} ({row['ip']})")
+        if backend == "awg":
+            errors.extend(firewall_readiness_errors(snapshot, guard_open=True))
+        else:
+            if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT", shell=True, capture_output=True, text=True).returncode != 0:
+                errors.append("Базовое правило ACCEPT между VPN-клиентами отсутствует")
+            if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -j DROP", shell=True, capture_output=True, text=True).returncode != 0:
+                errors.append("Базовое правило DROP для трафика из VPN отсутствует")
     return errors
 
 def cmd_health():
@@ -904,39 +1112,24 @@ def cmd_health():
     log.info("Система работает штатно, обязательные runtime-инварианты подтверждены")
 
 def cmd_sync():
-    """Пересборка состояния из базы данных."""
+    """Пересборка состояния из одного согласованного снимка БД."""
     log.info("Синхронизация состояния интерфейса и правил")
-    wg_bin = get_wg_cmd()
-    # Удаление всех пиров из интерфейса
-    current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
-    for peer in current_peers.splitlines():
-        pub = peer.split()[0] if peer else None
-        if pub:
-            run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
-
-    conn = init_db()
-    # Очистка динамических правил клиентов и временное удаление общего DROP.
-    # DROP будет добавлен последним после пользовательских ACCEPT.
-    delete_iptables_rule(forward_drop_rule())
-    rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-    for row in rows_all:
-        ip = row[0]
-        delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-        delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-
-    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    
-    # Восстановление пиров и правил
-    rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
-    for row in rows:
-        pub, ip, internet, _ = row
-        allowed = f"{ip}/32"
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
-        if internet:
-            ensure_client_internet_rules(ip)
-
-    ensure_forward_drop_last()
-    run_cmd("netfilter-persistent save")
+    snapshot = load_state_snapshot()
+    if snapshot["backend"] == "awg":
+        _sync_awg_runtime_locked(snapshot)
+    else:
+        wg_bin = snapshot["wg_bin"]
+        current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
+        for peer in current_peers.splitlines():
+            if peer:
+                run_cmd(f"{wg_bin} set {WG_IF} peer {peer} remove")
+        _remove_legacy_firewall_rules()
+        ensure_legacy_base_firewall_rules()
+        for row in _active_users(snapshot):
+            run_cmd(f"{wg_bin} set {WG_IF} peer {row['pubkey']} allowed-ips {row['ip']}/32 persistent-keepalive 25")
+            if int(row["internet"]):
+                ensure_legacy_client_internet_rules(row["ip"])
+        run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
     add_advice("Выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
 
@@ -1004,14 +1197,16 @@ def cmd_add(args):
     )
     conn.commit()
     
-    if not blocked_val:
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
-        if internet_val:
-            ensure_client_internet_rules(ip)
-            run_cmd("netfilter-persistent save")
-            
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     cfg_path = write_client_config(row)
+
+    if get_backend() == "awg":
+        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    elif not blocked_val:
+        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
+        if internet_val:
+            ensure_legacy_client_internet_rules(ip)
+            run_cmd("netfilter-persistent save")
     
     log.info(f"Учётная запись '{args.name}' создана. IP: {ip}, Админ: {bool(admin_val)}, Интернет: {bool(internet_val)}")
     log.info(f"Конфиг сохранён: {cfg_path}")
@@ -1049,49 +1244,51 @@ def cmd_edit(args):
     add_advice("Выполните sync для применения сетевых правил. Если менялся интернет-доступ, заново скачайте config <имя>")
 
 def cmd_block(args):
-    """Блокировка учётной записи."""
+    """Блокировка учётки с fail-closed применением для AWG."""
     conn = init_db()
     user = conn.execute("SELECT pubkey, ip, internet FROM users WHERE name=?", (args.name,)).fetchone()
     if not user:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
-        
     pub, ip, internet = user
-    wg_bin = get_wg_cmd()
-    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
-    if internet:
-        run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-        run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
-        run_cmd("netfilter-persistent save")
-        
+    backend = require_backend()
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
+
+    if backend == "awg":
+        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    else:
+        run_cmd(f"wg set {WG_IF} peer {pub} remove")
+        if internet:
+            run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
+            run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
+            run_cmd("netfilter-persistent save")
     log.info(f"Учётная запись '{args.name}' заблокирована. Соединение разорвано.")
-    add_advice("Выполните list для проверки статуса или sync для полной пересборки runtime-правил")
+    add_advice("Выполните list для проверки статуса или health для проверки runtime")
 
 def cmd_delete(args):
-    """Удаление учётной записи с подтверждением."""
+    """Удаление учётки с подтверждением и безопасным применением для AWG."""
     if args.confirm != args.name:
         raise RuntimeError("Подтверждение удаления не совпадает с именем учётной записи")
-        
     conn = init_db()
     user = conn.execute("SELECT pubkey, ip FROM users WHERE name=?", (args.name,)).fetchone()
     if not user:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
-        
     pub, ip = user
-    wg_bin = get_wg_cmd()
-    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove || true")
-    run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-    run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
-    run_cmd("netfilter-persistent save")
-    
+    backend = require_backend()
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
     conn.commit()
-    
+
     cfg = Path(f"{CONF_DIR}/{args.name}.conf")
     if cfg.exists():
         cfg.unlink()
-        
+
+    if backend == "awg":
+        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    else:
+        run_cmd(f"wg set {WG_IF} peer {pub} remove || true")
+        run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
+        run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
+        run_cmd("netfilter-persistent save")
     log.info(f"Учётная запись '{args.name}' полностью удалена.")
     add_advice("Выполните list для проверки списка пользователей")
 
@@ -1173,38 +1370,50 @@ def main():
         sys.exit(0)
         
     try:
-        if args.command == "init":
-            cmd_init(args)
-        elif args.command == "backend":
-            cmd_backend()
-        elif args.command == "start":
-            cmd_start()
-        elif args.command == "stop":
-            cmd_stop()
-        elif args.command == "restart":
-            cmd_restart()
-        elif args.command == "status":
-            cmd_status()
-        elif args.command == "health":
-            cmd_health()
-        elif args.command == "sync":
-            cmd_sync()
-        elif args.command == "add":
-            cmd_add(args)
-        elif args.command == "edit":
-            cmd_edit(args)
-        elif args.command == "block":
-            cmd_block(args)
-        elif args.command == "delete":
-            cmd_delete(args)
-        elif args.command == "list":
-            cmd_list()
-        elif args.command == "config":
-            cmd_config(args)
-        elif args.command == "remove":
-            cmd_remove(args)
-        elif args.command == "purge":
-            cmd_purge(args)
+        mutating_commands = {
+            "init", "start", "stop", "restart", "sync",
+            "add", "edit", "block", "delete", "remove", "purge",
+        }
+
+        def dispatch():
+            if args.command == "init":
+                cmd_init(args)
+            elif args.command == "backend":
+                cmd_backend()
+            elif args.command == "start":
+                cmd_start()
+            elif args.command == "stop":
+                cmd_stop()
+            elif args.command == "restart":
+                cmd_restart()
+            elif args.command == "status":
+                cmd_status()
+            elif args.command == "health":
+                cmd_health()
+            elif args.command == "sync":
+                cmd_sync()
+            elif args.command == "add":
+                cmd_add(args)
+            elif args.command == "edit":
+                cmd_edit(args)
+            elif args.command == "block":
+                cmd_block(args)
+            elif args.command == "delete":
+                cmd_delete(args)
+            elif args.command == "list":
+                cmd_list()
+            elif args.command == "config":
+                cmd_config(args)
+            elif args.command == "remove":
+                cmd_remove(args)
+            elif args.command == "purge":
+                cmd_purge(args)
+
+        if args.command in mutating_commands:
+            with runtime_lock():
+                dispatch()
+        else:
+            dispatch()
         flush_advice()
     except Exception as e:
         log.error(str(e))
