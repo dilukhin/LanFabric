@@ -4,6 +4,8 @@
 
 Предмет: issue [#12 — автоматическое восстановление AWG после загрузки](https://github.com/dilukhin/LanFabric/issues/12).
 
+Актуализация после обсуждения инспекции: пользователь принял порядок работ и разрешил обновление/слияние документов в PR #20. Продолжение ведётся по [согласованному плану](https://github.com/dilukhin/LanFabric/blob/master/docs/work_plan_ru.md) и [текущему статусу](https://github.com/dilukhin/LanFabric/blob/master/docs/current_status_ru.md). Первое действие в исходном диалоге — уточнение контракта C1–C8, затем #17 → #15 → обязательная часть #16 → #12 и отдельная приёмка. Это принятие очереди работ; детали реализации и версия следующего выпуска ещё должны быть согласованы.
+
 Проверенная реализация: `dilukhin/LanFabric`, `master@51df21abd770dbc47655317d870b4f73e080dc35`, оба runtime-модуля **0.0.17**. Это независимое заключение, а не разрешение на серверные изменения или изменение версии.
 
 ## 1. Итоговая оценка
@@ -176,6 +178,6 @@
 
 Не менять автоматически ранее утверждённый порядок AWG→Android→security→P2P. Найденные обязательные условия безопасного AWG restore следует включить в первый этап явно. Отдельные SSH-исправления [#18](https://github.com/dilukhin/LanFabric/issues/18) и восстановление wg [#19](https://github.com/dilukhin/LanFabric/issues/19) не являются основанием расширять работы на текущем стенде без решения.
 
-Проверка этой инспекции: существующий набор **84/84 PASS**, плюс **7/7 подтверждённых изолированных наблюдений** на 0.0.17. Это не доказательство уже исправленного lifecycle. Общий обзор: [LanFabric_project_inspection_2026-09-18.md](https://github.com/dilukhin/LanFabric/blob/agent/project-inspection-20260918/docs/reviews/LanFabric_project_inspection_2026-09-18.md).
+Проверка этой инспекции: существующий набор **84/84 PASS**, плюс **7/7 подтверждённых изолированных наблюдений** на 0.0.17. Это не доказательство уже исправленного lifecycle. Общий обзор: [LanFabric_project_inspection_2026-09-18.md](https://github.com/dilukhin/LanFabric/blob/master/docs/reviews/LanFabric_project_inspection_2026-09-18.md).
 
 До реализации заново перечитать GitHub HEAD: данный документ фиксирует снимок, а не запрещает параллельное продвижение проекта. VM dilyavm остаётся работающей; версия, runtime, systemd, firewall, agent-safe и yc-guard в инспекции не изменялись.

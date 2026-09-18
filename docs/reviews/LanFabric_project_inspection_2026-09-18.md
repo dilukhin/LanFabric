@@ -1,6 +1,8 @@
 # LanFabric — независимая инспекция проекта
 
-Дата: 2026-09-18. Статус: заключение для рассмотрения; не разрешение на изменение сервера.
+Дата: 2026-09-18. Статус: инспекция включена в согласованный план; не разрешение на изменение сервера.
+
+После обсуждения пользователь принял порядок работ и поручил обновить документы в PR #20 и выполнить слияние. Текущая очередь и точка продолжения: [work_plan_ru.md](../work_plan_ru.md); актуальное состояние: [current_status_ru.md](../current_status_ru.md). Находки ниже относятся к указанному снимку 0.0.17 и не считаются исправленными принятием документа.
 
 ## 1. Вывод
 
@@ -158,6 +160,6 @@ python3 /путь/к/inspection_probes_2026-09-18.py .
 
 ## 9. Публикация
 
-Созданы задачи [#15](https://github.com/dilukhin/LanFabric/issues/15), [#16](https://github.com/dilukhin/LanFabric/issues/16), [#17](https://github.com/dilukhin/LanFabric/issues/17), [#18](https://github.com/dilukhin/LanFabric/issues/18), [#19](https://github.com/dilukhin/LanFabric/issues/19); дубликатов среди прежних issues #8/#11/#12 не найдено. Документы публикуются через отдельную task-ветку и PR; merge требует отдельного явного разрешения по проектному bootstrap.
+Созданы задачи [#15](https://github.com/dilukhin/LanFabric/issues/15), [#16](https://github.com/dilukhin/LanFabric/issues/16), [#17](https://github.com/dilukhin/LanFabric/issues/17), [#18](https://github.com/dilukhin/LanFabric/issues/18), [#19](https://github.com/dilukhin/LanFabric/issues/19); дубликатов среди прежних issues #8/#11/#12 не найдено. Документы и согласованный план включены в PR #20. Пользователь отдельно разрешил обновление и слияние этого PR; само слияние документации не закрывает связанные дефекты.
 
 Новых переносимых наблюдений для общей GitHub knowledge base не выявлено.
