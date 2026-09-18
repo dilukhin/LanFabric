@@ -74,6 +74,7 @@ class TestAutostartContract(unittest.TestCase):
         with patch.object(srv, "load_state_snapshot", side_effect=lambda **kwargs: events.append("snapshot") or {}), \
              patch.object(srv, "ensure_state_permissions", side_effect=lambda: events.append("permissions")), \
              patch.object(srv, "state_permission_errors", return_value=[]), \
+             patch.object(srv, "trusted_python_path", return_value="/usr/bin/python3.12"), \
              patch.object(srv, "_atomic_write_root_file", side_effect=lambda *a, **k: events.append("write")), \
              patch.object(srv, "run_cmd", side_effect=lambda command, check=True: "enabled" if "is-enabled" in command else ""):
             srv.ensure_awg_autostart_unit()
