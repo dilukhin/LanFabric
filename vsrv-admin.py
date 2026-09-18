@@ -51,6 +51,7 @@ for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 log = logging.getLogger("vsrv")
 ADVICE_LINES = []
+os.umask(0o077)
 
 def add_advice(*lines):
     """Добавляет рекомендации, которые будут напечатаны в конце вывода."""
@@ -452,8 +453,10 @@ def close_firewall_guard(persist=True):
     _ensure_chain("nat", FW_NAT_CHAIN)
 
     run_cmd(f"iptables -I {FW_GUARD_CHAIN} 1 -j DROP")
-    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j {FW_GUARD_CHAIN}")
-    run_cmd(f"iptables -I FORWARD 1 -i {WG_IF} -j {FW_GUARD_CHAIN}")
+    hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
+    current_rules = _chain_rule_lines("filter", "FORWARD")
+    if not current_rules or current_rules[0] != hook:
+        run_cmd(f"iptables -I FORWARD 1 -i {WG_IF} -j {FW_GUARD_CHAIN}")
 
     if persist:
         run_cmd("netfilter-persistent save")
@@ -839,16 +842,48 @@ def allocate_ip(conn):
 
 def ensure_dirs():
     """Создаёт необходимые директории."""
-    Path(CONF_DIR).mkdir(parents=True, exist_ok=True)
+    Path(CONF_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
+    Path(CONF_DIR).chmod(0o700)
     wg_dir = Path(WG_DIR)
     wg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     wg_dir.chmod(0o700)
+
+def ensure_state_permissions():
+    """Закрепляет root-only границу кода и состояния перед запуском root-службы."""
+    for directory in (Path(REMOTE_DIR), Path(CONF_DIR), Path(WG_DIR)):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chown(directory, 0, 0)
+        directory.chmod(0o700)
+
+    protected_files = [
+        Path(REMOTE_DIR) / "vsrv-admin.py",
+        Path(DB_PATH),
+        Path(BACKEND_PATH),
+        Path(AWG_PARAMS_PATH),
+        Path(WG_DIR) / f"{WG_IF}.private",
+        Path(WG_DIR) / f"{WG_IF}.setconf",
+    ]
+    for path in protected_files:
+        if path.exists():
+            os.chown(path, 0, 0)
+            path.chmod(0o600)
+
+    public_key = Path(WG_DIR) / f"{WG_IF}.public"
+    if public_key.exists():
+        os.chown(public_key, 0, 0)
+        public_key.chmod(0o644)
+
+    for cfg in Path(CONF_DIR).glob("*.conf"):
+        if cfg.is_file():
+            os.chown(cfg, 0, 0)
+            cfg.chmod(0o600)
 
 def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
     log.info("Начало инициализации сервера")
     ensure_dirs()
     init_db(create=True).close()
+    ensure_state_permissions()
 
     # --- Очистка предыдущего состояния ---
     log.info("Очистка предыдущего состояния VPN (если есть)")

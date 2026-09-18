@@ -3,7 +3,7 @@
 vcli-admin.py - клиентский инструмент оркестрации VPN.
 Удалённое управление сервером, загрузка конфигураций и проверка состояния.
 """
-__version__ = "0.0.17"
+__version__ = "0.0.18"
 
 import sys
 import os
@@ -397,18 +397,93 @@ def get_remote_backend(args):
     return backend
 
 def copy_server_module(args):
-    """Копирует локальный серверный модуль на сервер."""
+    """Атомарно устанавливает проверенный серверный модуль в root-owned каталог."""
     local_path = local_server_module_path()
-    exec_remote(args, ["sudo", "mkdir", "-p", REMOTE_DIR])
-    exec_remote(args, ["sudo", "chown", f"{args.user}:{args.user}", REMOTE_DIR])
+    local_data = Path(local_path).read_bytes()
+    local_sha256 = hashlib.sha256(local_data).hexdigest()
+    nonce = uuid.uuid4().hex
+    remote_upload = f"/tmp/lanfabric-vsrv-{nonce}.py"
 
     scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
     if args.auth == "key":
         scp_cmd.extend(["-i", get_key_path(args.key)])
-    scp_cmd.extend([local_path, f"{args.user}@{args.host}:{REMOTE_SCRIPT}"])
+    scp_cmd.extend([local_path, f"{args.user}@{args.host}:{remote_upload}"])
     run_local(scp_cmd, args.debug)
-    exec_remote(args, ["sudo", "chmod", "+x", REMOTE_SCRIPT])
-    log.info(f"Серверный модуль обновлён до версии {__version__}")
+
+    installer = r"""
+import hashlib
+import os
+import re
+import sys
+
+src, dst, expected_hash, expected_version = sys.argv[1:5]
+data = open(src, "rb").read()
+actual_hash = hashlib.sha256(data).hexdigest()
+if actual_hash != expected_hash:
+    raise SystemExit("SHA-256 загруженного серверного модуля не совпадает")
+
+try:
+    text = data.decode("utf-8")
+except UnicodeDecodeError as e:
+    raise SystemExit(f"Серверный модуль не является UTF-8: {e}")
+
+match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+if not match or match.group(1) != expected_version:
+    raise SystemExit("Версия загруженного серверного модуля не совпадает с ожидаемой")
+compile(text, src, "exec")
+
+parent = os.path.dirname(dst)
+os.makedirs(parent, mode=0o700, exist_ok=True)
+os.chown(parent, 0, 0)
+os.chmod(parent, 0o700)
+
+tmp = os.path.join(parent, f".vsrv-admin.py.new-{os.getpid()}")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+try:
+    with os.fdopen(fd, "wb", closefd=True) as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.chown(tmp, 0, 0)
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, dst)
+    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+try:
+    os.unlink(src)
+except FileNotFoundError:
+    pass
+""".strip()
+
+    try:
+        exec_remote(
+            args,
+            [
+                "sudo", "python3", "-c", installer,
+                remote_upload, REMOTE_SCRIPT, local_sha256, __version__,
+            ],
+            timeout=30,
+        )
+    finally:
+        try:
+            exec_remote(args, ["rm", "-f", remote_upload], stream_output=False, timeout=10)
+        except RuntimeError:
+            pass
+
+    remote_ver = get_remote_version(args)
+    if remote_ver != __version__:
+        raise RuntimeError(
+            f"После атомарной установки сервер вернул версию {remote_ver}, ожидалась {__version__}"
+        )
+    log.info(f"Серверный модуль атомарно обновлён до версии {__version__}")
 
 def shell_single_quote(text):
     """Безопасно заключает строку в одинарные кавычки для POSIX shell."""
