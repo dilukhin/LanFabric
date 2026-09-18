@@ -16,7 +16,10 @@ import ipaddress
 import secrets
 import re
 import time
-import fcntl
+try:
+    import fcntl
+except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
+    fcntl = None
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -151,6 +154,8 @@ def run_cmd(cmd, check=True):
 @contextmanager
 def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
     """Сериализует все изменения желаемого и фактического состояния LanFabric."""
+    if fcntl is None:
+        raise RuntimeError("Межпроцессная блокировка LanFabric поддерживается только на POSIX-сервере")
     Path(LOCK_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + timeout
