@@ -646,6 +646,11 @@ class TestKnownDefects(unittest.TestCase):
         self.assertNotIn("os.listdir(\"/etc/sudoers.d\")", source)
         self.assertNotIn("[\"sudo\", \"python3\", \"-c\"", source)
 
+    def test_sudoers_allows_atomic_install_primitives(self):
+        rule = cli.sudoers_rule_for_user("donpedro")
+        self.assertIn("/usr/bin/install", rule)
+        self.assertIn("/bin/mv", rule)
+
     def test_patch_runs_new_cleanup_only_after_copy_and_version_check(self):
         args = make_args(command="patch")
         events = []
@@ -873,7 +878,7 @@ class TestVersionParsing(unittest.TestCase):
 
 class TestAdditionalChecks(unittest.TestCase):
 
-    def test_version_is_0_0_17(self):
+    def test_version_is_0_0_18(self):
         self.assertEqual(cli.__version__, "0.0.18")
 
     def test_server_copy_uses_atomic_root_install(self):
@@ -881,9 +886,11 @@ class TestAdditionalChecks(unittest.TestCase):
         self.assertIn("/tmp/lanfabric-vsrv-", source)
         self.assertIn("hashlib.sha256", source)
         self.assertIn("compile(text", source)
-        self.assertIn("os.replace", source)
-        self.assertIn("os.chown(parent, 0, 0)", source)
-        self.assertNotIn("sudo\", \"chown\", f\"{args.user}", source)
+        self.assertIn('"sudo", "install"', source)
+        self.assertIn('"sudo", "mv"', source)
+        self.assertIn('"root:root"', source)
+        self.assertNotIn('"sudo", "python3", "-c"', source)
+        self.assertNotIn('f"{args.user}:{args.user}"', source)
 
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",
