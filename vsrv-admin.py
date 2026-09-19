@@ -343,8 +343,8 @@ def read_server_key_material(backend):
         raise RuntimeError("Сохранённые приватный и публичный ключи сервера не соответствуют друг другу")
     return priv, pub
 
-def validate_user_rows(rows):
-    """Проверяет записи пользователей перед восстановлением runtime."""
+def validate_user_rows(rows, wg_bin):
+    """Проверяет записи пользователей и соответствие их пар ключей."""
     network = ipaddress.ip_network(VPN_NET)
     seen_ips = set()
     seen_pubkeys = set()
@@ -359,6 +359,8 @@ def validate_user_rows(rows):
             raise RuntimeError(f"Некорректный публичный ключ пользователя {name}")
         if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", privkey):
             raise RuntimeError(f"Некорректный приватный ключ пользователя {name}")
+        if derive_public_key(privkey, wg_bin) != pubkey:
+            raise RuntimeError(f"Пара ключей пользователя {name} не соответствует друг другу")
         try:
             address = ipaddress.ip_address(ip_text)
         except ValueError:
@@ -385,6 +387,9 @@ def load_state_snapshot(expected_backend=None):
     wg_bin = "awg" if backend == "awg" else "wg"
     if not run_cmd(f"command -v {wg_bin}", check=False):
         raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
+    module = "amneziawg" if backend == "awg" else "wireguard"
+    if not run_cmd(f"modprobe -n {module}", check=False):
+        raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
     priv, pub = read_server_key_material(backend)
     awg_params = read_awg_params_file() if backend == "awg" else None
     conn = init_db(read_only=True)
@@ -397,7 +402,7 @@ def load_state_snapshot(expected_backend=None):
         ).fetchall()]
     finally:
         conn.close()
-    validate_user_rows(rows)
+    validate_user_rows(rows, wg_bin)
     return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "users": rows}
 
 def ensure_iptables_rule(rule):
@@ -873,9 +878,13 @@ def ensure_awg_autostart_unit():
     if enabled != "enabled":
         raise RuntimeError(f"AWG autostart не включён после установки unit: {enabled or 'unknown'}")
 
+def cancel_awg_boot_before_lock():
+    """Останавливает незавершённую boot-задачу ДО захвата runtime lock."""
+    run_cmd(f"systemctl stop {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+
 def disable_awg_autostart(remove_unit=False):
     """Отключает будущий boot restore; текущий wg0 отдельно не останавливает."""
-    run_cmd(f"systemctl disable --now {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+    run_cmd(f"systemctl disable {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
     if remove_unit:
         run_cmd(f"rm -f {AWG_AUTOSTART_PATH}", check=False)
         run_cmd("systemctl daemon-reload")
@@ -1679,7 +1688,18 @@ def main():
             elif args.command == "purge":
                 cmd_purge(args)
 
-        if args.command in mutating_commands:
+        cancel_boot_commands = {"init", "remove", "purge"}
+        if args.command == "autostart" and args.autostart_action == "disable":
+            cancel_boot_commands.add("autostart")
+
+        if args.command in cancel_boot_commands:
+            cancel_awg_boot_before_lock()
+
+        needs_lock = (
+            args.command in mutating_commands
+            and not (args.command == "autostart" and args.autostart_action == "status")
+        )
+        if needs_lock:
             with runtime_lock():
                 dispatch()
         else:
