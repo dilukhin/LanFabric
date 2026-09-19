@@ -105,12 +105,13 @@ class TestAutostartContract(unittest.TestCase):
 
 class TestLockOrdering(unittest.TestCase):
 
-    def test_boot_cancel_is_before_runtime_lock_in_main_source(self):
+    def test_boot_cancel_is_before_runtime_lock_in_lifecycle_branch(self):
         import inspect
         source = inspect.getsource(srv.main)
+        lifecycle_source = source[source.index("cancel_boot_commands = "):]
         self.assertLess(
-            source.index("cancel_awg_boot_before_lock()"),
-            source.index("with runtime_lock():"),
+            lifecycle_source.index("cancel_awg_boot_before_lock()"),
+            lifecycle_source.index("with runtime_lock():"),
         )
 
 
