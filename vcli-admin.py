@@ -396,21 +396,12 @@ def get_remote_backend(args):
         raise RuntimeError(f"Сервер вернул неизвестный backend: {out}")
     return backend
 
-def copy_server_module(args):
-    """Проверяет staged-файл и атомарно устанавливает серверный модуль от root."""
-    local_path = local_server_module_path()
-    local_data = Path(local_path).read_bytes()
-    local_sha256 = hashlib.sha256(local_data).hexdigest()
-    nonce = uuid.uuid4().hex
-    remote_upload = f"/tmp/lanfabric-vsrv-{nonce}.py"
-    remote_staged = f"{REMOTE_DIR}/.vsrv-admin.py.new-{nonce}"
+def _version_at_least(version, minimum):
+    """Сравнивает числовые semver-тройки без изменения compatibility policy."""
+    return tuple(int(part) for part in version.split(".")) >= tuple(int(part) for part in minimum.split("."))
 
-    scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
-    if args.auth == "key":
-        scp_cmd.extend(["-i", get_key_path(args.key)])
-    scp_cmd.extend([local_path, f"{args.user}@{args.host}:{remote_upload}"])
-    run_local(scp_cmd, args.debug)
-
+def _validate_uploaded_server_module(args, remote_upload, local_sha256):
+    """Проверяет загруженный staged-файл без root-прав."""
     validator = r"""
 import hashlib
 import re
@@ -430,41 +421,98 @@ if not match or match.group(1) != expected_version:
 compile(text, path, "exec")
 print("OK")
 """.strip()
+    checked = exec_remote(
+        args,
+        ["python3", "-c", validator, remote_upload, local_sha256, __version__],
+        stream_output=False,
+        force_no_debug=True,
+        timeout=20,
+    )
+    if checked.strip().splitlines()[-1:] != ["OK"]:
+        raise RuntimeError("Удалённая проверка серверного модуля не вернула OK")
+
+def _legacy_atomic_server_install(args, remote_upload, nonce):
+    """Bootstrap 0.0.17: атомарная замена до появления root-owned installer."""
+    remote_staged = f"{REMOTE_DIR}/.vsrv-admin.py.new-{nonce}"
+    exec_remote(args, ["sudo", "mkdir", "-p", REMOTE_DIR], stream_output=False, timeout=10)
+    exec_remote(args, ["sudo", "chown", f"{args.user}:{args.user}", REMOTE_DIR], stream_output=False, timeout=10)
+    exec_remote(args, ["sudo", "chmod", "700", REMOTE_DIR], stream_output=False, timeout=10)
+
+    installer = r"""
+import os
+import sys
+
+src, staged, dst = sys.argv[1:4]
+data = open(src, "rb").read()
+fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+try:
+    with os.fdopen(fd, "wb", closefd=True) as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(staged, dst)
+    dir_fd = os.open(os.path.dirname(dst), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+finally:
+    try:
+        os.unlink(staged)
+    except FileNotFoundError:
+        pass
+""".strip()
+    exec_remote(
+        args,
+        ["python3", "-c", installer, remote_upload, remote_staged, REMOTE_SCRIPT],
+        stream_output=False,
+        force_no_debug=True,
+        timeout=20,
+    )
+
+    # Сначала защищаем исполняемый файл, затем родительский каталог.
+    exec_remote(args, ["sudo", "chown", "root:root", REMOTE_SCRIPT], stream_output=False, timeout=10)
+    exec_remote(args, ["sudo", "chmod", "700", REMOTE_SCRIPT], stream_output=False, timeout=10)
+    exec_remote(args, ["sudo", "chown", "root:root", REMOTE_DIR], stream_output=False, timeout=10)
+    exec_remote(args, ["sudo", "chmod", "700", REMOTE_DIR], stream_output=False, timeout=10)
+
+def copy_server_module(args, remote_version=None):
+    """Проверяет staged-файл и атомарно устанавливает серверный модуль."""
+    local_path = local_server_module_path()
+    local_data = Path(local_path).read_bytes()
+    local_sha256 = hashlib.sha256(local_data).hexdigest()
+    nonce = uuid.uuid4().hex
+    remote_upload = f"/tmp/lanfabric-vsrv-{nonce}.py"
+
+    scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
+    if args.auth == "key":
+        scp_cmd.extend(["-i", get_key_path(args.key)])
+    scp_cmd.extend([local_path, f"{args.user}@{args.host}:{remote_upload}"])
+    run_local(scp_cmd, args.debug)
 
     try:
-        checked = exec_remote(
-            args,
-            ["python3", "-c", validator, remote_upload, local_sha256, __version__],
-            stream_output=False,
-            force_no_debug=True,
-            timeout=20,
-        )
-        if checked.strip().splitlines()[-1:] != ["OK"]:
-            raise RuntimeError("Удалённая проверка серверного модуля не вернула OK")
+        _validate_uploaded_server_module(args, remote_upload, local_sha256)
 
-        exec_remote(args, ["sudo", "mkdir", "-p", REMOTE_DIR], stream_output=False, timeout=10)
-        exec_remote(args, ["sudo", "chown", "root:root", REMOTE_DIR], stream_output=False, timeout=10)
-        exec_remote(args, ["sudo", "chmod", "700", REMOTE_DIR], stream_output=False, timeout=10)
-
-        exec_remote(
-            args,
-            ["sudo", "install", "-o", "root", "-g", "root", "-m", "700", remote_upload, remote_staged],
-            stream_output=False,
-            timeout=20,
-        )
-        exec_remote(
-            args,
-            ["sudo", "mv", "-f", remote_staged, REMOTE_SCRIPT],
-            stream_output=False,
-            timeout=10,
-        )
+        if remote_version and _version_at_least(remote_version, "0.0.18"):
+            # Начиная с 0.0.18 root-owned сервер сам выполняет проверенную атомарную замену.
+            exec_remote(
+                args,
+                [
+                    "sudo", "python3", REMOTE_SCRIPT, "_install-module",
+                    "--source", remote_upload,
+                    "--sha256", local_sha256,
+                    "--version", __version__,
+                ],
+                stream_output=False,
+                timeout=30,
+            )
+        else:
+            # Первичный bootstrap и миграция 0.0.17 используют только команды,
+            # уже разрешённые прежним sudo contract. До 0.0.18 boot-unit ещё нет.
+            _legacy_atomic_server_install(args, remote_upload, nonce)
     finally:
         try:
             exec_remote(args, ["rm", "-f", remote_upload], stream_output=False, timeout=10)
-        except RuntimeError:
-            pass
-        try:
-            exec_remote(args, ["sudo", "-n", "rm", "-f", remote_staged], stream_output=False, timeout=10)
         except RuntimeError:
             pass
 
@@ -701,7 +749,6 @@ def sudoers_rule_for_user(user):
         "/usr/bin/netfilter-persistent, /usr/bin/wg, /usr/bin/awg, "
         "/usr/sbin/ip, /usr/bin/ip, /usr/sbin/modprobe, /sbin/modprobe, "
         "/bin/mkdir, /bin/chmod, /bin/chown, /bin/rm, /usr/bin/rm, "
-        "/usr/bin/install, /bin/mv, /usr/bin/mv, "
         f"/usr/bin/python3 {REMOTE_SCRIPT} *"
     )
 
@@ -1017,6 +1064,7 @@ def cmd_init(args):
     ensure_sudo_nopasswd(args)
         
     need_copy = True
+    remote_ver = None
     try:
         # Получаем версию из серверного модуля через его встроенный --version
         out = exec_remote(args, ["sudo", "python3", REMOTE_SCRIPT, "--version"], stream_output=False, force_no_debug=True)
@@ -1031,7 +1079,7 @@ def cmd_init(args):
         
     if need_copy:
         log.info("Подготовка директорий и копирование серверного модуля")
-        copy_server_module(args)
+        copy_server_module(args, remote_version=remote_ver)
     
     log.info("Запуск инициализации на сервере")
     init_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "init"]
@@ -1065,8 +1113,7 @@ def cmd_patch(args):
         )
 
     log.info(f"Версия клиента: {__version__}. Версия сервера: {remote_ver}. Обновление patch-версии")
-    ensure_sudo_nopasswd(args)
-    copy_server_module(args)
+    copy_server_module(args, remote_version=remote_ver)
     new_remote_ver = get_remote_version(args)
     if compare_versions(__version__, new_remote_ver) != "equal":
         raise RuntimeError(f"После patch версия сервера осталась несовместимой: {new_remote_ver}")

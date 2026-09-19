@@ -176,6 +176,15 @@ def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
+def command_succeeds(cmd):
+    """Проверяет только код возврата команды без зависимости от stdout."""
+    return subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
 def derive_public_key(private_key, wg_bin):
     """Вычисляет public key через stdin, не помещая private key в shell/diagnostics."""
     try:
@@ -388,7 +397,7 @@ def load_state_snapshot(expected_backend=None):
     if not run_cmd(f"command -v {wg_bin}", check=False):
         raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
     module = "amneziawg" if backend == "awg" else "wireguard"
-    if not run_cmd(f"modprobe -n {module}", check=False):
+    if not command_succeeds(f"modprobe -n {module}"):
         raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
     priv, pub = read_server_key_material(backend)
     awg_params = read_awg_params_file() if backend == "awg" else None
@@ -1571,9 +1580,83 @@ def cmd_list():
         status = "БЛОК" if r[4] else "АКТИВ"
         log.info(f"{r[0]:<15} {r[1]:<12} {'ДА' if r[2] else 'НЕТ':<6} {'ДА' if r[3] else 'НЕТ':<6} {status:<10} {r[5]}")
 
+def _run_internal_install_module(argv):
+    """Атомарно заменяет root-owned server module из строго проверенного /tmp staged-файла."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--sha256", required=True)
+    parser.add_argument("--version", required=True)
+    args = parser.parse_args(argv)
+
+    sudo_uid = os.environ.get("SUDO_UID")
+    if not os.environ.get("SUDO_USER") or not sudo_uid:
+        raise RuntimeError("Внутренняя установка модуля разрешена только через sudo")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
+        raise RuntimeError("Некорректный ожидаемый SHA-256")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+        raise RuntimeError("Некорректная ожидаемая версия")
+
+    source = Path(args.source)
+    if source.parent != Path("/tmp") or not re.fullmatch(r"lanfabric-vsrv-[0-9a-f]{32}\.py", source.name):
+        raise RuntimeError("Недопустимый путь staged server module")
+    st = source.lstat()
+    if not source.is_file() or source.is_symlink():
+        raise RuntimeError("Staged server module должен быть обычным файлом")
+    if st.st_uid != int(sudo_uid):
+        raise RuntimeError("Staged server module не принадлежит вызвавшему sudo пользователю")
+
+    data = source.read_bytes()
+    import hashlib
+    if hashlib.sha256(data).hexdigest() != args.sha256:
+        raise RuntimeError("SHA-256 staged server module не совпадает")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"Server module не является UTF-8: {e}")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match or match.group(1) != args.version:
+        raise RuntimeError("Версия staged server module не совпадает")
+    compile(text, str(source), "exec")
+
+    target = Path(REMOTE_DIR) / "vsrv-admin.py"
+    Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(REMOTE_DIR, 0, 0)
+    os.chmod(REMOTE_DIR, 0o700)
+
+    tmp = Path(REMOTE_DIR) / f".vsrv-admin.py.new-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, target)
+        dir_fd = os.open(REMOTE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+    print("OK")
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_cleanup-temp-sudoers":
         print(_run_internal_cleanup_temp_sudoers(sys.argv[2:]))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_install-module":
+        try:
+            _run_internal_install_module(sys.argv[2:])
+        except Exception as e:
+            log.error(str(e))
+            sys.exit(1)
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "_boot-awg":

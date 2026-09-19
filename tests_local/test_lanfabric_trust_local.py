@@ -646,21 +646,31 @@ class TestKnownDefects(unittest.TestCase):
         self.assertNotIn("os.listdir(\"/etc/sudoers.d\")", source)
         self.assertNotIn("[\"sudo\", \"python3\", \"-c\"", source)
 
-    def test_sudoers_allows_atomic_install_primitives(self):
-        rule = cli.sudoers_rule_for_user("donpedro")
-        self.assertIn("/usr/bin/install", rule)
-        self.assertIn("/bin/mv", rule)
-
     def test_patch_runs_new_cleanup_only_after_copy_and_version_check(self):
         args = make_args(command="patch")
         events = []
         with patch.object(cli, "get_remote_version", side_effect=["0.0.17", "0.0.18"]), \
              patch.object(cli, "ensure_sudo_nopasswd", side_effect=lambda a: events.append("sudo")), \
-             patch.object(cli, "copy_server_module", side_effect=lambda a: events.append("copy")), \
+             patch.object(cli, "copy_server_module", side_effect=lambda a, remote_version=None: events.append(("copy", remote_version))), \
              patch.object(cli, "cleanup_stale_temporary_sudo_trust", side_effect=lambda a: events.append("cleanup") or 0), \
              patch.object(cli, "add_advice"):
             cli.cmd_patch(args)
-        self.assertEqual(events, ["sudo", "copy", "cleanup"])
+        self.assertEqual(events, [("copy", "0.0.17"), "cleanup"])
+
+
+    def test_legacy_patch_installer_uses_only_0_0_17_sudo_primitives(self):
+        source = inspect.getsource(cli._legacy_atomic_server_install)
+        self.assertIn('"sudo", "mkdir"', source)
+        self.assertIn('"sudo", "chown"', source)
+        self.assertIn('"sudo", "chmod"', source)
+        self.assertNotIn('"sudo", "install"', source)
+        self.assertNotIn('"sudo", "mv"', source)
+        self.assertNotIn('"sudo", "python3", "-c"', source)
+
+    def test_modern_patch_uses_server_internal_installer(self):
+        source = inspect.getsource(cli.copy_server_module)
+        self.assertIn('"_install-module"', source)
+        self.assertIn('_legacy_atomic_server_install', source)
 
     def test_key_auth_equal_flow_cleans_sudoers_once(self):
         args = make_args(auth="key", command="status", host="srv")
@@ -881,16 +891,13 @@ class TestAdditionalChecks(unittest.TestCase):
     def test_version_is_0_0_18(self):
         self.assertEqual(cli.__version__, "0.0.18")
 
-    def test_server_copy_uses_atomic_root_install(self):
+    def test_server_copy_uses_validated_staging(self):
         source = inspect.getsource(cli.copy_server_module)
         self.assertIn("/tmp/lanfabric-vsrv-", source)
-        self.assertIn("hashlib.sha256", source)
-        self.assertIn("compile(text", source)
-        self.assertIn('"sudo", "install"', source)
-        self.assertIn('"sudo", "mv"', source)
-        self.assertIn('"root:root"', source)
-        self.assertNotIn('"sudo", "python3", "-c"', source)
-        self.assertNotIn('f"{args.user}:{args.user}"', source)
+        self.assertIn("_validate_uploaded_server_module", source)
+        self.assertIn('"_install-module"', source)
+        self.assertNotIn('"sudo", "install"', source)
+        self.assertNotIn('"sudo", "mv"', source)
 
     def test_module_has_required_functions(self):
         for name in ["lanfabric_marker", "current_client_id", "build_ssh_cmd",

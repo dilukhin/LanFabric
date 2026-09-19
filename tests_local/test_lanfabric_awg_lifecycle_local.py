@@ -64,6 +64,21 @@ class TestStrictState(unittest.TestCase):
         create.assert_not_called()
 
 
+
+    def test_modprobe_preflight_uses_exit_code_not_stdout(self):
+        fake = SimpleNamespace(returncode=0)
+        with patch.object(srv.subprocess, "run", return_value=fake):
+            self.assertTrue(srv.command_succeeds("modprobe -n amneziawg"))
+
+    def test_internal_installer_restricts_source_to_tmp(self):
+        import inspect
+        source = inspect.getsource(srv._run_internal_install_module)
+        self.assertIn('source.parent != Path("/tmp")', source)
+        self.assertIn("source.is_symlink()", source)
+        self.assertIn("st.st_uid != int(sudo_uid)", source)
+        self.assertIn("os.replace(tmp, target)", source)
+
+
 class TestAutostartContract(unittest.TestCase):
 
     def test_unit_is_boot_only_oneshot(self):
