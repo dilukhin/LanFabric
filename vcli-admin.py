@@ -9,6 +9,8 @@ import sys
 import os
 import subprocess
 import argparse
+import queue
+import threading
 import logging
 import shlex
 import platform
@@ -140,6 +142,9 @@ def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_
         return captured_output
 
     # Потоковый режим для длинных серверных операций.
+    # timeout здесь означает максимально допустимый интервал без новой строки
+    # вывода. Это сохраняет потоковый UX для долгих операций, но не позволяет
+    # навсегда зависнуть на readline(), в том числе на запросе без перевода строки.
     process = subprocess.Popen(
         ssh_cmd,
         stdout=subprocess.PIPE,
@@ -151,9 +156,46 @@ def exec_remote(args, remote_cmd_list, use_tty=False, stream_output=True, force_
     )
 
     output_lines = []
+    output_queue = queue.Queue()
+    stream_finished = object()
 
-    for line in iter(process.stdout.readline, ''):
-        line = line.rstrip()
+    def read_stream():
+        try:
+            for line in iter(process.stdout.readline, ''):
+                output_queue.put(line)
+        finally:
+            output_queue.put(stream_finished)
+
+    reader = threading.Thread(target=read_stream, daemon=True)
+    reader.start()
+
+    wait_timeout = timeout if timeout is not None and timeout > 0 else None
+
+    while True:
+        try:
+            item = output_queue.get(timeout=wait_timeout)
+        except queue.Empty:
+            if process.poll() is not None:
+                # Процесс уже завершился; даём reader возможность положить sentinel.
+                continue
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            reader.join(timeout=1)
+            raise RuntimeError(
+                f"SSH-команда не выдавала данных более {timeout} секунд. "
+                "Локальный SSH-процесс остановлен; удалённая команда могла продолжить выполнение."
+            )
+
+        if item is stream_finished:
+            break
+
+        line = item.rstrip()
         if line:
             print(line)
             output_lines.append(line)
