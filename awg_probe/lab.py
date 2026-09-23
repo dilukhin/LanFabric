@@ -126,7 +126,7 @@ def main():
                        "-v", f"{directory}:/state:ro", "-e", f"ROLE={role}",
                        "-e", f"VPN_ADDRESS={address}", IMAGE)
 
-            docker("network", "connect", "--ip", "172.29.77.1", OUTSIDE, "lf-probe-gateway")
+            docker("network", "connect", "--ip", "172.29.77.3", OUTSIDE, "lf-probe-gateway")
             docker("run", "-d", "--name", "lf-probe-http", "--network", OUTSIDE,
                    "--ip", "172.29.77.2", "--restart", "unless-stopped",
                    "--entrypoint", "python3", IMAGE,
