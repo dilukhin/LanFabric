@@ -1,0 +1,28 @@
+name: AWG userspace container probe
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/awg-userspace-probe.yml'
+      - 'awg_probe/**'
+permissions:
+  contents: read
+jobs:
+  runner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Платформа и зависимости
+        run: |
+          uname -a
+          docker version
+          test -c /dev/net/tun
+          test -e /dev/kvm && echo 'KVM присутствует' || echo 'KVM отсутствует: гостевой проход требует TCG'
+      - name: Сборка фиксированных исходников
+        run: |
+          timeout 12m docker build --pull -t lanfabric-awg-probe:local awg_probe
+          docker image inspect -f 'digest/image-id={{.Id}}' lanfabric-awg-probe:local >> "$GITHUB_STEP_SUMMARY"
+      - name: Два клиента, политики и сбои
+        run: timeout 8m python3 awg_probe/lab.py
