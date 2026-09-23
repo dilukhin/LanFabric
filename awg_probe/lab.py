@@ -50,6 +50,7 @@ def safe_diagnostics():
             continue
         print(f"Диагностика {name}: {state.stdout.strip()}", flush=True)
         logs = docker("logs", "--tail", "12", name, check=False)
+        print(f"  docker logs: exit={logs.returncode}", flush=True)
         for line in (logs.stdout + logs.stderr).splitlines():
             print("  " + re.sub(r"[A-Za-z0-9+/]{40,}={0,2}", "[скрыто]", line)[:300], flush=True)
 
@@ -156,6 +157,11 @@ def main():
             probe("восстановление после аварии", ping("a", "10.77.0.1"))
             probe("запрет B после аварии", http("b"), expected=False)
             print("PASS: функциональный тест контейнеров завершён; секреты не сохранены", flush=True)
+        except subprocess.CalledProcessError as error:
+            print("Ошибка Docker: " + re.sub(r"[A-Za-z0-9+/]{40,}={0,2}", "[скрыто]",
+                                          (error.stderr or "")[:400]), flush=True)
+            safe_diagnostics()
+            raise
         except Exception:
             safe_diagnostics()
             raise

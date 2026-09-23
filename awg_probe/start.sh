@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+echo 'Этап: процесс контейнера запущен'
 test -r /state/wg0.conf
 echo 'Этап: конфигурация найдена'
 amneziawg-go -f wg0 &
