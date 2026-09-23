@@ -71,8 +71,8 @@ timeout 12m docker build --pull -t lanfabric-awg-probe:local awg_probe
 set -o pipefail
 timeout 5m bash -c "docker save lanfabric-awg-probe:local | gzip -1 | ssh ${ssh_opts[*]} probe@127.0.0.1 'gzip -d | sudo docker load'"
 scp -i "$root/id" -P 2222 -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="$root/known_hosts" awg_probe/lab.py probe@127.0.0.1:/tmp/lf-awg-lab.py
-guest 'sudo timeout 7m python3 /tmp/lf-awg-lab.py --preserve'
+    -o UserKnownHostsFile="$root/known_hosts" awg_probe/lab.py probe@127.0.0.1:/var/tmp/lf-awg-lab.py
+guest 'sudo timeout 7m python3 /var/tmp/lf-awg-lab.py --preserve'
 
 echo 'Перезагрузка только гостевой ОС'
 guest 'sudo reboot' || true
@@ -85,5 +85,5 @@ for _ in {1..90}; do
 done
 test "$ready" = 1 || { echo 'FAIL: Docker не восстановился после загрузки'; exit 1; }
 guest 'uname -r; sudo docker version --format "{{.Server.Version}}"; sudo containerd --version; sudo runc --version; sudo dpkg --audit'
-guest 'sudo timeout 3m python3 /tmp/lf-awg-lab.py --check-boot'
+guest 'sudo timeout 3m python3 /var/tmp/lf-awg-lab.py --check-boot'
 echo 'PASS: гостевой функциональный сценарий и загрузка завершены'
