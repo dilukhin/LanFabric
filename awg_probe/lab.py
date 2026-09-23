@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Одноразовая лаборатория AWG: ключи и конфиги остаются вне журналов."""
 import pathlib
+import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from contextlib import nullcontext
 
 IMAGE = "lanfabric-awg-probe:local"
 NETWORK = "lf-probe-underlay"
 OUTSIDE = "lf-probe-outside"
 NAMES = ("lf-probe-gateway", "lf-probe-a", "lf-probe-b", "lf-probe-http")
+PERSISTENT = "/var/tmp/lf-awg-probe-state"
 
 
 def run(*args, check=True, timeout=30):
@@ -30,12 +35,54 @@ def probe(label, args, expected=True):
     raise AssertionError(f"FAIL: {label}; exit={result.returncode}; stderr={result.stderr[-250:]}")
 
 
-def main():
+def cleanup():
     for name in NAMES:
         docker("rm", "-f", name, check=False)
     for name in (NETWORK, OUTSIDE):
         docker("network", "rm", name, check=False)
-    with tempfile.TemporaryDirectory(prefix="lf-awg-") as tmp:
+
+
+def safe_diagnostics():
+    for name in NAMES:
+        state = docker("inspect", "-f", "{{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}", name,
+                       check=False)
+        if state.returncode:
+            continue
+        print(f"Диагностика {name}: {state.stdout.strip()}", flush=True)
+        logs = docker("logs", "--tail", "12", name, check=False)
+        for line in (logs.stdout + logs.stderr).splitlines():
+            print("  " + re.sub(r"[A-Za-z0-9+/]{40,}={0,2}", "[скрыто]", line)[:300], flush=True)
+
+
+def check_boot():
+    try:
+        for name in NAMES:
+            state = docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip()
+            assert state == "true", f"{name}: контейнер не запущен"
+        probe("после boot: туннель A → шлюз", ("lf-probe-a", "ping", "-n", "-c", "1", "-W", "2", "10.77.0.1"))
+        probe("после boot: туннель B → шлюз", ("lf-probe-b", "ping", "-n", "-c", "1", "-W", "2", "10.77.0.1"))
+        probe("после boot: разрешённый внешний путь", ("lf-probe-a", "python3", "-c",
+              "import urllib.request; urllib.request.urlopen('http://172.29.77.2:8080', timeout=2).read()"))
+        probe("после boot: запрет внешнего пути B", ("lf-probe-b", "python3", "-c",
+              "import urllib.request; urllib.request.urlopen('http://172.29.77.2:8080', timeout=2).read()"), expected=False)
+        print("PASS: восстановление после холодной загрузки гостя", flush=True)
+    finally:
+        cleanup()
+        shutil.rmtree(PERSISTENT, ignore_errors=True)
+
+
+def main():
+    if sys.argv[1:] == ["--check-boot"]:
+        check_boot()
+        return
+    preserve = sys.argv[1:] == ["--preserve"]
+    if sys.argv[1:] and not preserve:
+        raise SystemExit("допустимые параметры: --preserve или --check-boot")
+    cleanup()
+    if preserve:
+        pathlib.Path(PERSISTENT).mkdir(mode=0o700)
+    context = nullcontext(PERSISTENT) if preserve else tempfile.TemporaryDirectory(prefix="lf-awg-")
+    with context as tmp:
         try:
             docker("network", "create", "--subnet", "172.28.77.0/24", NETWORK)
             docker("network", "create", "--subnet", "172.29.77.0/24", "--internal", OUTSIDE)
@@ -80,7 +127,8 @@ def main():
 
             docker("network", "connect", "--ip", "172.29.77.1", OUTSIDE, "lf-probe-gateway")
             docker("run", "-d", "--name", "lf-probe-http", "--network", OUTSIDE,
-                   "--ip", "172.29.77.2", "--entrypoint", "python3", IMAGE,
+                   "--ip", "172.29.77.2", "--restart", "unless-stopped",
+                   "--entrypoint", "python3", IMAGE,
                    "-m", "http.server", "8080", "--bind", "172.29.77.2")
 
             ping = lambda who, ip: ("lf-probe-" + who, "ping", "-n", "-c", "1", "-W", "2", ip)
@@ -108,11 +156,12 @@ def main():
             probe("восстановление после аварии", ping("a", "10.77.0.1"))
             probe("запрет B после аварии", http("b"), expected=False)
             print("PASS: функциональный тест контейнеров завершён; секреты не сохранены", flush=True)
+        except Exception:
+            safe_diagnostics()
+            raise
         finally:
-            for name in NAMES:
-                docker("rm", "-f", name, check=False)
-            for name in (NETWORK, OUTSIDE):
-                docker("network", "rm", name, check=False)
+            if not preserve:
+                cleanup()
 
 
 if __name__ == "__main__":

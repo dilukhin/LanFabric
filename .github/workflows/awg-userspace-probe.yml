@@ -26,3 +26,13 @@ jobs:
           docker image inspect -f 'digest/image-id={{.Id}}' lanfabric-awg-probe:local >> "$GITHUB_STEP_SUMMARY"
       - name: Два клиента, политики и сбои
         run: timeout 8m python3 awg_probe/lab.py
+  guest:
+    needs: runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Ubuntu 20.04 в QEMU, Docker, полезный трафик и холодная загрузка
+        run: timeout 29m bash awg_probe/guest.sh
