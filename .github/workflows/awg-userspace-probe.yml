@@ -25,7 +25,7 @@ jobs:
           timeout 12m docker build --pull -t lanfabric-awg-probe:local awg_probe
           docker image inspect -f 'digest/image-id={{.Id}}' lanfabric-awg-probe:local >> "$GITHUB_STEP_SUMMARY"
       - name: Два клиента, политики и сбои
-        run: timeout 8m python3 awg_probe/lab.py
+        run: sudo timeout 8m python3 awg_probe/lab.py
   guest:
     needs: runner
     runs-on: ubuntu-24.04
