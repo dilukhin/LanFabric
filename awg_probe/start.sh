@@ -3,12 +3,14 @@ set -eu
 echo 'Этап: процесс контейнера запущен'
 test -r /state/wg0.conf
 echo 'Этап: конфигурация найдена'
+# После SIGKILL файл сокета может пережить процесс в том же контейнере.
+rm -f /var/run/amneziawg/wg0.sock
 amneziawg-go -f wg0 &
 awg_pid=$!
 echo "$awg_pid" > /run/awg-probe.pid
 trap 'kill "$awg_pid" 2>/dev/null || true; wait "$awg_pid" 2>/dev/null || true' TERM INT
 i=0
-while [ ! -S /var/run/amneziawg/wg0.sock ]; do
+while ! [ -S /var/run/amneziawg/wg0.sock ] || ! awg show wg0 >/dev/null 2>&1; do
     kill -0 "$awg_pid"
     i=$((i+1))
     test "$i" -lt 50

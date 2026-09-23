@@ -20,6 +20,8 @@ jobs:
           docker version
           test -c /dev/net/tun
           test -e /dev/kvm && echo 'KVM присутствует' || echo 'KVM отсутствует: гостевой проход требует TCG'
+      - name: Локальные проверки LanFabric
+        run: python3 tests_local/run_local_checks.py
       - name: Сборка фиксированных исходников
         run: |
           timeout 12m docker build --pull -t lanfabric-awg-probe:local awg_probe
