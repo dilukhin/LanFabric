@@ -81,7 +81,7 @@ class TestInitDirectories(unittest.TestCase):
         file_handle = mock_open()
         with (
             patch.object(srv.os, "open", return_value=42) as os_open,
-            patch.object(srv.os, "fchmod") as fchmod,
+            patch.object(srv.os, "fchmod", create=True) as fchmod,
             patch.object(srv.os, "fdopen", return_value=file_handle()) as fdopen,
         ):
             srv.write_private_file("/etc/wireguard/wg0.private", "secret")
@@ -94,6 +94,59 @@ class TestInitDirectories(unittest.TestCase):
         fchmod.assert_called_once_with(42, 0o600)
         fdopen.assert_called_once_with(42, "w", encoding="utf-8")
         file_handle().write.assert_called_once_with("secret")
+
+
+class TestInternetNatInterface(unittest.TestCase):
+
+    def test_uses_interface_from_ipv4_route(self):
+        with patch.object(srv, "run_cmd", return_value="1.1.1.1 via 95.81.118.129 dev ens3 src 95.81.118.143"):
+            self.assertEqual(srv.get_wan_interface(), "ens3")
+
+    def test_rejects_missing_or_vpn_interface(self):
+        for route in ("", "1.1.1.1 dev wg0 src 10.8.0.1", "1.1.1.1 dev bad;name"):
+            with self.subTest(route=route), patch.object(srv, "run_cmd", return_value=route):
+                with self.assertRaises(RuntimeError):
+                    srv.get_wan_interface()
+
+    def test_internet_rules_use_real_interface_and_keep_drop_last(self):
+        commands = []
+        with (
+            patch.object(srv, "get_wan_interface", return_value="ens3"),
+            patch.object(srv, "delete_iptables_rule", side_effect=commands.append),
+            patch.object(srv, "ensure_iptables_rule", side_effect=commands.append),
+        ):
+            srv.ensure_client_internet_rules("10.8.0.2")
+        self.assertIn("iptables -t nat -A POSTROUTING -s 10.8.0.2 -o ens3 -j MASQUERADE", commands)
+        self.assertEqual(commands[-1], "iptables -A FORWARD -i wg0 -j DROP")
+
+    def test_missing_route_does_not_change_forward_rules(self):
+        with (
+            patch.object(srv, "get_wan_interface", side_effect=RuntimeError("маршрут отсутствует")),
+            patch.object(srv, "delete_iptables_rule") as delete_rule,
+            patch.object(srv, "ensure_iptables_rule") as ensure_rule,
+        ):
+            with self.assertRaises(RuntimeError):
+                srv.ensure_client_internet_rules("10.8.0.2")
+        delete_rule.assert_not_called()
+        ensure_rule.assert_not_called()
+
+    def test_removes_only_exact_client_nat_rules_without_route(self):
+        rules = []
+        with (
+            patch.object(srv, "run_cmd", return_value="\n".join((
+                "-A POSTROUTING -s 10.8.0.2/32 -o ens3 -j MASQUERADE",
+                "-A POSTROUTING -s 10.8.0.2/32 -o eth0 -j MASQUERADE",
+                "-A POSTROUTING -s 10.8.0.3/32 -o ens3 -j MASQUERADE",
+                "-A POSTROUTING -s 10.8.0.2/32 -o ens3 -j ACCEPT",
+                "-A POSTROUTING -s 10.8.0.2/32 -o wg0 -j MASQUERADE",
+            ))),
+            patch.object(srv, "delete_iptables_rule", side_effect=rules.append),
+        ):
+            srv.delete_client_nat_rules("10.8.0.2")
+        self.assertEqual(rules, [
+            "iptables -t nat -A POSTROUTING -s 10.8.0.2 -o ens3 -j MASQUERADE",
+            "iptables -t nat -A POSTROUTING -s 10.8.0.2 -o eth0 -j MASQUERADE",
+        ])
 
 
 if __name__ == "__main__":

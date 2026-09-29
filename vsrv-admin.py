@@ -277,6 +277,27 @@ def delete_iptables_rule(rule):
     delete_rule = rule.replace(" -A ", " -D ", 1)
     run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
 
+def get_wan_interface():
+    """Определяет исходящий IPv4-интерфейс по маршруту вне VPN."""
+    route = run_cmd("ip -4 route get 1.1.1.1")
+    match = re.search(r"(?:^|\s)dev\s+(\S+)", route)
+    interface = match.group(1) if match else ""
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) or interface == WG_IF:
+        raise RuntimeError("Не удалось определить внешний IPv4-интерфейс для NAT; проверьте маршрут по умолчанию")
+    return interface
+
+def delete_client_nat_rules(ip):
+    """Удаляет точные NAT-правила клиента, даже если маршрут WAN пропал."""
+    for line in run_cmd("iptables -t nat -S POSTROUTING").splitlines():
+        parts = shlex.split(line)
+        if len(parts) != 8 or parts[:3] != ["-A", "POSTROUTING", "-s"]:
+            continue
+        if parts[3] not in (ip, f"{ip}/32") or parts[4] != "-o" or parts[6:] != ["-j", "MASQUERADE"]:
+            continue
+        interface = parts[5]
+        if re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) and interface != WG_IF:
+            delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o {interface} -j MASQUERADE")
+
 def cleanup_firewall_rules():
     """Удаляет базовые и пользовательские правила LanFabric."""
     delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
@@ -290,7 +311,7 @@ def cleanup_firewall_rules():
             for row in rows:
                 ip = row[0]
                 delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-                delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+                delete_client_nat_rules(ip)
         except Exception as e:
             log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
 
@@ -315,9 +336,10 @@ def ensure_base_firewall_rules():
 
 def ensure_client_internet_rules(ip):
     """Разрешает пользователю интернет до общего DROP и включает NAT."""
+    interface = get_wan_interface()
     delete_iptables_rule(forward_drop_rule())
     ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-    ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+    ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o {interface} -j MASQUERADE")
     ensure_forward_drop_last()
 
 def cmd_stop():
@@ -886,6 +908,7 @@ def cmd_health():
 def cmd_sync():
     """Пересборка состояния из базы данных."""
     log.info("Синхронизация состояния интерфейса и правил")
+    get_wan_interface()
     wg_bin = get_wg_cmd()
     # Удаление всех пиров из интерфейса
     current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
@@ -902,7 +925,7 @@ def cmd_sync():
     for row in rows_all:
         ip = row[0]
         delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-        delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
+        delete_client_nat_rules(ip)
 
     ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
     
@@ -1037,10 +1060,11 @@ def cmd_block(args):
         
     pub, ip, internet = user
     wg_bin = get_wg_cmd()
+    if internet:
+        delete_client_nat_rules(ip)
     run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
     if internet:
         run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-        run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
         run_cmd("netfilter-persistent save")
         
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
@@ -1059,10 +1083,10 @@ def cmd_delete(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
         
     pub, ip = user
+    delete_client_nat_rules(ip)
     wg_bin = get_wg_cmd()
     run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove || true")
     run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-    run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
     run_cmd("netfilter-persistent save")
     
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
