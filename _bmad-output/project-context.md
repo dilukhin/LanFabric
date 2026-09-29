@@ -161,7 +161,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - User ACCEPT rules for `internet=1` and `blocked=0` must be placed **before** the general DROP rule.
 - `sync` must rebuild peers and dynamic firewall rules from SQLite.
 - `health` must check FORWARD rule ordering.
-- NAT uses the outbound IPv4 route interface; reject missing or VPN-only routes before adding client internet rules.
+- NAT uses the validated physical IPv4 route of forwarded client traffic; ambiguous/policy routes and unowned legacy rules must fail closed before granting client internet access.
 
 #### Trust & security
 - Temporary SSH trust and temporary sudo trust must be cleaned up in `finally`.

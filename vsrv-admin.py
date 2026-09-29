@@ -16,6 +16,7 @@ import ipaddress
 import secrets
 import re
 import time
+import json
 from pathlib import Path
 
 # Константы
@@ -32,6 +33,8 @@ SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
 SUDOERS_LANFABRIC_GLOB = "/etc/sudoers.d/lanfabric-*"
 AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
 AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+NAT_MARK = "lanfabric-client-nat-v1"
+FORWARD_MARK = "lanfabric-client-forward-v1"
 
 # Логирование
 logging.basicConfig(
@@ -277,32 +280,117 @@ def delete_iptables_rule(rule):
     delete_rule = rule.replace(" -A ", " -D ", 1)
     run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
 
-def get_wan_interface():
-    """Определяет исходящий IPv4-интерфейс по маршруту вне VPN."""
-    route = run_cmd("ip -4 route get 1.1.1.1")
-    match = re.search(r"(?:^|\s)dev\s+(\S+)", route)
-    interface = match.group(1) if match else ""
-    if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) or interface == WG_IF:
-        raise RuntimeError("Не удалось определить внешний IPv4-интерфейс для NAT; проверьте маршрут по умолчанию")
+def client_nat_rule(ip, interface):
+    """Возвращает правило NAT с признаком принадлежности LanFabric."""
+    return (f"iptables -t nat -A POSTROUTING -s {ip} -o {interface} "
+            f"-m comment --comment {NAT_MARK} -j MASQUERADE")
+
+def client_forward_rule(ip):
+    """Возвращает маркированное разрешение интернет-трафика клиента."""
+    return f"iptables -A FORWARD -s {ip} -m comment --comment {FORWARD_MARK} -j ACCEPT"
+
+def get_wan_interface(ip):
+    """Проверяет однозначный физический выход для пересылаемого IPv4 клиента."""
+    if ipaddress.ip_address(ip) not in ipaddress.ip_network(VPN_NET):
+        raise RuntimeError("IP клиента вне VPN-сети; определение WAN прекращено")
+    rules = [line.split() for line in run_cmd("ip -4 rule show").splitlines()]
+    if rules != [["0:", "from", "all", "lookup", "local"],
+                 ["32766:", "from", "all", "lookup", "main"],
+                 ["32767:", "from", "all", "lookup", "default"]]:
+        raise RuntimeError("Дополнительные IPv4 policy rules: выход клиента неоднозначен")
+
+    defaults = run_cmd("ip -4 route show table main default").splitlines()
+    if len(defaults) != 1:
+        raise RuntimeError("Нужен ровно один маршрут IPv4 по умолчанию для клиентов")
+    parts = defaults[0].split()
+    if parts[:2] != ["default", "via"] or parts.count("via") != 1 or parts.count("dev") != 1:
+        raise RuntimeError("Неоднозначный IPv4 маршрут по умолчанию для NAT")
+    gateway = parts[parts.index("via") + 1]
+    interface = parts[parts.index("dev") + 1]
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) or interface in (WG_IF, "lo"):
+        raise RuntimeError("Внешний IPv4-интерфейс для NAT отсутствует или является туннелем")
+    try:
+        ipaddress.IPv4Address(gateway)
+        links = json.loads(run_cmd(f"ip -d -j link show dev {interface}"))
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(f"Не удалось проверить внешний интерфейс NAT: {e}") from e
+    if (not isinstance(links, list) or len(links) != 1 or not isinstance(links[0], dict) or
+            links[0].get("ifname") != interface or
+            links[0].get("link_type") != "ether" or links[0].get("linkinfo") or
+            "UP" not in links[0].get("flags", [])):
+        raise RuntimeError("Интерфейс NAT не подтверждён как активный физический Ethernet")
+
+    for probe in ("1.1.1.1", "8.8.8.8"):
+        if run_cmd(f"ip -4 route show table main match {probe}/32").splitlines() != defaults:
+            raise RuntimeError("Для контрольного адреса есть особый маршрут; выбор WAN неоднозначен")
+        route = run_cmd(f"ip -4 route get {probe} from {ip} iif {WG_IF}").splitlines()
+        tokens = route[0].split() if route else []
+        if (not tokens or tokens[0] != probe or tokens.count("dev") != 1 or
+                tokens.count("via") != 1 or tokens.index("dev") + 1 >= len(tokens) or
+                tokens.index("via") + 1 >= len(tokens) or
+                tokens[tokens.index("dev") + 1] != interface or
+                tokens[tokens.index("via") + 1] != gateway):
+            raise RuntimeError("Пересылаемый трафик клиента идёт не по проверенному WAN-маршруту")
     return interface
 
-def delete_client_nat_rules(ip):
-    """Удаляет точные NAT-правила клиента, даже если маршрут WAN пропал."""
+def list_client_nat_rules(ip):
+    """Сверяет свои правила и отвергает неотмеченные правила старого формата."""
+    if str(ipaddress.IPv4Address(ip)) != ip:
+        raise RuntimeError("Некорректный IP клиента при проверке NAT")
+    found = []
     for line in run_cmd("iptables -t nat -S POSTROUTING").splitlines():
         parts = shlex.split(line)
-        if len(parts) != 8 or parts[:3] != ["-A", "POSTROUTING", "-s"]:
-            continue
-        if parts[3] not in (ip, f"{ip}/32") or parts[4] != "-o" or parts[6:] != ["-j", "MASQUERADE"]:
+        if (len(parts) < 8 or parts[:3] != ["-A", "POSTROUTING", "-s"] or
+                parts[3] not in (ip, f"{ip}/32") or parts[4] != "-o"):
             continue
         interface = parts[5]
-        if re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) and interface != WG_IF:
-            delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o {interface} -j MASQUERADE")
+        if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface):
+            continue
+        if parts[6:] == ["-j", "MASQUERADE"]:
+            raise RuntimeError(f"NAT для {ip} без метки: принадлежность не доказана; нужна отдельная миграция")
+        if parts[6:] == ["-m", "comment", "--comment", NAT_MARK, "-j", "MASQUERADE"]:
+            found.append(interface)
+    return found
+
+def delete_client_nat_rules(ip):
+    """Строго удаляет и проверяет только маркированные правила клиента."""
+    for interface in list_client_nat_rules(ip):
+        run_cmd(client_nat_rule(ip, interface).replace(" -A ", " -D ", 1))
+    if list_client_nat_rules(ip):
+        raise RuntimeError(f"NAT для {ip} остался после удаления; частичная очистка")
+
+def list_client_forward_rules(ip):
+    """Возвращает только принадлежащие LanFabric разрешения клиента."""
+    found = []
+    for line in run_cmd("iptables -S FORWARD").splitlines():
+        parts = shlex.split(line)
+        if parts == ["-A", "FORWARD", "-s", f"{ip}/32", "-m", "comment",
+                     "--comment", FORWARD_MARK, "-j", "ACCEPT"]:
+            found.append(parts)
+    return found
+
+def delete_client_forward_rules(ip):
+    """Отзывает свои разрешения и проверяет их отсутствие."""
+    for _ in list_client_forward_rules(ip):
+        run_cmd(client_forward_rule(ip).replace(" -A ", " -D ", 1))
+    if list_client_forward_rules(ip):
+        raise RuntimeError(f"FORWARD для {ip} остался после удаления; частичная очистка")
+
+def verify_client_internet_rules(ip, interface):
+    """Подтверждает единственный свой NAT и расположение ACCEPT до DROP."""
+    if list_client_nat_rules(ip) != [interface]:
+        raise RuntimeError(f"NAT для {ip} не соответствует проверенному WAN {interface}")
+    rules = [shlex.split(line) for line in run_cmd("iptables -S FORWARD").splitlines()]
+    accept = ["-A", "FORWARD", "-s", f"{ip}/32", "-m", "comment",
+              "--comment", FORWARD_MARK, "-j", "ACCEPT"]
+    drop = ["-A", "FORWARD", "-i", WG_IF, "-j", "DROP"]
+    if rules.count(accept) != 1 or rules.count(drop) != 1 or rules.index(accept) > rules.index(drop):
+        raise RuntimeError(f"FORWARD для {ip} отсутствует либо расположен после DROP")
 
 def cleanup_firewall_rules():
     """Удаляет базовые и пользовательские правила LanFabric."""
     delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
     delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
-    delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {VPN_NET} -j MASQUERADE")
 
     if os.path.exists(DB_PATH):
         try:
@@ -310,10 +398,10 @@ def cleanup_firewall_rules():
             rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
             for row in rows:
                 ip = row[0]
-                delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
+                delete_client_forward_rules(ip)
                 delete_client_nat_rules(ip)
         except Exception as e:
-            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
+            raise RuntimeError(f"Очистка правил клиентов не подтверждена: {e}") from e
 
 def forward_drop_rule():
     """Возвращает базовое запрещающее правило для трафика из VPN."""
@@ -334,13 +422,21 @@ def ensure_base_firewall_rules():
     ensure_forward_drop_last()
 
 
-def ensure_client_internet_rules(ip):
+def ensure_client_internet_rules(ip, expected_interface=None):
     """Разрешает пользователю интернет до общего DROP и включает NAT."""
-    interface = get_wan_interface()
+    interface = get_wan_interface(ip)
+    if expected_interface is not None and expected_interface != interface:
+        raise RuntimeError("WAN изменился во время синхронизации; состояние может быть частичным")
+    old_interfaces = list_client_nat_rules(ip)
+    if old_interfaces and (len(old_interfaces) != 1 or old_interfaces[0] != interface):
+        delete_client_nat_rules(ip)
     delete_iptables_rule(forward_drop_rule())
-    ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-    ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o {interface} -j MASQUERADE")
-    ensure_forward_drop_last()
+    try:
+        ensure_iptables_rule(client_forward_rule(ip))
+        ensure_iptables_rule(client_nat_rule(ip, interface))
+    finally:
+        ensure_forward_drop_last()
+    verify_client_internet_rules(ip, interface)
 
 def cmd_stop():
     """Останавливает VPN runtime без удаления пакетов и данных."""
@@ -553,7 +649,6 @@ def cmd_init(args):
 
     run_cmd("iptables -D FORWARD -i wg0 -o wg0 -j ACCEPT 2>/dev/null || true", check=False)
     run_cmd("iptables -D FORWARD -i wg0 -j DROP 2>/dev/null || true", check=False)
-    run_cmd("iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true", check=False)
 
     run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
     run_cmd("rm -f /etc/wireguard/wg0.private /etc/wireguard/wg0.public", check=False)
@@ -870,15 +965,16 @@ def cmd_health():
     try:
         conn = init_db()
         internet_rows = conn.execute("SELECT name, ip FROM users WHERE internet=1 AND blocked=0").fetchall()
-        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
+        forward_rules = [shlex.split(line) for line in run_cmd("iptables -S FORWARD", check=False).splitlines()]
         drop_index = None
         for index, rule in enumerate(forward_rules):
-            if rule == f"-A FORWARD -i {WG_IF} -j DROP":
+            if rule == ["-A", "FORWARD", "-i", WG_IF, "-j", "DROP"]:
                 drop_index = index
                 break
         if drop_index is not None:
             for row in internet_rows:
-                accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
+                accept_rule = ["-A", "FORWARD", "-s", f"{row['ip']}/32", "-m", "comment",
+                               "--comment", FORWARD_MARK, "-j", "ACCEPT"]
                 accept_index = None
                 for index, rule in enumerate(forward_rules):
                     if rule == accept_rule:
@@ -908,7 +1004,18 @@ def cmd_health():
 def cmd_sync():
     """Пересборка состояния из базы данных."""
     log.info("Синхронизация состояния интерфейса и правил")
-    get_wan_interface()
+    conn = init_db()
+    rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
+    rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
+    # Все проверки выполняются до удаления пиров и изменения FORWARD.
+    for row in rows_all:
+        list_client_nat_rules(row[0])
+    interfaces = {}
+    for pub, ip, internet, _ in rows:
+        if internet:
+            interfaces[ip] = get_wan_interface(ip)
+    if len(set(interfaces.values())) > 1:
+        raise RuntimeError("Активные клиенты используют разные WAN-интерфейсы; sync остановлен")
     wg_bin = get_wg_cmd()
     # Удаление всех пиров из интерфейса
     current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
@@ -917,28 +1024,28 @@ def cmd_sync():
         if pub:
             run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
 
-    conn = init_db()
     # Очистка динамических правил клиентов и временное удаление общего DROP.
     # DROP будет добавлен последним после пользовательских ACCEPT.
-    delete_iptables_rule(forward_drop_rule())
-    rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-    for row in rows_all:
-        ip = row[0]
-        delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-        delete_client_nat_rules(ip)
+    try:
+        for row in rows_all:
+            ip = row[0]
+            delete_client_forward_rules(ip)
+            delete_client_nat_rules(ip)
 
-    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    
-    # Восстановление пиров и правил
-    rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
-    for row in rows:
-        pub, ip, internet, _ = row
-        allowed = f"{ip}/32"
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
-        if internet:
-            ensure_client_internet_rules(ip)
-
-    ensure_forward_drop_last()
+        ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+        # Восстановление пиров и правил
+        for pub, ip, internet, _ in rows:
+            if internet and get_wan_interface(ip) != interfaces[ip]:
+                raise RuntimeError("WAN изменился во время sync; состояние может быть частичным")
+            allowed = f"{ip}/32"
+            run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
+            if internet:
+                ensure_client_internet_rules(ip, expected_interface=interfaces[ip])
+    finally:
+        ensure_forward_drop_last()
+    for ip, interface in interfaces.items():
+        if get_wan_interface(ip) != interface:
+            raise RuntimeError("WAN изменился после sync; состояние может быть частичным")
     run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
     add_advice("Выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
@@ -993,13 +1100,17 @@ def cmd_add(args):
         raise RuntimeError(f"Учётная запись '{args.name}' уже существует")
         
     ip = allocate_ip(conn)
-    wg_bin = get_wg_cmd()
-    priv = run_cmd(f"{wg_bin} genkey")
-    pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey")
-    
     admin_val = 1 if args.admin else 0
     internet_val = 1 if (args.admin or args.internet) else 0
     blocked_val = 1 if args.block else 0
+    interface = None
+    if internet_val and not blocked_val:
+        interface = get_wan_interface(ip)
+        list_client_nat_rules(ip)
+
+    wg_bin = get_wg_cmd()
+    priv = run_cmd(f"{wg_bin} genkey")
+    pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey")
     
     conn.execute(
         "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1008,10 +1119,18 @@ def cmd_add(args):
     conn.commit()
     
     if not blocked_val:
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
-        if internet_val:
-            ensure_client_internet_rules(ip)
-            run_cmd("netfilter-persistent save")
+        try:
+            if internet_val:
+                ensure_client_internet_rules(ip, expected_interface=interface)
+                if get_wan_interface(ip) != interface:
+                    raise RuntimeError("WAN изменился после создания правил; клиент не подключён")
+                run_cmd("netfilter-persistent save")
+            run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
+        except Exception as e:
+            raise RuntimeError(
+                f"Учётная запись '{args.name}' записана в БД, но runtime может быть частичным: {e}. "
+                "Не включайте клиент, проверьте list/health и обратитесь к администратору"
+            ) from e
             
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     cfg_path = write_client_config(row)
@@ -1060,15 +1179,19 @@ def cmd_block(args):
         
     pub, ip, internet = user
     wg_bin = get_wg_cmd()
-    if internet:
-        delete_client_nat_rules(ip)
     run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
-    if internet:
-        run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-        run_cmd("netfilter-persistent save")
-        
+    if pub in run_cmd(f"{wg_bin} show {WG_IF} peers").splitlines():
+        raise RuntimeError(f"Peer учётной записи '{args.name}' всё ещё активен; блокировка не подтверждена")
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
+    try:
+        delete_client_forward_rules(ip)
+        delete_client_nat_rules(ip)
+        run_cmd("netfilter-persistent save")
+    except Exception as e:
+        raise RuntimeError(
+            f"Учётная запись '{args.name}' заблокирована и peer отключён, но очистка правил не подтверждена: {e}"
+        ) from e
     log.info(f"Учётная запись '{args.name}' заблокирована. Соединение разорвано.")
     add_advice("Выполните list для проверки статуса или sync для полной пересборки runtime-правил")
 
@@ -1083,11 +1206,18 @@ def cmd_delete(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
         
     pub, ip = user
-    delete_client_nat_rules(ip)
     wg_bin = get_wg_cmd()
-    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove || true")
-    run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-    run_cmd("netfilter-persistent save")
+    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
+    if pub in run_cmd(f"{wg_bin} show {WG_IF} peers").splitlines():
+        raise RuntimeError(f"Peer '{args.name}' не отключён; удаление остановлено")
+    conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
+    conn.commit()
+    try:
+        delete_client_forward_rules(ip)
+        delete_client_nat_rules(ip)
+        run_cmd("netfilter-persistent save")
+    except Exception as e:
+        raise RuntimeError(f"Peer '{args.name}' отключён, но очистка правил не завершена: {e}") from e
     
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
     conn.commit()
