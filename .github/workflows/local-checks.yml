@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - master
-      - agent/awg-python310-wan-integration
 
 permissions:
   contents: read
