@@ -17,14 +17,14 @@ _This file contains critical rules and patterns that AI agents must follow when 
 ## Technology Stack & Versions
 
 ### Python
-- Python 3.12+ required for both client (`vcli-admin.py`) and server (`vsrv-admin.py`) modules
+- Python 3.10+ required for both client (`vcli-admin.py`) and server (`vsrv-admin.py`) modules
 - Only Python standard library — no `requirements.txt`, no external PyPI dependencies
 - No external Python package manager for project code
 
 ### Operating Systems
 - **Server:** Ubuntu 22.04 or 24.04
 - **Admin Client:** Windows or Linux
-- Windows client must have `ssh`/`scp` and Python 3.12+; `winget` required for `install-client`
+- Windows client must have `ssh`/`scp` and Python 3.10+; `winget` required for `install-client`
 
 ### Connectivity & Access
 - Server must have SSH access and a user with `sudo`
@@ -84,7 +84,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - For clean stdout commands (`backend`, `config`, `--version`), do not add extraneous log output to stdout.
 
 **Compatibility:**
-- Code must remain compatible with Python 3.12+.
+- Code must remain compatible with Python 3.10+ (including 3.12+).
 
 ---
 
@@ -161,7 +161,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - User ACCEPT rules for `internet=1` and `blocked=0` must be placed **before** the general DROP rule.
 - `sync` must rebuild peers and dynamic firewall rules from SQLite.
 - `health` must check FORWARD rule ordering.
-- NAT currently uses `eth0`; do not change to auto-detection without a separate task.
+- AWG NAT uses the validated physical IPv4 route of forwarded client traffic inside owned chains. Ambiguous routes and unowned public client rules require an explicit migration; keep the traffic guard closed on failure. The legacy `wg` path remains limited to `eth0` pending issue #19.
 
 #### Trust & security
 - Temporary SSH trust and temporary sudo trust must be cleaned up in `finally`.

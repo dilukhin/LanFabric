@@ -175,6 +175,7 @@ class TestFailureSemantics(unittest.TestCase):
         snapshot = {"backend": "awg", "users": []}
         with patch.object(srv, "awg_interface_ownership", return_value="owned"), \
              patch.object(srv, "close_firewall_guard") as close_guard, \
+             patch.object(srv, "public_client_firewall_rules", return_value=[]), \
              patch.object(srv, "_apply_awg_peers", side_effect=RuntimeError("peer failure")), \
              patch.object(srv, "open_firewall_guard") as open_guard:
             with self.assertRaises(RuntimeError):
