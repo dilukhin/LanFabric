@@ -164,7 +164,7 @@ ssh-add $Key
 ssh -F NUL -i $Key -o IdentitiesOnly=yes dilukhin@$HostIp "id; sudo -n true; python3 --version"
 ```
 
-Ожидается Python 3.12+ и успешный `sudo -n true`. Если SSH или `sudo` не
+Ожидается Python 3.10+ и успешный `sudo -n true`. Если SSH или `sudo` не
 работает, `init` не выполнять.
 
 ## 7. Этап 1. Локальный baseline

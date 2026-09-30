@@ -88,7 +88,7 @@ class TestInitDirectories(unittest.TestCase):
         file_handle = mock_open()
         with (
             patch.object(srv.os, "open", return_value=42) as os_open,
-            patch.object(srv.os, "fchmod") as fchmod,
+            patch.object(srv.os, "fchmod", create=True) as fchmod,
             patch.object(srv.os, "fdopen", return_value=file_handle()) as fdopen,
         ):
             srv.write_private_file("/etc/wireguard/wg0.private", "secret")

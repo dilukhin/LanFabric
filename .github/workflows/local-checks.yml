@@ -1,0 +1,41 @@
+name: Локальные проверки LanFabric
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - agent/awg-python310-wan-integration
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-checks:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.10', '3.12', '3.13']
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Получить исходный код проверяемого коммита
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Подготовить Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Проверить модули, справку и регрессионные сценарии
+        run: python tests_local/run_local_checks.py

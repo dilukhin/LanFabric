@@ -16,6 +16,7 @@ import ipaddress
 import secrets
 import re
 import time
+import json
 try:
     import fcntl
 except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
@@ -43,6 +44,8 @@ LOCK_TIMEOUT_SECONDS = 20
 FW_GUARD_CHAIN = "LANFABRIC-GUARD"
 FW_FORWARD_CHAIN = "LANFABRIC-FWD"
 FW_NAT_CHAIN = "LANFABRIC-NAT"
+NAT_MARK = "lanfabric-client-nat-v1"
+FORWARD_MARK = "lanfabric-client-forward-v1"
 AWG_AUTOSTART_UNIT = "lanfabric-awg.service"
 AWG_AUTOSTART_PATH = f"/etc/systemd/system/{AWG_AUTOSTART_UNIT}"
 AWG_AUTOSTART_TIMEOUT_SECONDS = 60
@@ -388,8 +391,8 @@ def validate_user_rows(rows, wg_bin):
 
 def load_state_snapshot(expected_backend=None):
     """Строго читает сохранённое состояние без создания или исправления данных."""
-    if sys.version_info < (3, 12):
-        raise RuntimeError("Для восстановления LanFabric требуется Python 3.12+")
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Для восстановления LanFabric требуется Python 3.10+")
     backend = require_backend()
     if expected_backend is not None and backend != expected_backend:
         raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
@@ -425,6 +428,52 @@ def delete_iptables_rule(rule):
     """Удаляет одно точное правило iptables, если оно существует."""
     delete_rule = rule.replace(" -A ", " -D ", 1)
     run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
+
+def get_wan_interface(ip):
+    """Проверяет однозначный физический выход для пересылаемого IPv4 клиента."""
+    if ipaddress.ip_address(ip) not in ipaddress.ip_network(VPN_NET):
+        raise RuntimeError("IP клиента вне VPN-сети; определение WAN прекращено")
+    rules = [line.split() for line in run_cmd("ip -4 rule show").splitlines()]
+    if rules != [["0:", "from", "all", "lookup", "local"],
+                 ["32766:", "from", "all", "lookup", "main"],
+                 ["32767:", "from", "all", "lookup", "default"]]:
+        raise RuntimeError("Дополнительные IPv4 policy rules: выход клиента неоднозначен")
+
+    defaults = run_cmd("ip -4 route show table main default").splitlines()
+    if len(defaults) != 1:
+        raise RuntimeError("Нужен ровно один маршрут IPv4 по умолчанию для клиентов")
+    parts = defaults[0].split()
+    if (parts[:2] != ["default", "via"] or parts.count("via") != 1 or parts.count("dev") != 1 or
+            parts.index("via") + 1 >= len(parts) or parts.index("dev") + 1 >= len(parts)):
+        raise RuntimeError("Неоднозначный IPv4 маршрут по умолчанию для NAT")
+    gateway = parts[parts.index("via") + 1]
+    interface = parts[parts.index("dev") + 1]
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) or interface in (WG_IF, "lo"):
+        raise RuntimeError("Внешний IPv4-интерфейс для NAT отсутствует или является туннелем")
+    try:
+        ipaddress.IPv4Address(gateway)
+        links = json.loads(run_cmd(f"ip -d -j link show dev {interface}"))
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(f"Не удалось проверить внешний интерфейс NAT: {e}") from e
+    if (not isinstance(links, list) or len(links) != 1 or not isinstance(links[0], dict) or
+            links[0].get("ifname") != interface or
+            links[0].get("link_type") != "ether" or links[0].get("linkinfo") or
+            not isinstance(links[0].get("flags"), list) or
+            "UP" not in links[0].get("flags", [])):
+        raise RuntimeError("Интерфейс NAT не подтверждён как активный физический Ethernet")
+
+    for probe in ("1.1.1.1", "8.8.8.8"):
+        if run_cmd(f"ip -4 route show table main match {probe}/32").splitlines() != defaults:
+            raise RuntimeError("Для контрольного адреса есть особый маршрут; выбор WAN неоднозначен")
+        route = run_cmd(f"ip -4 route get {probe} from {ip} iif {WG_IF}").splitlines()
+        tokens = route[0].split() if route else []
+        if (not tokens or tokens[0] != probe or tokens.count("dev") != 1 or
+                tokens.count("via") != 1 or tokens.index("dev") + 1 >= len(tokens) or
+                tokens.index("via") + 1 >= len(tokens) or
+                tokens[tokens.index("dev") + 1] != interface or
+                tokens[tokens.index("via") + 1] != gateway):
+            raise RuntimeError("Пересылаемый трафик клиента идёт не по проверенному WAN-маршруту")
+    return interface
 
 def _iptables_prefix(table):
     return "iptables" if table == "filter" else f"iptables -t {table}"
@@ -506,8 +555,65 @@ def close_firewall_guard(persist=True):
     if persist:
         run_cmd("netfilter-persistent save")
 
+def public_client_firewall_rules():
+    """Проверяет внешние клиентские правила; возвращает только доказанно свои."""
+    owned = []
+    network = ipaddress.ip_network(VPN_NET)
+    for table, chain, target, marker in (
+        ("filter", "FORWARD", "ACCEPT", FORWARD_MARK),
+        ("nat", "POSTROUTING", "MASQUERADE", NAT_MARK),
+    ):
+        for line in run_cmd(f"{_iptables_prefix(table)} -S {chain}").splitlines():
+            parts = shlex.split(line)
+            if parts[:2] != ["-A", chain] or "-s" not in parts or "-j" not in parts:
+                continue
+            source_index = parts.index("-s") + 1
+            target_index = parts.index("-j") + 1
+            if source_index >= len(parts) or target_index >= len(parts):
+                raise RuntimeError("Не удалось разобрать клиентское правило; нужна отдельная миграция")
+            if parts[target_index] not in (target, "SNAT" if table == "nat" else target):
+                continue
+            try:
+                source = ipaddress.ip_network(parts[source_index], strict=False)
+            except ValueError:
+                raise RuntimeError("Не удалось проверить источник клиентского правила; нужна отдельная миграция")
+            if source.version != network.version or not source.overlaps(network):
+                continue
+            address = source.network_address
+            expected = ["-A", chain, "-s", parts[source_index]]
+            if table == "nat":
+                if len(parts) < 6 or parts[4] != "-o" or not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", parts[5]):
+                    raise RuntimeError("NAT без доказанной принадлежности LanFabric; нужна отдельная миграция")
+                expected += ["-o", parts[5]]
+            expected += ["-m", "comment", "--comment", marker, "-j", target]
+            if source.prefixlen != 32 or address not in network or parts != expected:
+                raise RuntimeError("Правило VPN без доказанной принадлежности LanFabric; нужна отдельная миграция")
+            owned.append((table, chain, shlex.join(parts[2:])))
+    return owned
+
+def _remove_owned_public_client_rules():
+    """Удаляет и перепроверяет только маркированные правила прежней ветки NAT."""
+    for table, chain, spec in public_client_firewall_rules():
+        _delete_rule_all(table, chain, spec)
+    if public_client_firewall_rules():
+        raise RuntimeError("Маркированные правила остались после удаления; очистка не подтверждена")
+
+def prepare_internet_policy(snapshot):
+    """Выбирает WAN для активных клиентов до замены участников и правил."""
+    interfaces = {}
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            interfaces[row["ip"]] = get_wan_interface(row["ip"])
+    if len(set(interfaces.values())) > 1:
+        raise RuntimeError("Активные клиенты используют разные WAN-интерфейсы; применение остановлено")
+    if "wan_interfaces" in snapshot and snapshot["wan_interfaces"] != interfaces:
+        raise RuntimeError("WAN изменился во время применения; защитный запрет трафика должен остаться закрытым")
+    return dict(snapshot, wan_interfaces=interfaces)
+
 def rebuild_policy_chains(snapshot):
     """Пересобирает принадлежащие LanFabric цепочки при закрытом guard."""
+    snapshot = prepare_internet_policy(snapshot)
+    _remove_owned_public_client_rules()
     _ensure_chain("filter", FW_FORWARD_CHAIN)
     _ensure_chain("nat", FW_NAT_CHAIN)
     run_cmd(f"iptables -F {FW_FORWARD_CHAIN}")
@@ -517,12 +623,12 @@ def rebuild_policy_chains(snapshot):
     for row in _active_users(snapshot):
         if int(row["internet"]):
             run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -s {row['ip']}/32 -j ACCEPT")
-            run_cmd(f"iptables -t nat -A {FW_NAT_CHAIN} -s {row['ip']}/32 -o eth0 -j MASQUERADE")
+            interface = snapshot["wan_interfaces"][row["ip"]]
+            run_cmd(f"iptables -t nat -A {FW_NAT_CHAIN} -s {row['ip']}/32 -o {interface} -j MASQUERADE")
     run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -j DROP")
 
     _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
     run_cmd(f"iptables -t nat -I POSTROUTING 1 -s {VPN_NET} -j {FW_NAT_CHAIN}")
-    _remove_legacy_firewall_rules()
 
 def open_firewall_guard():
     """Переводит guard из DROP в проверенную рабочую policy без открытого промежутка."""
@@ -530,8 +636,13 @@ def open_firewall_guard():
     run_cmd(f"iptables -A {FW_GUARD_CHAIN} -j {FW_FORWARD_CHAIN}")
     _delete_rule_all("filter", FW_GUARD_CHAIN, "-j DROP")
 
-def cleanup_owned_firewall():
-    """Удаляет только hook/цепочки новой схемы LanFabric и узнаваемые legacy-правила."""
+def cleanup_owned_firewall(allow_missing=False):
+    """Удаляет только собственные цепочки и доказанно свои клиентские правила."""
+    if allow_missing and not command_succeeds("command -v iptables"):
+        if interface_exists():
+            raise RuntimeError("Есть интерфейс VPN, но нет iptables для проверки правил; установка остановлена")
+        return
+    _remove_owned_public_client_rules()
     _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j {FW_GUARD_CHAIN}")
     _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
 
@@ -549,7 +660,6 @@ def cleanup_owned_firewall():
     if _chain_exists("nat", FW_NAT_CHAIN):
         run_cmd(f"iptables -t nat -X {FW_NAT_CHAIN}")
 
-    _remove_legacy_firewall_rules()
 
 def ensure_legacy_base_firewall_rules():
     """Сохраняет прежний firewall-контракт только для backend wg."""
@@ -601,6 +711,13 @@ def _apply_awg_peers(snapshot):
 def firewall_readiness_errors(snapshot, guard_open=True):
     """Проверяет точную принадлежащую LanFabric firewall policy."""
     errors = []
+    try:
+        snapshot = prepare_internet_policy(snapshot)
+        if public_client_firewall_rules():
+            errors.append("Вне собственных цепочек остались маркированные правила клиентов")
+    except RuntimeError as e:
+        errors.append(str(e))
+        return errors
     forward_rules = _chain_rule_lines("filter", "FORWARD")
     hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
     if not forward_rules or forward_rules[0] != hook:
@@ -627,14 +744,15 @@ def firewall_readiness_errors(snapshot, guard_open=True):
     expected_nat = []
     for row in _active_users(snapshot):
         if int(row["internet"]):
-            expected_nat.append(f"-A {FW_NAT_CHAIN} -s {row['ip']}/32 -o eth0 -j MASQUERADE")
+            interface = snapshot["wan_interfaces"][row["ip"]]
+            expected_nat.append(f"-A {FW_NAT_CHAIN} -s {row['ip']}/32 -o {interface} -j MASQUERADE")
     if _chain_rule_lines("nat", FW_NAT_CHAIN) != expected_nat:
         errors.append("Цепочка NAT LanFabric не совпадает с политиками БД")
 
     nat_rules = _chain_rule_lines("nat", "POSTROUTING")
     nat_hook = f"-A POSTROUTING -s {VPN_NET} -j {FW_NAT_CHAIN}"
-    if nat_hook not in nat_rules:
-        errors.append("Hook NAT LanFabric отсутствует")
+    if not nat_rules or nat_rules[0] != nat_hook or nat_rules.count(nat_hook) != 1:
+        errors.append("Переход в цепочку NAT LanFabric должен быть первым и единственным")
     return errors
 
 def _verify_awg_before_open(snapshot):
@@ -669,6 +787,8 @@ def _restore_awg_runtime_locked(snapshot):
         run_cmd(f"awg setconf {WG_IF} {setconf_path}")
         run_cmd(f"ip -4 addr flush dev {WG_IF}")
         run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
+        snapshot = prepare_internet_policy(snapshot)
+        public_client_firewall_rules()
         _apply_awg_peers(snapshot)
         rebuild_policy_chains(snapshot)
         run_cmd(f"ip link set up dev {WG_IF}")
@@ -691,6 +811,8 @@ def _sync_awg_runtime_locked(snapshot):
         raise RuntimeError("sync разрешён только для подтверждённого runtime LanFabric")
     close_firewall_guard(persist=True)
     try:
+        snapshot = prepare_internet_policy(snapshot)
+        public_client_firewall_rules()
         _apply_awg_peers(snapshot)
         rebuild_policy_chains(snapshot)
         _verify_awg_before_open(snapshot)
@@ -793,9 +915,9 @@ def _atomic_write_root_file(path, content, mode=0o644):
             pass
 
 def trusted_python_path():
-    """Возвращает реальный доверенный путь текущего Python 3.12+."""
-    if sys.version_info < (3, 12):
-        raise RuntimeError("Для root-службы требуется Python 3.12+")
+    """Возвращает реальный доверенный путь текущего Python 3.10+."""
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Для root-службы требуется Python 3.10+")
     path = Path(os.path.realpath(sys.executable))
     if not path.is_file():
         raise RuntimeError(f"Интерпретатор Python не найден: {path}")
@@ -1121,7 +1243,7 @@ def cmd_init(args):
             "его принадлежность LanFabric не подтверждена, init остановлен"
         )
     else:
-        cleanup_owned_firewall()
+        cleanup_owned_firewall(allow_missing=True)
         run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
 
     run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
@@ -1458,13 +1580,16 @@ def cmd_add(args):
         raise RuntimeError(f"Учётная запись '{args.name}' уже существует")
         
     ip = allocate_ip(conn)
-    wg_bin = get_wg_cmd()
-    priv = run_cmd(f"{wg_bin} genkey")
-    pub = derive_public_key(priv, wg_bin)
-    
     admin_val = 1 if args.admin else 0
     internet_val = 1 if (args.admin or args.internet) else 0
     blocked_val = 1 if args.block else 0
+    backend = require_backend()
+    if backend == "awg" and internet_val and not blocked_val:
+        get_wan_interface(ip)
+        public_client_firewall_rules()
+    wg_bin = get_wg_cmd()
+    priv = run_cmd(f"{wg_bin} genkey")
+    pub = derive_public_key(priv, wg_bin)
     
     conn.execute(
         "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1475,8 +1600,14 @@ def cmd_add(args):
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     cfg_path = write_client_config(row)
 
-    if get_backend() == "awg":
-        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    if backend == "awg":
+        try:
+            _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+        except Exception as e:
+            raise RuntimeError(
+                f"Учётная запись '{args.name}' сохранена, но применение не завершено: {e}. "
+                "Не включайте клиент; проверьте list/health и устраните причину перед повторным sync"
+            ) from e
     elif not blocked_val:
         run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
         if internet_val:
