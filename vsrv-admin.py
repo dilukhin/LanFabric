@@ -17,6 +17,8 @@ import secrets
 import re
 import time
 import json
+import base64
+import binascii
 try:
     import fcntl
 except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
@@ -32,12 +34,23 @@ VPN_NET = "10.8.0.0/24"
 CONF_DIR = "/opt/vpn-admin/configs"
 WG_DIR = "/etc/wireguard"
 WG_BASE_PORT = 51820
+LISTEN_PORT_PATH = "/opt/vpn-admin/listen_port"
 BACKEND_PATH = "/opt/vpn-admin/backend"
 REMOTE_DIR = "/opt/vpn-admin"
 SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
 SUDOERS_LANFABRIC_GLOB = "/etc/sudoers.d/lanfabric-*"
 AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
 AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+AWG31_EXTRA_KEYS = (
+    "S3", "S4", "HeaderProtectionKey", "RekeyAfterTime", "RekeyTimeout",
+    "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts",
+    "ContentPaddingAddition", "RandomTrailers", "DisableCookies",
+)
+AWG31_PARAM_KEYS = AWG_PARAM_KEYS + AWG31_EXTRA_KEYS
+AWG31_TIMER_KEYS = (
+    "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
+    "MaxHandshakeAttempts", "ContentPaddingAddition",
+)
 LOCK_DIR = "/run/lanfabric"
 LOCK_PATH = f"{LOCK_DIR}/runtime.lock"
 LOCK_TIMEOUT_SECONDS = 20
@@ -209,8 +222,12 @@ def derive_public_key(private_key, wg_bin):
         raise RuntimeError(f"{wg_bin} вернул публичный ключ некорректного формата")
     return public_key
 
-def generate_awg_params():
-    """Генерирует параметры маскировки AmneziaWG для сервера и клиентов."""
+def generate_awg_params(profile="legacy"):
+    """Генерирует явно выбранный профиль без изменения сохранённого состояния."""
+    if profile == "awg31":
+        return generate_awg31_params()
+    if profile != "legacy":
+        raise RuntimeError("Неизвестный профиль AmneziaWG; допустимы legacy и awg31")
     s1 = 15 + secrets.randbelow(136)
     s2 = 15 + secrets.randbelow(136)
     while s1 + 56 == s2:
@@ -233,38 +250,99 @@ def generate_awg_params():
         "H4": h4,
     }
 
+def generate_awg31_params():
+    """Создаёт полный профиль AWG 3.1 по официальному профилю клиента 5.0.3.0."""
+    return {
+        "Jc": 4 + secrets.randbelow(3), "Jmin": 10, "Jmax": 50,
+        "S1": 12, "S2": 12, "S3": 12, "S4": 12,
+        "H1": 1, "H2": 2, "H3": 3, "H4": 4,
+        "HeaderProtectionKey": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        "RekeyAfterTime": "100-120", "RekeyTimeout": "3-7",
+        "RejectAfterTime": "150-180", "KeepaliveTimeout": "5-15",
+        "MaxHandshakeAttempts": "15-20", "ContentPaddingAddition": "10-100",
+        "RandomTrailers": "on", "DisableCookies": "on",
+    }
+
+def _validate_awg_number(value, key, maximum, minimum=0):
+    """Проверяет целое или диапазон, не включая исходное значение в ошибку."""
+    text = str(value)
+    match = re.fullmatch(r"([0-9]{1,10})(?:-([0-9]{1,10}))?", text)
+    if not match:
+        raise RuntimeError(f"Некорректный параметр AmneziaWG {key}: ожидается число или диапазон")
+    lower = int(match.group(1))
+    upper = int(match.group(2)) if match.group(2) is not None else lower
+    if not minimum <= lower <= upper <= maximum:
+        raise RuntimeError(f"Некорректный диапазон параметра AmneziaWG {key}")
+    normalized = lower if match.group(2) is None else f"{lower}-{upper}"
+    return normalized, lower, upper
+
 def validate_awg_params(params):
-    """Проверяет параметры AmneziaWG перед применением."""
-    missing = [key for key in AWG_PARAM_KEYS if key not in params]
+    """Строго проверяет прежний или полный современный профиль без потери полей."""
+    unsupported = set(params) - set(AWG31_PARAM_KEYS)
+    if unsupported:
+        raise RuntimeError("В профиле AmneziaWG есть неподдерживаемые поля; I1-I5 пока не поддерживаются")
+    modern = any(key in params for key in AWG31_EXTRA_KEYS)
+    required = AWG31_PARAM_KEYS if modern else AWG_PARAM_KEYS
+    missing = [key for key in required if key not in params]
     if missing:
         raise RuntimeError("В параметрах AmneziaWG отсутствуют поля: " + ", ".join(missing))
 
-    try:
-        values = {key: int(params[key]) for key in AWG_PARAM_KEYS}
-    except (TypeError, ValueError) as e:
-        raise RuntimeError(f"Параметры AmneziaWG должны быть целыми числами: {e}")
+    values = {}
+    bounds = {}
+    for key in required:
+        if key == "HeaderProtectionKey":
+            try:
+                value = params[key]
+                if not isinstance(value, str):
+                    raise ValueError
+                decoded = base64.b64decode(value, validate=True)
+                if len(decoded) != 32 or not any(decoded) or base64.b64encode(decoded).decode("ascii") != value:
+                    raise ValueError
+            except (ValueError, TypeError, binascii.Error):
+                raise RuntimeError("Некорректный HeaderProtectionKey: требуется ключ из 32 байт в base64") from None
+            values[key] = value
+        elif key in ("RandomTrailers", "DisableCookies"):
+            value = str(params[key]).lower()
+            if value not in ("on", "off"):
+                raise RuntimeError(f"Некорректный параметр AmneziaWG {key}: ожидается on или off")
+            values[key] = value
+        else:
+            maximum = 4294967295 if key.startswith("H") else 65535
+            minimum = 1 if key == "Jc" else 0
+            value, lower, upper = _validate_awg_number(params[key], key, maximum, minimum)
+            if not isinstance(value, int) and key not in AWG31_TIMER_KEYS and not key.startswith("H"):
+                raise RuntimeError(f"Параметр AmneziaWG {key} должен быть целым числом")
+            if not modern and not isinstance(value, int):
+                raise RuntimeError(f"Диапазон {key} требует полного профиля AWG 3.1")
+            values[key] = value
+            bounds[key] = (lower, upper)
 
-    if not 1 <= values["Jc"] <= 128:
-        raise RuntimeError("Некорректный параметр AmneziaWG Jc: ожидается 1..128")
-    if not 0 <= values["Jmin"] < values["Jmax"] <= 1280:
-        raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax: ожидается 0 <= Jmin < Jmax <= 1280")
-    if not 0 <= values["S1"] <= 1132:
-        raise RuntimeError("Некорректный параметр AmneziaWG S1: ожидается 0..1132")
-    if not 0 <= values["S2"] <= 1188:
-        raise RuntimeError("Некорректный параметр AmneziaWG S2: ожидается 0..1188")
-    if values["S1"] + 56 == values["S2"]:
-        raise RuntimeError("Некорректные параметры AmneziaWG: S1 + 56 не должно совпадать с S2")
+    if (bounds["Jmin"][1] > bounds["Jmax"][0] or
+            (not modern and bounds["Jmin"][1] == bounds["Jmax"][0])):
+        raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax")
+    if modern:
+        if any(bounds[key][0] < 12 for key in ("S1", "S2", "S3", "S4")):
+            raise RuntimeError("Параметры S1-S4 с HeaderProtectionKey должны быть не меньше 12")
+    else:
+        if not 1 <= values["Jc"] <= 128:
+            raise RuntimeError("Некорректный параметр AmneziaWG Jc: ожидается 1..128")
+        if values["Jmax"] > 1280:
+            raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax: ожидается Jmax <= 1280")
+        if values["S1"] > 1132 or values["S2"] > 1188:
+            raise RuntimeError("Некорректные параметры AmneziaWG S1/S2")
+        if values["S1"] + 56 == values["S2"]:
+            raise RuntimeError("Некорректные параметры AmneziaWG: S1 + 56 не должно совпадать с S2")
+        if any(not 5 <= values[key] <= 2147483647 for key in ("H1", "H2", "H3", "H4")):
+            raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть в диапазоне 5..2147483647")
 
-    headers = [values["H1"], values["H2"], values["H3"], values["H4"]]
-    if len(set(headers)) != 4:
-        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть уникальными")
-    if any(value < 5 or value > 2147483647 for value in headers):
-        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть в диапазоне 5..2147483647")
-
+    headers = [bounds[key] for key in ("H1", "H2", "H3", "H4")]
+    for i, (lower, upper) in enumerate(headers):
+        if any(lower <= other_upper and other_lower <= upper for other_lower, other_upper in headers[:i]):
+            raise RuntimeError("Параметры AmneziaWG H1-H4 не должны пересекаться")
     return values
 
 def read_awg_params_file():
-    """Читает параметры AmneziaWG из файла."""
+    """Читает профиль без создания состояния и без вывода его содержимого."""
     params = {}
     with open(AWG_PARAMS_PATH, "r", encoding="utf-8") as f:
         for line in f:
@@ -272,39 +350,65 @@ def read_awg_params_file():
             if not line or line.startswith("#"):
                 continue
             if "=" not in line:
-                raise RuntimeError(f"Некорректная строка параметров AmneziaWG: {line}")
+                raise RuntimeError("Некорректная строка параметров AmneziaWG")
             key, value = line.split("=", 1)
-            params[key.strip()] = value.strip()
+            key = key.strip()
+            if key in params:
+                raise RuntimeError("Повторяющееся поле параметров AmneziaWG")
+            params[key] = value.strip()
     return validate_awg_params(params)
 
 def write_awg_params_file(params):
-    """Сохраняет параметры AmneziaWG."""
+    """Сохраняет все проверенные поля с правами 0600."""
     params = validate_awg_params(params)
     Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True)
-    text = "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS) + "\n"
-    Path(AWG_PARAMS_PATH).write_text(text, encoding="utf-8")
-    os.chmod(AWG_PARAMS_PATH, 0o600)
+    write_private_file(AWG_PARAMS_PATH, format_awg_params(params) + "\n")
 
-def get_or_create_awg_params():
-    """Возвращает сохранённые параметры AmneziaWG или создаёт новые."""
+def get_or_create_awg_params(profile="legacy"):
+    """Создаёт профиль только при отсутствии файла и явно заданном формате."""
+    if profile not in ("legacy", "awg31"):
+        raise RuntimeError("Неизвестный профиль AmneziaWG; допустимы legacy и awg31")
     if os.path.exists(AWG_PARAMS_PATH):
-        return read_awg_params_file()
+        params = read_awg_params_file()
+        actual = "awg31" if "HeaderProtectionKey" in params else "legacy"
+        if profile != actual:
+            raise RuntimeError("Сохранённый профиль AmneziaWG отличается от выбранного; автоматическая замена запрещена")
+        return params
 
-    params = generate_awg_params()
+    params = generate_awg_params(profile=profile)
     write_awg_params_file(params)
     log.info(f"Параметры AmneziaWG созданы: {AWG_PARAMS_PATH}")
     return params
 
 def format_awg_params(params):
-    """Формирует блок параметров AmneziaWG для .conf."""
+    """Формирует полный проверенный блок параметров для .conf."""
     params = validate_awg_params(params)
-    return "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS)
+    keys = AWG31_PARAM_KEYS if "HeaderProtectionKey" in params else AWG_PARAM_KEYS
+    return "\n".join(f"{key} = {params[key]}" for key in keys)
 
-def build_setconf(priv, backend, awg_params=None):
+def validate_listen_port(value):
+    """Проверяет порт без включения исходного значения в ошибку."""
+    if not re.fullmatch(r"[0-9]{1,5}", str(value)) or not 1 <= int(value) <= 65535:
+        raise RuntimeError("ListenPort должен быть целым числом 1..65535")
+    return int(value)
+
+def read_listen_port():
+    """Отсутствие файла означает прежний порт; повреждение не исправляется."""
+    try:
+        value = Path(LISTEN_PORT_PATH).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return WG_BASE_PORT
+    return validate_listen_port(value)
+
+def write_listen_port(value):
+    write_private_file(LISTEN_PORT_PATH, str(validate_listen_port(value)) + "\n")
+
+def build_setconf(priv, backend, awg_params=None, listen_port=None):
     """Формирует конфиг для wg/awg setconf без неявного создания состояния."""
+    port = read_listen_port() if listen_port is None else validate_listen_port(listen_port)
     conf = f"""[Interface]
 PrivateKey = {priv}
-ListenPort = {WG_BASE_PORT}
+ListenPort = {port}
 """
     if backend == "awg":
         params = read_awg_params_file() if awg_params is None else validate_awg_params(awg_params)
@@ -324,10 +428,10 @@ def write_private_file(path, content):
         if fd is not None:
             os.close(fd)
 
-def write_setconf(priv, backend, awg_params=None):
+def write_setconf(priv, backend, awg_params=None, listen_port=None):
     """Сохраняет производный конфиг для wg/awg setconf."""
     setconf_path = Path(f"/etc/wireguard/{WG_IF}.setconf")
-    write_private_file(setconf_path, build_setconf(priv, backend, awg_params=awg_params))
+    write_private_file(setconf_path, build_setconf(priv, backend, awg_params=awg_params, listen_port=listen_port))
     return setconf_path
 
 def ensure_awg_setconf():
@@ -404,6 +508,7 @@ def load_state_snapshot(expected_backend=None):
         raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
     priv, pub = read_server_key_material(backend)
     awg_params = read_awg_params_file() if backend == "awg" else None
+    listen_port = read_listen_port()
     conn = init_db(read_only=True)
     try:
         quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
@@ -415,7 +520,7 @@ def load_state_snapshot(expected_backend=None):
     finally:
         conn.close()
     validate_user_rows(rows, wg_bin)
-    return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "users": rows}
+    return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "listen_port": listen_port, "users": rows}
 
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
@@ -778,13 +883,18 @@ def _restore_awg_runtime_locked(snapshot):
     try:
         run_cmd("modprobe amneziawg")
         setconf_path = str(write_setconf(
-            snapshot["server_private_key"], "awg", awg_params=snapshot["awg_params"]
+            snapshot["server_private_key"], "awg", awg_params=snapshot["awg_params"],
+            listen_port=snapshot.get("listen_port", WG_BASE_PORT)
         ))
         if created:
             run_cmd(f"ip link add {WG_IF} type amneziawg")
         else:
             run_cmd(f"ip link set down dev {WG_IF}")
-        run_cmd(f"awg setconf {WG_IF} {setconf_path}")
+        try:
+            run_cmd(f"awg setconf {WG_IF} {setconf_path}")
+        except (RuntimeError, OSError):
+            # tools может включить отвергнутую строку с HPK в stderr.
+            raise RuntimeError("Не удалось применить конфигурацию AWG; проверьте совместимость tools и модуля") from None
         run_cmd(f"ip -4 addr flush dev {WG_IF}")
         run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
         snapshot = prepare_internet_policy(snapshot)
@@ -971,9 +1081,11 @@ def state_permission_errors():
 
     for path_text in (
         f"{REMOTE_DIR}/vsrv-admin.py", DB_PATH, BACKEND_PATH,
-        AWG_PARAMS_PATH, f"{WG_DIR}/{WG_IF}.private",
+        AWG_PARAMS_PATH, f"{WG_DIR}/{WG_IF}.private", LISTEN_PORT_PATH,
     ):
         path = Path(path_text)
+        if path_text == LISTEN_PORT_PATH and not path.exists():
+            continue  # прежнее состояние без файла порта поддерживается
         try:
             st = path.stat()
         except OSError as e:
@@ -1207,6 +1319,7 @@ def ensure_state_permissions():
         Path(DB_PATH),
         Path(BACKEND_PATH),
         Path(AWG_PARAMS_PATH),
+        Path(LISTEN_PORT_PATH),
         Path(WG_DIR) / f"{WG_IF}.private",
         Path(WG_DIR) / f"{WG_IF}.setconf",
     ]
@@ -1227,6 +1340,23 @@ def ensure_state_permissions():
 
 def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
+    # Проверить выбор и существующее состояние до очистки ключей/БД/runtime.
+    requested_port = getattr(args, "listen_port", None)
+    listen_port = read_listen_port() if requested_port is None else validate_listen_port(requested_port)
+    profile = getattr(args, "awg_profile", None)
+    if args.no_amnezia and profile is not None:
+        raise RuntimeError("--awg-profile несовместим с --no-amnezia")
+    awg_params = None
+    if not args.no_amnezia:
+        if profile not in (None, "legacy", "awg31"):
+            raise RuntimeError("Неизвестный профиль AmneziaWG")
+        if os.path.exists(AWG_PARAMS_PATH):
+            awg_params = read_awg_params_file()
+            saved_profile = "awg31" if "HeaderProtectionKey" in awg_params else "legacy"
+            if profile is not None and profile != saved_profile:
+                raise RuntimeError("Сохранённый профиль отличается от выбранного; автоматическая замена запрещена")
+        else:
+            awg_params = validate_awg_params(generate_awg_params(profile=profile or "legacy"))
     log.info("Начало инициализации сервера")
     ensure_dirs()
     ensure_state_permissions()
@@ -1342,14 +1472,16 @@ def cmd_init(args):
     conf = f"""[Interface]
 PrivateKey = {priv}
 Address = {SERVER_IP}/24
-ListenPort = {WG_BASE_PORT}
+ListenPort = {listen_port}
 PostUp = iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -A FORWARD -i {WG_IF} -j DROP
 PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORWARD -i {WG_IF} -j DROP || true
 """
     write_private_file(f"/etc/wireguard/{WG_IF}.conf", conf)
 
-    awg_params = get_or_create_awg_params() if backend == "awg" else None
-    write_setconf(priv, backend, awg_params=awg_params)
+    write_listen_port(listen_port)
+    if backend == "awg":
+        write_awg_params_file(awg_params)
+    write_setconf(priv, backend, awg_params=awg_params, listen_port=listen_port)
 
     # --- Поднятие интерфейса ---
     log.info("Запуск интерфейса")
@@ -1363,7 +1495,7 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
 
     # --- Проверка ---
     run_cmd("ip link show wg0")
-    run_cmd(f"{wg_bin} show {WG_IF}")
+    run_cmd(f"{wg_bin} show {WG_IF} public-key")
 
     # --- Сохранение правил ---
     run_cmd("netfilter-persistent save")
@@ -1430,6 +1562,42 @@ def _active_users(snapshot):
 def _expected_peer_map(snapshot):
     return {row["pubkey"]: f"{row['ip']}/32" for row in _active_users(snapshot)}
 
+def awg31_runtime_errors(params):
+    """Сверяет применённые поля; секретные ответы никогда не включаются в ошибки."""
+    if not params or "HeaderProtectionKey" not in params:
+        return []
+    fields = {key: key.lower() for key in AWG_PARAM_KEYS + ("S3", "S4")}
+    fields.update({
+        "HeaderProtectionKey": "header-protection-key",
+        "ContentPaddingAddition": "content-padding-addition",
+        "RekeyAfterTime": "rekey-after-time", "RekeyTimeout": "rekey-timeout",
+        "RejectAfterTime": "reject-after-time", "KeepaliveTimeout": "keepalive-timeout",
+        # В закреплённом upstream tools v3.1.20260812 поле действительно содержит эту опечатку.
+        "MaxHandshakeAttempts": "max-handshake-attemps",
+        "RandomTrailers": "random-trailers", "DisableCookies": "disable-cookies",
+    })
+    for key, field in fields.items():
+        try:
+            result = subprocess.run(["awg", "show", WG_IF, field], capture_output=True,
+                                    text=True, timeout=2)
+            if result.returncode != 0:
+                return [f"AWG 3.1: невозможно прочитать поле {key}"]
+            actual = result.stdout.strip()
+            if key == "HeaderProtectionKey":
+                matches = secrets.compare_digest(actual, str(params[key]))
+            elif key in ("RandomTrailers", "DisableCookies"):
+                matches = actual == params[key]
+            else:
+                maximum = 4294967295 if key.startswith("H") else 65535
+                _, lower, upper = _validate_awg_number(actual, key, maximum)
+                _, expected_lower, expected_upper = _validate_awg_number(params[key], key, maximum)
+                matches = (lower, upper) == (expected_lower, expected_upper)
+            if not matches:
+                return [f"AWG 3.1: применённое поле {key} не совпадает с сохранённым"]
+        except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+            return [f"AWG 3.1: не удалось проверить поле {key}"]
+    return []
+
 def runtime_readiness_errors(snapshot, check_firewall=True):
     """Возвращает нарушения обязательных runtime-инвариантов без изменения системы."""
     errors = []
@@ -1456,9 +1624,12 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
     expected_address = f"{SERVER_IP}/24"
     if addresses != [expected_address]:
         errors.append(f"IPv4-адрес интерфейса {WG_IF}: ожидался только {expected_address}, получено {', '.join(addresses) or 'нет'}")
+    port = snapshot.get("listen_port", WG_BASE_PORT)
     listen_port = run_cmd(f"{wg_bin} show {WG_IF} listen-port", check=False).strip()
-    if listen_port != str(WG_BASE_PORT):
-        errors.append(f"ListenPort: ожидался {WG_BASE_PORT}, получено {listen_port or 'нет'}")
+    if listen_port != str(port):
+        errors.append(f"ListenPort: ожидался {port}, получено {listen_port or 'нет'}")
+    if backend == "awg":
+        errors.extend(awg31_runtime_errors(snapshot.get("awg_params")))
     actual_peers = set(filter(None, run_cmd(f"{wg_bin} show {WG_IF} peers", check=False).splitlines()))
     expected_peers = set(_expected_peer_map(snapshot))
     if actual_peers != expected_peers:
@@ -1470,8 +1641,8 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
             allowed[parts[0]] = " ".join(parts[1:])
     if allowed != _expected_peer_map(snapshot):
         errors.append("AllowedIPs peers не совпадают с адресами активных пользователей БД")
-    if not run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False):
-        errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
+    if not run_cmd(f"ss -ulnH 'sport = :{port}'", check=False):
+        errors.append(f"Порт {port}/UDP не слушается")
     if run_cmd("sysctl -n net.ipv4.ip_forward", check=False).strip() != "1":
         errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
     if backend == "wg":
@@ -1532,10 +1703,12 @@ def cmd_sync():
 
 def build_client_config(row, endpoint=None):
     """Формирует клиентский конфиг из данных БД."""
-    server_pub = open(f"/etc/wireguard/{WG_IF}.public").read().strip()
+    with open(f"{WG_DIR}/{WG_IF}.public") as public_file:
+        server_pub = public_file.read().strip()
     server_ip = str(endpoint).strip() if endpoint else run_cmd("hostname -I | awk '{print $1}'").strip()
     allowed_ips = "0.0.0.0/0" if row["internet"] else VPN_NET
     backend = require_backend()
+    listen_port = read_listen_port()
     awg_params = ""
     if backend == "awg":
         awg_params = "\n" + format_awg_params(read_awg_params_file())
@@ -1547,7 +1720,7 @@ DNS = 8.8.8.8{awg_params}
 
 [Peer]
 PublicKey = {server_pub}
-Endpoint = {server_ip}:{WG_BASE_PORT}
+Endpoint = {server_ip}:{listen_port}
 AllowedIPs = {allowed_ips}
 PersistentKeepalive = 25
 """
@@ -1810,7 +1983,10 @@ def main():
     parser = argparse.ArgumentParser(description="Серверное управление VPN-сетью", add_help=False)
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("init", help="Инициализация сервера и установка пакетов").add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    p_init = subparsers.add_parser("init", help="Инициализация сервера и установка пакетов")
+    p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    p_init.add_argument("--listen-port", type=int, default=None, help="UDP-порт 1..65535; при отсутствии сохраняется прежний")
+    p_init.add_argument("--awg-profile", choices=["legacy", "awg31"], default=None, help="Профиль AWG; существующий не заменяется, новый по умолчанию legacy")
     subparsers.add_parser("backend", help="Вывести сохранённый backend")
     subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
     subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
