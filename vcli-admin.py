@@ -1054,6 +1054,12 @@ def cmd_untrust(args):
 
 def cmd_init(args):
     """Создание среды на сервере."""
+    port = getattr(args, "listen_port", None)
+    profile = getattr(args, "awg_profile", None)
+    if port is not None and not 1 <= port <= 65535:
+        raise RuntimeError("ListenPort должен быть целым числом 1..65535")
+    if args.no_amnezia and profile is not None:
+        raise RuntimeError("--awg-profile несовместим с --no-amnezia")
     log.info("Проверка соединения с сервером")
     try:
         exec_remote(args, ["whoami"])
@@ -1085,6 +1091,10 @@ def cmd_init(args):
     init_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "init"]
     if args.no_amnezia:
         init_cmd.append("--no-amnezia")
+    if port is not None:
+        init_cmd.extend(["--listen-port", str(port)])
+    if profile is not None:
+        init_cmd.extend(["--awg-profile", profile])
     exec_remote(args, init_cmd)
     log.info("Среда успешно создана и проверена")
 
@@ -1618,6 +1628,8 @@ def main():
 
     p_init = subparsers.add_parser("init", help="Развёртывание среды на сервере")
     p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    p_init.add_argument("--listen-port", type=int, default=None, help="UDP-порт 1..65535; при отсутствии сохраняется прежний")
+    p_init.add_argument("--awg-profile", choices=["legacy", "awg31"], default=None, help="Профиль AWG; новый по умолчанию legacy, существующий не заменяется")
 
     subparsers.add_parser("patch", help="Обновить серверный модуль при отличии только patch-версии")
 
