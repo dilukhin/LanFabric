@@ -1106,6 +1106,8 @@ def cmd_init(args):
     profile = getattr(args, "awg_profile", None)
     if port is not None and not 1 <= port <= 65535:
         raise RuntimeError("ListenPort должен быть целым числом 1..65535")
+    if args.no_amnezia and getattr(args, "implementation", None) == "go":
+        raise RuntimeError("--implementation go несовместим с --no-amnezia")
     if args.no_amnezia and profile is not None:
         raise RuntimeError("--awg-profile несовместим с --no-amnezia")
     log.info("Проверка соединения с сервером")
@@ -1137,6 +1139,8 @@ def cmd_init(args):
     
     log.info("Запуск инициализации на сервере")
     init_cmd = ["sudo", "python3", "-u", REMOTE_SCRIPT, "init"]
+    if getattr(args, "implementation", None) is not None:
+        init_cmd.extend(["--implementation", args.implementation])
     if args.no_amnezia:
         init_cmd.append("--no-amnezia")
     if port is not None:
@@ -1704,6 +1708,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True, help="Команда управления")
 
     p_init = subparsers.add_parser("init", help="Развёртывание среды на сервере")
+    p_init.add_argument("--implementation", choices=["kernel", "go"], default=None, help="Явный выбор реализации AWG; Go устанавливается только на чистой цели")
     p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
     p_init.add_argument("--listen-port", type=int, default=None, help="UDP-порт 1..65535; при отсутствии сохраняется прежний")
     p_init.add_argument("--awg-profile", choices=["legacy", "awg31"], default=None, help="Профиль AWG; новый по умолчанию legacy, существующий не заменяется")

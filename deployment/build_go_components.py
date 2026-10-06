@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import runpy
+import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,6 +45,21 @@ def main():
         previous = hashes
     for name, value in sorted(hashes.items()):
         print("COMPONENT_SHA256 " + name + " " + value, flush=True)
+    srv = runpy.run_path(str(ROOT / "vsrv-admin.py"))
+    for name, expected in srv["AWG_GO_RELEASE_SHA256"].items():
+        if hashes[name + "-linux-amd64"] != expected:
+            raise RuntimeError("Сборка отличается от закреплённого компонента")
+    # Объектные файлы позволяют повторную компоновку статической управляющей утилиты.
+    metadata = out / "LINKING.txt"
+    compiler = subprocess.check_output(["gcc", "--version"], text=True).splitlines()[0]
+    libc = subprocess.check_output(["dpkg-query", "-W", "-f=${Version}", "libc6-dev"], text=True)
+    metadata.write_text("gcc *.o -static -o awg\n" + compiler + "\nlibc6-dev=" + libc +
+                        "\nИсходники libc: https://launchpad.net/ubuntu/+source/glibc/" + libc + "\n")
+    with tarfile.open(out / "awg-tools-link-inputs.tar.gz", "w:gz") as archive:
+        archive.add(metadata, arcname="LINKING.txt")
+        for path in sorted((ROOT / "ci-src/tools").rglob("*")):
+            if path.is_file() and ".git" not in path.relative_to(ROOT / "ci-src/tools").parts and path.name != "wg":
+                archive.add(path, arcname="amneziawg-tools/" + str(path.relative_to(ROOT / "ci-src/tools")))
     # Существующее испытание службы использует те же готовые компоненты.
     shutil.copyfile(out / "amneziawg-go-linux-amd64", go / "amneziawg-go")
     shutil.copyfile(out / "awg-linux-amd64", tools / "wg")

@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import time
+import io
+from unittest.mock import patch
 
 GO_COMMIT = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
 TOOLS_COMMIT = "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
@@ -54,48 +56,34 @@ def main():
     installed = root / "vsrv-admin.py"
     shutil.copyfile(repository / "vsrv-admin.py", installed)
     installed.chmod(0o600)
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("srv_ci", installed)
     srv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(srv)
     old_forward = run(["sysctl", "-n", "net.ipv4.ip_forward"])
     fingerprints = {}
     try:
-        print("Подготовка синтетического состояния без публикации ключей", flush=True)
-        srv.ensure_dirs()
-        binaries = root / "awg-go"
-        binaries.mkdir(mode=0o700)
-        for source, name in ((repository / "ci-src/go/amneziawg-go", "amneziawg-go"),
-                             (repository / "ci-src/tools/src/wg", "awg")):
-            shutil.copyfile(source, binaries / name)
-            (binaries / name).chmod(0o700)
-        srv.write_private_file(srv.BACKEND_PATH, "awg\n")
-        srv.write_private_file(srv.IMPLEMENTATION_PATH, "go\n")
-        srv.write_private_file(srv.AWG_GO_MANIFEST, json.dumps({
-            "schema": 1, "platform": "linux-amd64", "go_commit": GO_COMMIT, "tools_commit": TOOLS_COMMIT,
-            "sha256": {name: digest(binaries / name) for name in ("amneziawg-go", "awg")}}) + "\n")
-        for name in ("server", "ci-peer"):
-            private = run([srv.AWG_GO_TOOLS, "genkey"])
-            public = srv.derive_public_key(private, srv.AWG_GO_TOOLS)
-            if name == "server":
-                srv.write_private_file("/etc/wireguard/wg0.private", private + "\n")
-                srv.write_private_file("/etc/wireguard/wg0.public", public + "\n")
-            else:
-                connection = srv.init_db(create=True)
-                connection.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                   (name, public, private, "10.8.0.2", 0, 1, 0, "синтетический участник"))
-                connection.commit()
-                connection.close()
-        srv.write_awg_params_file(srv.generate_awg31_params())
-        srv.write_listen_port(4387)
-        run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
-        srv.ensure_state_permissions()
+        print("Чистая установка штатным init с готовыми компонентами", flush=True)
+        # До публикации выпуска источник загрузки заменён байтами той же CI-сборки.
+        # Проверки SHA-256, доверенных путей и весь установочный путь остаются штатными.
+        def component_response(url, timeout):
+            prefix = "https://github.com/dilukhin/LanFabric/releases/download/" + srv.AWG_GO_RELEASE + "/"
+            if not url.startswith(prefix):
+                raise RuntimeError("Неожиданный источник компонента")
+            filename = url[len(prefix):]
+            if filename not in ("amneziawg-go-linux-amd64", "awg-linux-amd64"):
+                raise RuntimeError("Неожиданный компонент")
+            response = io.BytesIO((repository / "ci-dist" / filename).read_bytes())
+            response.geturl = lambda: url
+            return response
+        with patch.object(srv.urllib.request, "urlopen", side_effect=component_response), \
+                patch.object(sys, "argv", [str(installed), "init", "--implementation", "go", "--listen-port", "4387"]):
+            srv.main()
+        run(["/usr/bin/python3", str(installed), "add", "ci-peer", "--internet"])
         # Контрольный снимок содержит только хеши; значения не выводятся.
         for path in (srv.DB_PATH, srv.AWG_PARAMS_PATH, "/etc/wireguard/wg0.private", "/etc/wireguard/wg0.public", srv.LISTEN_PORT_PATH):
             fingerprints[path] = digest(path)
-        srv.ensure_awg_autostart_unit()
-        print("Предварительная проверка до появления TUN", flush=True)
-        with srv.runtime_lock():
-            srv.go_preflight_locked()
+        run(["/usr/bin/python3", str(installed), "init", "--implementation", "go"])
         for action in ("start", "start", "sync", "restart", "stop", "start"):
             print("Штатная команда: " + action, flush=True)
             run(["/usr/bin/python3", str(installed), action])
@@ -124,7 +112,26 @@ def main():
             raise RuntimeError("Служба не восстановилась после SIGKILL в установленный срок")
         if any(digest(path) != expected for path, expected in fingerprints.items()):
             raise RuntimeError("Аварийное восстановление изменило сохранённое состояние")
-        print("PASS: настоящий Go, полный профиль, systemd, повторный start, restart, stop и SIGKILL", flush=True)
+        print("Удаление службы и повторная установка без смены профилей", flush=True)
+        run(["/usr/bin/python3", str(installed), "remove", "REMOVE"])
+        if Path(srv.AWG_GO_UNIT_PATH).exists() or srv.interface_exists():
+            raise RuntimeError("Служба сохранилась после remove")
+        run(["/usr/bin/python3", str(installed), "init", "--implementation", "go"])
+        run(["/usr/bin/python3", str(installed), "health"])
+        if any(digest(path) != expected for path, expected in fingerprints.items()):
+            raise RuntimeError("Повтор установки изменил сохранённое состояние")
+        # Чужой файл запрещает purge до остановки текущего VPN.
+        foreign = root / "foreign-data"
+        foreign.write_text("synthetic foreign resource")
+        rejected = subprocess.run(["/usr/bin/python3", str(installed), "purge", "PURGE"], capture_output=True, timeout=90)
+        if rejected.returncode == 0 or not foreign.exists():
+            raise RuntimeError("Purge не защитил чужой файл")
+        run(["/usr/bin/python3", str(installed), "health"])
+        foreign.unlink()
+        run(["/usr/bin/python3", str(installed), "purge", "PURGE"])
+        if root.exists() or Path(srv.WG_DIR).exists() or Path(srv.AWG_GO_UNIT_PATH).exists():
+            raise RuntimeError("Собственные данные сохранились после purge")
+        print("PASS: чистый init, полный профиль, remove/reinstall/purge, защита чужих файлов и SIGKILL", flush=True)
     except Exception:
         # Только несекретные свойства службы, без showconf/dump/journal и ключей.
         print(run(["systemctl", "show", srv.AWG_GO_UNIT, "-p", "ActiveState", "-p", "SubState",

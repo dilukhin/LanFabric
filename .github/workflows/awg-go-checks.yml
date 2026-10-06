@@ -7,6 +7,7 @@ on:
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
+      - deployment/publish_go_components.py
   push:
     branches: [master]
     paths:
@@ -14,6 +15,7 @@ on:
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
+      - deployment/publish_go_components.py
 
 permissions:
   contents: read
@@ -23,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  awg-go-service:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -56,7 +58,56 @@ jobs:
           cache: false
       - name: Собрать компоненты для одноразового испытания
         run: python3 deployment/build_go_components.py
+      - name: Сохранить готовые компоненты для испытаний выпуска
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: awg-go-components
+          path: ci-dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  awg-go-service:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - name: Получить проверяемые исходники
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Получить компоненты той же сборки
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: awg-go-components
+          path: ci-dist/
       - name: Подготовить зависимости изолированной машины
         run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent
-      - name: Проверить запуск и аварийное восстановление без VPS
+      - name: Проверить чистую установку, удаление и аварийное восстановление
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_REPOSITORY,RUNNER_ENVIRONMENT /usr/bin/python3 tests_integration/run_awg_go_ci.py
+
+  publish-components:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'dilukhin/LanFabric'
+    needs: [build, awg-go-service]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Получить проверенный исходный коммит
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Получить проверенные компоненты
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: awg-go-components
+          path: ci-dist/
+      - name: Опубликовать предварительную поставку компонентов
+        env:
+          GH_COMPONENT_TOKEN: ${{ github.token }}
+        run: python3 deployment/publish_go_components.py

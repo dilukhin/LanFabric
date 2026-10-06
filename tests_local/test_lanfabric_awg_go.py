@@ -57,10 +57,11 @@ class ImplementationTests(unittest.TestCase):
             run.assert_not_called()
             directories.assert_not_called()
 
-    def test_remove_and_purge_refuse_before_system_changes(self):
+    def test_remove_and_purge_refuse_missing_state_before_system_changes(self):
         for command, confirmation in ((srv.cmd_remove, "REMOVE"), (srv.cmd_purge, "PURGE")):
             with self.subTest(command=command.__name__), patch.object(srv, "get_implementation", return_value="go"), \
-                    patch.object(srv, "run_cmd") as run, patch.object(srv, "disable_awg_autostart") as disable:
+                    patch.object(srv, "run_cmd") as run, patch.object(srv, "disable_awg_autostart") as disable, \
+                    patch.object(srv, "runtime_lock"), patch.object(srv, "load_state_snapshot", side_effect=RuntimeError("нет состояния")):
                 with self.assertRaises(RuntimeError):
                     command(SimpleNamespace(confirm=confirmation))
                 run.assert_not_called()
@@ -81,6 +82,7 @@ class ComponentTests(unittest.TestCase):
                     "sha256": {"amneziawg-go": hashlib.sha256(binary.read_bytes()).hexdigest(),
                                "awg": hashlib.sha256(tools.read_bytes()).hexdigest()}}
             with patch.object(srv, "AWG_GO_MANIFEST", str(manifest)), \
+                    patch.object(srv, "AWG_GO_RELEASE_SHA256", data["sha256"]), \
                     patch.object(srv, "AWG_GO_BINARY", str(binary)), patch.object(srv, "AWG_GO_TOOLS", str(tools)), \
                     patch.object(srv, "trusted_go_path"), \
                     patch.object(srv.os, "uname", create=True, return_value=SimpleNamespace(machine="x86_64")):
