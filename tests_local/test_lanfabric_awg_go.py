@@ -316,6 +316,19 @@ class LifecycleTests(unittest.TestCase):
             opened.assert_not_called()
             self.assertEqual(close.call_count, 2)
 
+    def test_preflight_does_not_query_forwarded_route_before_tun_exists(self):
+        with patch.object(srv, "get_implementation", return_value="go"), \
+                patch.object(srv, "state_permission_errors", return_value=[]), \
+                patch.object(srv, "require_go_components"), patch.object(srv, "require_go_unit"), \
+                patch.object(srv, "load_state_snapshot", return_value=self.state()), \
+                patch.object(srv, "close_firewall_guard"), patch.object(srv, "cleanup_go_stale_socket"), \
+                patch.object(srv, "interface_exists", return_value=False), \
+                patch.object(srv.os.path, "lexists", return_value=False), \
+                patch.object(srv, "run_cmd", side_effect=lambda c, check=True: "[]" if c.startswith("ip -j") else ""), \
+                patch.object(srv, "prepare_internet_policy") as policy:
+            srv.go_preflight_locked()
+        policy.assert_not_called()
+
     def test_main_does_not_hold_runtime_lock_while_starting_go_service(self):
         with patch.object(srv.sys, "argv", ["vsrv-admin.py", "start"]), \
                 patch.object(srv.os.path, "exists", return_value=True), \

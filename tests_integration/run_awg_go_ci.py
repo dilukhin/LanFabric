@@ -93,6 +93,9 @@ def main():
         for path in (srv.DB_PATH, srv.AWG_PARAMS_PATH, "/etc/wireguard/wg0.private", "/etc/wireguard/wg0.public", srv.LISTEN_PORT_PATH):
             fingerprints[path] = digest(path)
         srv.ensure_awg_autostart_unit()
+        print("Предварительная проверка до появления TUN", flush=True)
+        with srv.runtime_lock():
+            srv.go_preflight_locked()
         for action in ("start", "start", "sync", "restart", "stop", "start"):
             print("Штатная команда: " + action, flush=True)
             run(["/usr/bin/python3", str(installed), action])

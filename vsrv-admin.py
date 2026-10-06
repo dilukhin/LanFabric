@@ -350,7 +350,8 @@ def go_preflight_locked():
         if entry.get("dst", "default") != "default" and ipaddress.ip_network(VPN_NET).overlaps(
                 ipaddress.ip_network(entry["dst"], strict=False)):
             raise RuntimeError("Подсеть AWG Go пересекается с существующим маршрутом")
-    prepare_internet_policy(snapshot)
+    # Проверка пересылаемого WAN-пути требует уже созданного входного wg0.
+    # Она выполняется в go_restore_locked при закрытой защитной цепочке.
 
 def record_go_socket(pid):
     """Запоминает конкретный сокет только после независимого доказательства владения."""
