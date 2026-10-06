@@ -1,0 +1,68 @@
+name: Проверка настоящей службы AWG Go
+
+on:
+  pull_request:
+    paths:
+      - vsrv-admin.py
+      - tests_integration/run_awg_go_ci.py
+      - .github/workflows/awg-go-checks.yml
+  push:
+    branches: [master]
+    paths:
+      - vsrv-admin.py
+      - tests_integration/run_awg_go_ci.py
+      - .github/workflows/awg-go-checks.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awg-go-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  awg-go-service:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Получить проверяемые исходники LanFabric
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Получить закреплённый Go-компонент
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: amnezia-vpn/amneziawg-go
+          ref: b5928efb6ca19f0153958460c3d141f04abc5c2e
+          path: ci-src/go
+          persist-credentials: false
+      - name: Получить закреплённые управляющие утилиты
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: amnezia-vpn/amneziawg-tools
+          ref: ee0f0a9aa34ff0a0da4b3433b9512781cfe02843
+          path: ci-src/tools
+          persist-credentials: false
+      - name: Подготовить закреплённый компилятор Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Собрать компоненты для одноразового испытания
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+          GOTOOLCHAIN: local
+        run: |
+          cd ci-src/go
+          go build -trimpath -buildvcs=false -o amneziawg-go .
+          make -C ../tools/src -j2 wg
+      - name: Подготовить зависимости изолированной машины
+        run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent
+      - name: Проверить запуск и аварийное восстановление без VPS
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_REPOSITORY,RUNNER_ENVIRONMENT /usr/bin/python3 tests_integration/run_awg_go_ci.py
