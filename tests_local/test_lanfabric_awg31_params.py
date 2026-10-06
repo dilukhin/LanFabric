@@ -21,6 +21,14 @@ def legacy_params():
 
 class TestAwg31Params(unittest.TestCase):
 
+    def setUp(self):
+        if os.name == "nt":
+            # Сервер работает на Linux. Windows проверяет формат и вызов
+            # защиты файла; фактические POSIX-права проверяются на Ubuntu.
+            mode_patch = patch.object(srv.os, "fchmod", create=True)
+            self.addCleanup(mode_patch.stop)
+            self.mode_change = mode_patch.start()
+
     def test_generator_has_complete_upstream_profile_and_fresh_key(self):
         first = srv.generate_awg_params("awg31")
         second = srv.generate_awg31_params()
@@ -50,7 +58,11 @@ class TestAwg31Params(unittest.TestCase):
                  patch.object(srv, "WG_DIR", tmp), patch.object(srv, "require_backend", return_value="awg"):
                 srv.write_awg_params_file(params)
                 self.assertEqual(srv.read_awg_params_file(), params)
-                self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+                if os.name == "posix":
+                    self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+                else:
+                    self.mode_change.assert_called_once()
+                    self.assertEqual(self.mode_change.call_args.args[1], 0o600)
                 server = srv.build_setconf("B" * 43 + "=", "awg")
                 row = dict(privkey="C" * 43 + "=", ip="10.8.0.2", internet=1)
                 # build_client_config сохраняет прежний абсолютный путь public key.

@@ -88,10 +88,10 @@ class TestServiceInputs(unittest.TestCase):
                 run.assert_not_called()
 
     def test_untrusted_script_never_enters_provision(self):
-        with patch.object(service.os, 'geteuid', return_value=0):
+        with patch.object(service.os, 'geteuid', return_value=0, create=True):
             with self.assertRaises(RuntimeError):
                 service.require_root()
-        with patch.object(service.os, 'geteuid', return_value=1000):
+        with patch.object(service.os, 'geteuid', return_value=1000, create=True):
             with self.assertRaises(RuntimeError):
                 service.require_root()
 
@@ -148,13 +148,15 @@ class TestStagedState(unittest.TestCase):
                 self.assertIn(key + ' = ', text)
             for name in service.PEER_NAMES:
                 client = staging / (name + '.conf')
-                self.assertEqual(client.stat().st_mode & 0o777, 0o600)
+                if os.name == 'posix':
+                    self.assertEqual(client.stat().st_mode & 0o777, 0o600)
                 self.assertIn('AllowedIPs = 0.0.0.0/0, ::/0', client.read_text())
                 self.assertIn('Endpoint = 198.51.100.42:5182', client.read_text())
             stored = json.loads((staging / 'manifest.json').read_text())
             self.assertNotIn('HeaderProtectionKey', stored)
             self.assertNotIn('PrivateKey', stored)
-            self.assertEqual(staging.stat().st_mode & 0o777, 0o700)
+            if os.name == 'posix':
+                self.assertEqual(staging.stat().st_mode & 0o777, 0o700)
 
     def test_zero_keys_are_rejected_and_header_generation_is_bounded(self):
         with self.assertRaises(RuntimeError):

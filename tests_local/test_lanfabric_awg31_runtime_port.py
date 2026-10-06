@@ -1,6 +1,7 @@
 """Регрессии порта и проверки применённых параметров; без настоящего VPN."""
 import importlib.util
 import base64
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -20,6 +21,12 @@ srv = load("srv_awg31_runtime", "vsrv-admin.py")
 cli = load("cli_awg31_runtime", "vcli-admin.py")
 
 class TestSavedPort(unittest.TestCase):
+    def setUp(self):
+        if os.name == "nt":
+            mode_patch = patch.object(srv.os, "fchmod", create=True)
+            self.addCleanup(mode_patch.stop)
+            self.mode_change = mode_patch.start()
+
     def test_absent_legacy_port_does_not_create_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "port"
@@ -40,7 +47,11 @@ class TestSavedPort(unittest.TestCase):
                 self.assertEqual(srv.read_listen_port(), 4387)
                 self.assertIn("ListenPort = 4387", srv.build_setconf("private-key", "awg"))
                 self.assertIn("Endpoint = 45.144.232.170:4387", srv.build_client_config(row, "45.144.232.170"))
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                if os.name == "posix":
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                else:
+                    self.mode_change.assert_called_once()
+                    self.assertEqual(self.mode_change.call_args.args[1], 0o600)
 
     def test_bad_existing_port_is_not_replaced_with_default(self):
         with tempfile.TemporaryDirectory() as tmp:
