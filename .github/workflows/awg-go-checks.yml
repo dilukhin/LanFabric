@@ -8,6 +8,8 @@ on:
       - tests_local/test_lanfabric_awg_go.py
       - tests_local/test_lanfabric_go_installation.py
       - tests_local/test_lanfabric_go_update.py
+      - tests_local/test_lanfabric_python_runtime.py
+      - tests_integration/Dockerfile.ubuntu20
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
@@ -20,6 +22,8 @@ on:
       - tests_local/test_lanfabric_awg_go.py
       - tests_local/test_lanfabric_go_installation.py
       - tests_local/test_lanfabric_go_update.py
+      - tests_local/test_lanfabric_python_runtime.py
+      - tests_integration/Dockerfile.ubuntu20
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
@@ -98,9 +102,38 @@ jobs:
       - name: Проверить публичную поставку, обновление, возврат и аварийное восстановление
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_REPOSITORY,RUNNER_ENVIRONMENT /usr/bin/python3 tests_integration/run_awg_go_ci.py
 
+  awg-go-ubuntu20:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Получить проверяемый коммит
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Создать одноразовый образ Ubuntu 20.04 с исходным Python
+        run: docker build -f tests_integration/Dockerfile.ubuntu20 -t lanfabric-ci-ubuntu20 .
+      - name: Проверить bootstrap и настоящую службу в отдельном контейнере
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f lanfabric-ci-ubuntu20 >/dev/null 2>&1 || true' EXIT
+          docker run -d --name lanfabric-ci-ubuntu20 --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock -v "$GITHUB_WORKSPACE:/work:ro" lanfabric-ci-ubuntu20
+          docker exec lanfabric-ci-ubuntu20 /usr/bin/python3 --version
+          docker exec lanfabric-ci-ubuntu20 cat /etc/os-release
+          docker exec lanfabric-ci-ubuntu20 sh -c 'mkdir -p /dev/net; test -c /dev/net/tun || mknod /dev/net/tun c 10 200'
+          for attempt in $(seq 1 30); do
+            state=$(docker exec lanfabric-ci-ubuntu20 systemctl is-system-running || true)
+            if [[ "$state" == "running" || "$state" == "degraded" ]]; then break; fi
+            if [[ "$attempt" == "30" ]]; then docker logs lanfabric-ci-ubuntu20; exit 1; fi
+            sleep 1
+          done
+          docker exec -e GITHUB_ACTIONS=true -e RUNNER_ENVIRONMENT=github-hosted -e GITHUB_REPOSITORY=dilukhin/LanFabric lanfabric-ci-ubuntu20 /usr/bin/python3 /work/tests_integration/run_awg_go_ci.py
+          docker exec lanfabric-ci-ubuntu20 /usr/bin/python3 --version
+
   publish-components:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'dilukhin/LanFabric'
-    needs: [build, awg-go-service]
+    needs: [build, awg-go-service, awg-go-ubuntu20]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
