@@ -2620,6 +2620,9 @@ def _run_internal_install_module(argv):
         raise RuntimeError("Версия staged server module не совпадает")
     compile(text, str(source), "exec")
 
+    if os.path.exists(BACKEND_PATH) and get_implementation() == "go":
+        raise RuntimeError("Обновление модуля AWG Go требует проверенного пути с контрольным снимком и возвратом по #28; текущая установка сохранена")
+
     target = Path(REMOTE_DIR) / "vsrv-admin.py"
     Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chown(REMOTE_DIR, 0, 0)

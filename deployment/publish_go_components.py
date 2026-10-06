@@ -64,6 +64,7 @@ def main():
         print("Проверенные компоненты уже опубликованы; выпуск сохранён")
         return
     files["SOURCES.txt"] = sources.encode()
+    files["GO-LICENSES.txt"] = (ROOT / "ci-dist/GO-LICENSES.txt").read_bytes()
     files["awg-tools-link-inputs.tar.gz"] = (ROOT / "ci-dist/awg-tools-link-inputs.tar.gz").read_bytes()
     existing = {asset["name"]: asset for asset in release["assets"]}
     if set(existing) - set(files):

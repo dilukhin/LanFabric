@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 import io
 from unittest.mock import patch
 
@@ -84,6 +85,20 @@ def main():
         # Контрольный снимок содержит только хеши; значения не выводятся.
         for path in (srv.DB_PATH, srv.AWG_PARAMS_PATH, "/etc/wireguard/wg0.private", "/etc/wireguard/wg0.public", srv.LISTEN_PORT_PATH):
             fingerprints[path] = digest(path)
+        print("Неподдержанное обновление Go отказывает до замены модуля", flush=True)
+        staged_module = Path("/tmp/lanfabric-vsrv-" + uuid.uuid4().hex + ".py")
+        with staged_module.open("xb") as target:
+            target.write(installed.read_bytes())
+        try:
+            env = os.environ.copy()
+            env.update(SUDO_USER="root", SUDO_UID="0")
+            rejected = subprocess.run(["/usr/bin/python3", str(installed), "_install-module", "--source", str(staged_module),
+                                       "--sha256", digest(staged_module), "--version", srv.__version__],
+                                      capture_output=True, env=env, timeout=30)
+            if rejected.returncode == 0 or digest(installed) != digest(staged_module):
+                raise RuntimeError("Неподдержанное обновление изменило модуль Go")
+        finally:
+            staged_module.unlink()
         run(["/usr/bin/python3", str(installed), "init", "--implementation", "go"])
         for action in ("start", "start", "sync", "restart", "stop", "start"):
             print("Штатная команда: " + action, flush=True)

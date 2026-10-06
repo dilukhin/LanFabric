@@ -55,8 +55,18 @@ def main():
     libc = subprocess.check_output(["dpkg-query", "-W", "-f=${Version}", "libc6-dev"], text=True)
     metadata.write_text("gcc *.o -static -o awg\n" + compiler + "\nlibc6-dev=" + libc +
                         "\nИсходники libc: https://launchpad.net/ubuntu/+source/glibc/" + libc + "\n")
+    module_dirs = subprocess.check_output(["go", "list", "-m", "-f", "{{.Dir}}", "all"], cwd=go, env=env, text=True).splitlines()
+    licenses = []
+    for directory in sorted(set(module_dirs + [str(go)])):
+        if not directory:
+            continue
+        for path in sorted(Path(directory).iterdir()):
+            if path.is_file() and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
+                licenses.append(path.name + " (" + Path(directory).name + ")\n" + path.read_text(errors="replace"))
+    (out / "GO-LICENSES.txt").write_text("\n\n".join(licenses))
     with tarfile.open(out / "awg-tools-link-inputs.tar.gz", "w:gz") as archive:
         archive.add(metadata, arcname="LINKING.txt")
+        archive.add("/usr/share/doc/libc6/copyright", arcname="libc-copyright.txt")
         for path in sorted((ROOT / "ci-src/tools").rglob("*")):
             if path.is_file() and ".git" not in path.relative_to(ROOT / "ci-src/tools").parts and path.name != "wg":
                 archive.add(path, arcname="amneziawg-tools/" + str(path.relative_to(ROOT / "ci-src/tools")))
