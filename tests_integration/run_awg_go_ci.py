@@ -19,7 +19,12 @@ TOOLS_COMMIT = "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
 def run(argv, timeout=90):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError("Испытательная команда завершилась ошибкой; вывод с данными состояния скрыт")
+        operation = argv[2] if len(argv) > 2 and Path(argv[1]).name == "vsrv-admin.py" else Path(argv[0]).name
+        public_errors = ("Приватная поставка Python изменена", "Файл службы AWG Go не соответствует штатному контракту",
+                         "WAN", "Требуется Python 3.10+", "Обновление Go не завершено")
+        hints = [message for message in public_errors if message in result.stdout + result.stderr]
+        raise RuntimeError("Испытательная команда завершилась ошибкой: " + operation + "; код=" + str(result.returncode)
+                           + "; признаки=" + ",".join(hints) + "; вывод с данными состояния скрыт")
     return result.stdout.strip()
 
 
@@ -33,14 +38,15 @@ def main():
             or os.environ.get("GITHUB_REPOSITORY") != "dilukhin/LanFabric"):
         raise RuntimeError("Испытание разрешено только в одноразовой машине GitHub Actions этого репозитория")
     repository = Path(__file__).resolve().parents[1]
-    for path in ("/opt/vpn-admin", "/etc/wireguard", "/etc/systemd/system/lanfabric-awg-go.service",
-                 "/run/amneziawg/wg0.sock", "/opt/lanfabric-awg31"):
+    prepared = sys.argv[1:] == ["--prepared-ci"] and os.environ.get("CI_PYTHON20_PREPARED") == "1"
+    for path in (() if prepared else ("/opt/vpn-admin", "/etc/wireguard", "/etc/systemd/system/lanfabric-awg-go.service",
+                 "/run/amneziawg/wg0.sock", "/opt/lanfabric-awg31")):
         if os.path.lexists(path):
             raise RuntimeError("Машина уже содержит ресурс VPN; испытание не начато")
-    if subprocess.run(["ip", "link", "show", "wg0"], capture_output=True).returncode == 0:
+    if not prepared and subprocess.run(["ip", "link", "show", "wg0"], capture_output=True).returncode == 0:
         raise RuntimeError("Интерфейс испытания занят")
     for table, chain in (("filter", "LANFABRIC-GUARD"), ("filter", "LANFABRIC-FWD"), ("nat", "LANFABRIC-NAT")):
-        if subprocess.run(["iptables", "-t", table, "-S", chain], capture_output=True).returncode == 0:
+        if not prepared and subprocess.run(["iptables", "-t", table, "-S", chain], capture_output=True).returncode == 0:
             raise RuntimeError("Сетевая цепочка испытания занята")
     root = Path("/opt/vpn-admin")
     for parent in (Path("/opt"), Path("/")):
@@ -52,20 +58,33 @@ def main():
         raise RuntimeError("Родитель испытательной установки является ссылкой")
     os.chown("/opt", 0, 0)
     os.chmod("/opt", 0o755)
-    root.mkdir(mode=0o700)
+    if not prepared:
+        root.mkdir(mode=0o700)
     installed = root / "vsrv-admin.py"
-    shutil.copyfile(repository / "vsrv-admin.py", installed)
-    installed.chmod(0o600)
+    if not prepared:
+        shutil.copyfile(repository / "vsrv-admin.py", installed)
+        installed.chmod(0o600)
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("srv_ci", installed)
     srv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(srv)
-    old_forward = run(["sysctl", "-n", "net.ipv4.ip_forward"])
+    old_forward = os.environ.get("CI_FORWARD_BEFORE") if prepared else run(["sysctl", "-n", "net.ipv4.ip_forward"])
+    if old_forward not in ("0", "1"):
+        raise RuntimeError("Исходное значение forwarding для испытания неизвестно")
     fingerprints = {}
     try:
         print("Чистая установка штатным init с готовыми компонентами", flush=True)
         # Обычная команда получает уже опубликованные файлы по публичным HTTPS URL.
         run(["/usr/bin/python3", str(installed), "init", "--implementation", "go", "--listen-port", "4387"], timeout=540)
+        if sys.version_info < (3, 10):
+            if not Path(srv.PYTHON_RUNTIME_EXECUTABLE).is_file():
+                raise RuntimeError("Штатный init не обеспечил поддержанный Python")
+            if not run(["/usr/bin/python3", "--version"]).startswith("Python 3.8."):
+                raise RuntimeError("Системный Python изменился")
+            env = os.environ.copy()
+            env.update(CI_PYTHON20_PREPARED="1", CI_FORWARD_BEFORE=old_forward)
+            os.execve(srv.PYTHON_RUNTIME_EXECUTABLE,
+                      [srv.PYTHON_RUNTIME_EXECUTABLE, "-I", "-B", str(Path(__file__).resolve()), "--prepared-ci"], env)
         run(["/usr/bin/python3", str(installed), "add", "ci-peer", "--internet"])
         # Контрольный снимок содержит только хеши; значения не выводятся.
         for path in (srv.DB_PATH, srv.AWG_PARAMS_PATH, "/etc/wireguard/wg0.private", "/etc/wireguard/wg0.public", srv.LISTEN_PORT_PATH):

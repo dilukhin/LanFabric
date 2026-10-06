@@ -6,6 +6,7 @@ vsrv-admin.py - серверный инструмент управления VPN
 __version__ = "0.0.18"
 
 import sys
+sys.dont_write_bytecode = True
 import os
 import subprocess
 import sqlite3
@@ -26,6 +27,8 @@ import struct
 import shutil
 import tempfile
 import urllib.request
+import tarfile
+from pathlib import PurePosixPath
 try:
     import fcntl
 except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
@@ -91,6 +94,232 @@ AWG_GO_RELEASE_SHA256 = {
 AWG_GO_INSTALL_RECORD = f"{REMOTE_DIR}/go-install.json"
 GO_UPDATE_RECORD = f"{REMOTE_DIR}/go-update.json"
 GO_UPDATE_SCHEMA = 1
+PYTHON_RUNTIME_DIR = f"{REMOTE_DIR}/python-runtime"
+PYTHON_RUNTIME_RELEASE = "20261003"
+PYTHON_RUNTIME_ASSET = "cpython-3.12.15+20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+PYTHON_RUNTIME_SHA256 = "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91"
+PYTHON_RUNTIME_SIZE = 34285590
+PYTHON_RUNTIME_EXECUTABLE = f"{PYTHON_RUNTIME_DIR}/bin/python3.12"
+
+def python_runtime_relative(name):
+    path = PurePosixPath(name)
+    if path.is_absolute() or not path.parts or any(part in (".", "..") for part in path.parts) or "\\" in name:
+        raise RuntimeError("Недопустимый путь в поставке Python")
+    return path
+
+def fsync_root_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def unpack_python_runtime(archive, destination):
+    """Распаковывает проверенный архив вручную; ссылки превращает в обычные файлы."""
+    destination = Path(destination)
+    destination.mkdir(mode=0o700)
+    links = {}
+    total = 0
+    seen = set()
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle:
+            path = python_runtime_relative(member.name)
+            if path.parts[0] != "python":
+                raise RuntimeError("Архив Python содержит посторонний корень")
+            if len(path.parts) == 1 and member.isdir():
+                continue
+            if len(path.parts) < 2 or str(path) in seen or len(seen) >= 20000:
+                raise RuntimeError("Недопустимый набор файлов Python")
+            seen.add(str(path))
+            target = destination.joinpath(*path.parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if member.isdir():
+                target.mkdir(exist_ok=True, mode=0o700)
+            elif member.isfile():
+                total += member.size
+                if member.size < 0 or member.size > 64 * 1024 * 1024 or total > 512 * 1024 * 1024:
+                    raise RuntimeError("Превышен предел размера распакованного Python")
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise RuntimeError("Файл Python недоступен в архиве")
+                with source:
+                    contents = source.read(member.size + 1)
+                if len(contents) != member.size:
+                    raise RuntimeError("Файл Python обрезан")
+                if target.exists():
+                    raise RuntimeError("Пути поставки Python пересекаются")
+                atomic_root_bytes(target, contents, 0o700 if member.mode & 0o111 else 0o600)
+            elif member.issym():
+                link = PurePosixPath(member.linkname)
+                if link.is_absolute() or "\\" in member.linkname:
+                    raise RuntimeError("Ссылка поставки Python выходит за архив")
+                parts = list(path.parts[:-1])
+                for part in link.parts:
+                    if part == "..":
+                        if len(parts) <= 1:
+                            raise RuntimeError("Ссылка поставки Python выходит за архив")
+                        parts.pop()
+                    elif part != ".":
+                        parts.append(part)
+                links[str(path)] = "/".join(parts)
+            else:
+                raise RuntimeError("Специальные файлы и жёсткие ссылки Python запрещены")
+    for name, target_name in links.items():
+        visited = {name}
+        while target_name in links:
+            if target_name in visited or len(visited) > 16:
+                raise RuntimeError("Цикл ссылок в поставке Python")
+            visited.add(target_name)
+            target_name = links[target_name]
+        source = destination.joinpath(*PurePosixPath(target_name).parts[1:])
+        target = destination.joinpath(*PurePosixPath(name).parts[1:])
+        if not source.is_file() or source.is_symlink() or target.exists():
+            raise RuntimeError("Ссылка Python не указывает на собственный обычный файл")
+        contents = source.read_bytes()
+        total += len(contents)
+        if total > 512 * 1024 * 1024:
+            raise RuntimeError("Превышен предел полного размера Python")
+        atomic_root_bytes(target, contents, source.stat().st_mode & 0o777)
+    files = {}
+    directories = []
+    for parent, names, filenames in os.walk(destination):
+        directory = Path(parent)
+        directory.chmod(0o700)
+        for name in names:
+            (directory / name).chmod(0o700)
+        directories.extend((directory / name).relative_to(destination).as_posix() for name in names)
+        for name in filenames:
+            entry = directory / name
+            files[entry.relative_to(destination).as_posix()] = {"sha256": hashlib.sha256(entry.read_bytes()).hexdigest(), "mode": entry.stat().st_mode & 0o777}
+    record = {"schema": 1, "release": PYTHON_RUNTIME_RELEASE, "archive_sha256": PYTHON_RUNTIME_SHA256,
+              "files": files, "directories": sorted(directories)}
+    atomic_root_bytes(destination / "lanfabric-runtime.json", (json.dumps(record) + "\n").encode())
+    for parent, names, filenames in os.walk(destination, topdown=False):
+        fsync_root_directory(parent)
+    return record
+
+def validate_python_runtime():
+    """Доказывает целостность всей приватной поставки, включая библиотеки Python."""
+    directory = Path(PYTHON_RUNTIME_DIR)
+    trusted_go_path(str(directory / "lanfabric-runtime.json"), private=True)
+    try:
+        root_info = directory.lstat()
+        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or root_info.st_mode & 0o077:
+            raise ValueError
+        if (directory / "lanfabric-runtime.json").stat().st_size > 8 * 1024 * 1024:
+            raise ValueError
+        record = json.loads((directory / "lanfabric-runtime.json").read_text())
+        if (set(record) != {"schema", "release", "archive_sha256", "files", "directories"}
+                or type(record["schema"]) is not int or record["schema"] != 1
+                or record["release"] != PYTHON_RUNTIME_RELEASE or record["archive_sha256"] != PYTHON_RUNTIME_SHA256
+                or type(record["files"]) is not dict or not 0 < len(record["files"]) <= 20000
+                or type(record["directories"]) is not list or len(record["directories"]) > 20000
+                or "bin/python3.12" not in record["files"]):
+            raise ValueError
+        expected = set(record["files"]) | set(record["directories"]) | {"lanfabric-runtime.json"}
+        if len(expected) != len(record["files"]) + len(record["directories"]) + 1:
+            raise ValueError
+        actual = set()
+        for parent, names, files in os.walk(directory):
+            for name in [*names, *files]:
+                entry = Path(parent) / name
+                relative = entry.relative_to(directory).as_posix()
+                actual.add(relative)
+                info = entry.lstat()
+                if info.st_uid != 0 or info.st_mode & 0o077 or stat.S_ISLNK(info.st_mode):
+                    raise ValueError
+        if actual != expected:
+            raise ValueError
+        for name in record["directories"]:
+            entry = directory.joinpath(*python_runtime_relative(name).parts)
+            if not entry.is_dir():
+                raise ValueError
+        for name, info in record["files"].items():
+            entry = directory.joinpath(*python_runtime_relative(name).parts)
+            if (set(info) != {"sha256", "mode"} or info["mode"] not in (0o600, 0o700)
+                or not re.fullmatch(r"[0-9a-f]{64}", info["sha256"]) or not entry.is_file()
+                    or entry.stat().st_size > 64 * 1024 * 1024 or entry.stat().st_mode & 0o777 != info["mode"]
+                    or hashlib.sha256(entry.read_bytes()).hexdigest() != info["sha256"]):
+                raise ValueError
+        return record
+    except (ValueError, TypeError, KeyError, OSError, AttributeError):
+        raise RuntimeError("Приватная поставка Python изменена; запуск и автоматическая очистка запрещены") from None
+
+def install_python_runtime():
+    """Получает готовый закреплённый Python; системный интерпретатор не меняет."""
+    if os.path.lexists(PYTHON_RUNTIME_DIR):
+        validate_python_runtime()
+        return
+    if shutil.disk_usage(REMOTE_DIR).free < 768 * 1024 * 1024:
+        raise RuntimeError("Для подготовки приватного Python требуется 768 MiB свободного места")
+    with tempfile.TemporaryDirectory(prefix=".python-staging-", dir=REMOTE_DIR) as staging:
+        archive = Path(staging) / "bundle.tar.gz"
+        url = "https://github.com/astral-sh/python-build-standalone/releases/download/" + PYTHON_RUNTIME_RELEASE + "/" + PYTHON_RUNTIME_ASSET.replace("+", "%2B")
+        size = 0
+        digest = hashlib.sha256()
+        deadline = time.monotonic() + 180
+        phase = "загрузка"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as source, archive.open("xb") as output:
+                if not source.geturl().startswith("https://"):
+                    raise ValueError
+                os.chmod(archive, 0o600)
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 64 * 1024 * 1024 or time.monotonic() >= deadline:
+                        raise ValueError
+                    output.write(chunk)
+                    digest.update(chunk)
+            if size != PYTHON_RUNTIME_SIZE or not secrets.compare_digest(digest.hexdigest(), PYTHON_RUNTIME_SHA256):
+                raise ValueError
+            destination = Path(staging) / "installation"
+            phase = "проверка архива"
+            unpack_python_runtime(archive, destination)
+            executable = destination / "bin/python3.12"
+            phase = "проверка интерпретатора"
+            run_bounded_command([str(executable), "-I", "-B", "-c", "import sys,ssl,sqlite3,fcntl; assert sys.version_info[:3] == (3,12,15); assert ssl.create_default_context().verify_mode == ssl.CERT_REQUIRED; sqlite3.connect(':memory:').close()"], timeout=30)
+            os.replace(destination, PYTHON_RUNTIME_DIR)
+            phase = "проверка установленной поставки"
+            fd = os.open(REMOTE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            validate_python_runtime()
+        except Exception:
+            raise RuntimeError("Готовый Python не прошёл этап: " + phase + "; VPN не установлен, системный Python сохранён") from None
+
+def bootstrap_go_python():
+    """Python 3.8 используется только для проверки и перехода на поддержанный runtime."""
+    if str(Path(os.path.realpath(sys.executable))).startswith(PYTHON_RUNTIME_DIR + "/"):
+        validate_python_runtime()
+        return
+    if sys.version_info >= (3, 10) or len(sys.argv) < 2 or sys.argv[1] in ("help", "--version", "--help"):
+        return
+    values = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
+    if (values.get("ID", "").strip('"') != "ubuntu" or values.get("VERSION_ID", "").strip('"') != "20.04"
+            or os.uname().machine != "x86_64" or os.geteuid() != 0
+            or Path(__file__).resolve() != Path(REMOTE_DIR) / "vsrv-admin.py"):
+        raise RuntimeError("Требуется Python 3.10+; автоматический переход разрешён только штатному Go на Ubuntu 20.04 x86_64")
+    trusted_go_path(str(Path(__file__).resolve()), private=True)
+    with runtime_lock(lock_path=AWG_GO_OPERATION_LOCK):
+        if not os.path.lexists(PYTHON_RUNTIME_DIR):
+            parser = argparse.ArgumentParser(add_help=False)
+            parser.add_argument("command", choices=["init"])
+            parser.add_argument("--implementation", choices=["go"], required=True)
+            parser.add_argument("--listen-port", type=int, default=WG_BASE_PORT)
+            parser.add_argument("--awg-profile", choices=["legacy", "awg31"])
+            args = parser.parse_args(sys.argv[1:])
+            if not 1 <= args.listen_port <= 65535:
+                raise RuntimeError("Недопустимый порт до подготовки Python")
+            check_go_clean_target(args.listen_port)
+        install_python_runtime()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.execve(PYTHON_RUNTIME_EXECUTABLE, [PYTHON_RUNTIME_EXECUTABLE, "-I", "-B", str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 def go_update_paths():
     """Точный набор данных и компонентов для совместимого обновления."""
@@ -347,9 +576,9 @@ def require_go_platform():
         if "=" in line:
             key, value = line.split("=", 1)
             values[key] = value.strip('"')
-    if (values.get("ID") != "ubuntu" or values.get("VERSION_ID") not in ("22.04", "24.04")
+    if (values.get("ID") != "ubuntu" or values.get("VERSION_ID") not in ("20.04", "22.04", "24.04")
             or os.uname().machine != "x86_64" or sys.version_info < (3, 10)):
-        raise RuntimeError("Поставка Go поддерживает Ubuntu 22.04/24.04 x86_64 с Python 3.10+; для другой ОС нужен отдельный проверенный путь")
+        raise RuntimeError("Поставка Go поддерживает Ubuntu 20.04/22.04/24.04 x86_64 с Python 3.10+; для другой ОС нужен отдельный проверенный путь")
     info = os.stat("/dev/net/tun")
     if not stat.S_ISCHR(info.st_mode):
         raise RuntimeError("Для AWG Go требуется доступный символьный /dev/net/tun")
@@ -372,6 +601,9 @@ def check_go_clean_target(port, staging=None):
     trusted_go_path(f"{REMOTE_DIR}/vsrv-admin.py", private=True)
     for entry in Path(REMOTE_DIR).iterdir():
         if entry.name == "vsrv-admin.py" or (staging is not None and entry == Path(staging)):
+            continue
+        if entry == Path(PYTHON_RUNTIME_DIR):
+            validate_python_runtime()
             continue
         if entry == Path(CONF_DIR) and not entry.is_symlink() and entry.is_dir() and not any(entry.iterdir()):
             continue
@@ -518,7 +750,7 @@ def go_purge_files(snapshot):
             {"schema": 1, "phase": "complete"}, {"schema": 1, "phase": "removed"}, {"schema": 1, "phase": "prepared"}):
         raise RuntimeError("Для удаления требуется завершённое собственное состояние установки Go")
     allowed = {
-        Path(REMOTE_DIR): {"vsrv-admin.py", "vpn.db", "backend", "implementation", "awg_params", "listen_port", "go-install.json", "awg-go", "configs", "go-update.json"},
+        Path(REMOTE_DIR): {"vsrv-admin.py", "vpn.db", "backend", "implementation", "awg_params", "listen_port", "go-install.json", "awg-go", "configs", "go-update.json", "python-runtime"},
         Path(AWG_GO_DIR): {"amneziawg-go", "awg", "manifest.json"},
         Path(CONF_DIR): {row["name"] + ".conf" for row in snapshot["users"]},
         Path(WG_DIR): {WG_IF + ".private", WG_IF + ".public", WG_IF + ".setconf"},
@@ -528,6 +760,13 @@ def go_purge_files(snapshot):
         validate_go_update_backup(record)
         allowed[Path(REMOTE_DIR)].add(record["backup"])
         allowed[Path(REMOTE_DIR) / record["backup"]] = {str(index) for index in range(len(go_update_paths()))}
+    if os.path.lexists(PYTHON_RUNTIME_DIR):
+        runtime = validate_python_runtime()
+        for name in ["", *runtime["directories"]]:
+            allowed[Path(PYTHON_RUNTIME_DIR) / name] = set()
+        for name in [*runtime["files"], *runtime["directories"], "lanfabric-runtime.json"]:
+            path = Path(PYTHON_RUNTIME_DIR) / name
+            allowed[path.parent].add(path.name)
     files = []
     for directory, names in allowed.items():
         info = directory.lstat()
@@ -764,6 +1003,8 @@ def go_systemctl(*arguments):
 
 def awg_go_unit_text(python_path=None):
     python_path = python_path or "/usr/bin/python3"
+    if python_path.startswith(PYTHON_RUNTIME_DIR + "/"):
+        python_path += " -I -B"
     return f"""[Unit]
 Description=LanFabric AWG Go
 After=systemd-sysctl.service netfilter-persistent.service
@@ -2902,6 +3143,7 @@ def _run_internal_install_module(argv):
     print("OK")
 
 def main():
+    bootstrap_go_python()
     if len(sys.argv) > 1 and sys.argv[1] == "_cleanup-temp-sudoers":
         print(_run_internal_cleanup_temp_sudoers(sys.argv[2:]))
         return
