@@ -118,7 +118,9 @@ jobs:
         run: |
           set -euo pipefail
           trap 'docker rm -f lanfabric-ci-ubuntu20 >/dev/null 2>&1 || true' EXIT
-          docker run -d --name lanfabric-ci-ubuntu20 --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock -v "$GITHUB_WORKSPACE:/work:ro" lanfabric-ci-ubuntu20
+          # У одноразовой машины свой физический WAN. Сеть контейнера veth
+          # отвергается штатной проверкой; продуктовую границу не ослабляем.
+          docker run -d --name lanfabric-ci-ubuntu20 --privileged --network=host --cgroupns=private --tmpfs /run --tmpfs /run/lock -v "$GITHUB_WORKSPACE:/work:ro" lanfabric-ci-ubuntu20
           docker exec lanfabric-ci-ubuntu20 /usr/bin/python3 --version
           docker exec lanfabric-ci-ubuntu20 cat /etc/os-release
           docker exec lanfabric-ci-ubuntu20 sh -c 'mkdir -p /dev/net; test -c /dev/net/tun || mknod /dev/net/tun c 10 200'

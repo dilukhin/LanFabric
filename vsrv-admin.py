@@ -187,10 +187,10 @@ def unpack_python_runtime(archive, destination):
         directory.chmod(0o700)
         for name in names:
             (directory / name).chmod(0o700)
-        directories.extend(str((directory / name).relative_to(destination)) for name in names)
+        directories.extend((directory / name).relative_to(destination).as_posix() for name in names)
         for name in filenames:
             entry = directory / name
-            files[str(entry.relative_to(destination))] = {"sha256": hashlib.sha256(entry.read_bytes()).hexdigest(), "mode": entry.stat().st_mode & 0o777}
+            files[entry.relative_to(destination).as_posix()] = {"sha256": hashlib.sha256(entry.read_bytes()).hexdigest(), "mode": entry.stat().st_mode & 0o777}
     record = {"schema": 1, "release": PYTHON_RUNTIME_RELEASE, "archive_sha256": PYTHON_RUNTIME_SHA256,
               "files": files, "directories": sorted(directories)}
     atomic_root_bytes(destination / "lanfabric-runtime.json", (json.dumps(record) + "\n").encode())
@@ -223,7 +223,7 @@ def validate_python_runtime():
         for parent, names, files in os.walk(directory):
             for name in [*names, *files]:
                 entry = Path(parent) / name
-                relative = str(entry.relative_to(directory))
+                relative = entry.relative_to(directory).as_posix()
                 actual.add(relative)
                 info = entry.lstat()
                 if info.st_uid != 0 or info.st_mode & 0o077 or stat.S_ISLNK(info.st_mode):

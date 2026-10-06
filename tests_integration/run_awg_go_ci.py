@@ -19,7 +19,12 @@ TOOLS_COMMIT = "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
 def run(argv, timeout=90):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError("Испытательная команда завершилась ошибкой; вывод с данными состояния скрыт")
+        operation = argv[2] if len(argv) > 2 and Path(argv[1]).name == "vsrv-admin.py" else Path(argv[0]).name
+        public_errors = ("Приватная поставка Python изменена", "Файл службы AWG Go не соответствует штатному контракту",
+                         "WAN", "Требуется Python 3.10+", "Обновление Go не завершено")
+        hints = [message for message in public_errors if message in result.stdout + result.stderr]
+        raise RuntimeError("Испытательная команда завершилась ошибкой: " + operation + "; код=" + str(result.returncode)
+                           + "; признаки=" + ",".join(hints) + "; вывод с данными состояния скрыт")
     return result.stdout.strip()
 
 
