@@ -199,7 +199,7 @@ def trusted_go_path(path_text, executable=False, private=False):
         except OSError:
             raise RuntimeError("Обязательный доверенный файл AWG Go отсутствует") from None
         if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise RuntimeError("Нарушены владелец, тип или права пути AWG Go")
+            raise RuntimeError(f"Нарушены владелец, тип или права пути AWG Go: {entry}")
     if not path.is_file() or (executable and not os.access(path, os.X_OK)):
         raise RuntimeError("Обязательный файл AWG Go имеет неверный тип или недоступен")
     if private and path.stat().st_mode & 0o077:

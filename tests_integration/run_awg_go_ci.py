@@ -41,6 +41,15 @@ def main():
         if subprocess.run(["iptables", "-t", table, "-S", chain], capture_output=True).returncode == 0:
             raise RuntimeError("Сетевая цепочка испытания занята")
     root = Path("/opt/vpn-admin")
+    for parent in (Path("/opt"), Path("/")):
+        info = parent.lstat()
+        print(f"Права родителя {parent}: uid={info.st_uid}, mode={info.st_mode & 0o777:o}", flush=True)
+    # В одноразовом образе Actions /opt может быть открыт для установки инструментов.
+    # Подготовка стенда восстанавливает необходимую границу root, не ослабляя код службы.
+    if Path("/opt").is_symlink():
+        raise RuntimeError("Родитель испытательной установки является ссылкой")
+    os.chown("/opt", 0, 0)
+    os.chmod("/opt", 0o755)
     root.mkdir(mode=0o700)
     installed = root / "vsrv-admin.py"
     shutil.copyfile(repository / "vsrv-admin.py", installed)

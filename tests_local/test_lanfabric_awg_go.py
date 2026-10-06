@@ -144,6 +144,7 @@ class ProcessTests(unittest.TestCase):
                 patch.object(Path, "read_text", return_value="0::/system.slice/lanfabric-awg-go.service\n"), \
                 patch.object(srv.os, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=0)), \
                 patch.object(srv.socket, "socket", return_value=connection), \
+                patch.object(srv.socket, "AF_UNIX", 1, create=True), \
                 patch.object(srv.socket, "SO_PEERCRED", 17, create=True):
             return srv.go_process_identity()
 
@@ -334,7 +335,7 @@ class StaleSocketTests(unittest.TestCase):
         if not listening:
             connection.connect.side_effect = ConnectionRefusedError()
         def read(path, *args, **kwargs):
-            if str(path) == srv.AWG_GO_SOCKET_RECORD:
+            if path == Path(srv.AWG_GO_SOCKET_RECORD):
                 return json.dumps(record)
             if alive:
                 return "123 (synthetic process) " + " ".join(["0"] * 19 + ["100"])
@@ -345,7 +346,8 @@ class StaleSocketTests(unittest.TestCase):
                 patch.object(Path, "stat", return_value=SimpleNamespace(st_size=100)), \
                 patch.object(srv.os, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=0,
                                                                           st_dev=1, st_ino=inode, st_ctime_ns=3)), \
-                patch.object(srv.socket, "socket", return_value=connection), patch.object(srv.os, "unlink") as unlink:
+                patch.object(srv.socket, "socket", return_value=connection), \
+                patch.object(srv.socket, "AF_UNIX", 1, create=True), patch.object(srv.os, "unlink") as unlink:
             if inode != 2 or alive or listening:
                 with self.assertRaises(RuntimeError):
                     srv.cleanup_go_stale_socket()
