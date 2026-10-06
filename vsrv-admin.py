@@ -3,7 +3,7 @@
 vsrv-admin.py - серверный инструмент управления VPN на базе WireGuard/AmneziaWG.
 Управление пирами, маршрутизацией, доступом в интернет и состоянием сервера.
 """
-__version__ = "0.0.17"
+__version__ = "0.0.18"
 
 import sys
 import os
@@ -16,6 +16,14 @@ import ipaddress
 import secrets
 import re
 import time
+import json
+import base64
+import binascii
+try:
+    import fcntl
+except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
+    fcntl = None
+from contextlib import contextmanager
 from pathlib import Path
 
 # Константы
@@ -26,12 +34,34 @@ VPN_NET = "10.8.0.0/24"
 CONF_DIR = "/opt/vpn-admin/configs"
 WG_DIR = "/etc/wireguard"
 WG_BASE_PORT = 51820
+LISTEN_PORT_PATH = "/opt/vpn-admin/listen_port"
 BACKEND_PATH = "/opt/vpn-admin/backend"
 REMOTE_DIR = "/opt/vpn-admin"
 SUDOERS_PATH = "/etc/sudoers.d/vpn-admin"
 SUDOERS_LANFABRIC_GLOB = "/etc/sudoers.d/lanfabric-*"
 AWG_PARAMS_PATH = "/opt/vpn-admin/awg_params"
 AWG_PARAM_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+AWG31_EXTRA_KEYS = (
+    "S3", "S4", "HeaderProtectionKey", "RekeyAfterTime", "RekeyTimeout",
+    "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts",
+    "ContentPaddingAddition", "RandomTrailers", "DisableCookies",
+)
+AWG31_PARAM_KEYS = AWG_PARAM_KEYS + AWG31_EXTRA_KEYS
+AWG31_TIMER_KEYS = (
+    "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
+    "MaxHandshakeAttempts", "ContentPaddingAddition",
+)
+LOCK_DIR = "/run/lanfabric"
+LOCK_PATH = f"{LOCK_DIR}/runtime.lock"
+LOCK_TIMEOUT_SECONDS = 20
+FW_GUARD_CHAIN = "LANFABRIC-GUARD"
+FW_FORWARD_CHAIN = "LANFABRIC-FWD"
+FW_NAT_CHAIN = "LANFABRIC-NAT"
+NAT_MARK = "lanfabric-client-nat-v1"
+FORWARD_MARK = "lanfabric-client-forward-v1"
+AWG_AUTOSTART_UNIT = "lanfabric-awg.service"
+AWG_AUTOSTART_PATH = f"/etc/systemd/system/{AWG_AUTOSTART_UNIT}"
+AWG_AUTOSTART_TIMEOUT_SECONDS = 60
 
 # Логирование
 logging.basicConfig(
@@ -43,6 +73,7 @@ for handler in logging.getLogger().handlers:
     handler.flush = sys.stdout.flush
 log = logging.getLogger("vsrv")
 ADVICE_LINES = []
+os.umask(0o077)
 
 def add_advice(*lines):
     """Добавляет рекомендации, которые будут напечатаны в конце вывода."""
@@ -114,7 +145,7 @@ def get_backend():
 
 def get_wg_cmd(allow_missing=False):
     try:
-        backend = get_backend()
+        backend = require_backend()
         return "awg" if backend == "awg" else "wg"
     except Exception:
         if allow_missing:
@@ -136,8 +167,67 @@ def run_cmd(cmd, check=True):
         )
     return result.stdout.strip()
 
-def generate_awg_params():
-    """Генерирует параметры маскировки AmneziaWG для сервера и клиентов."""
+@contextmanager
+def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
+    """Сериализует все изменения желаемого и фактического состояния LanFabric."""
+    if fcntl is None:
+        raise RuntimeError("Межпроцессная блокировка LanFabric поддерживается только на POSIX-сервере")
+    Path(LOCK_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Не удалось получить блокировку LanFabric за {timeout} секунд")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+def command_succeeds(cmd):
+    """Проверяет только код возврата команды без зависимости от stdout."""
+    return subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+def derive_public_key(private_key, wg_bin):
+    """Вычисляет public key через stdin, не помещая private key в shell/diagnostics."""
+    try:
+        result = subprocess.run(
+            [wg_bin, "pubkey"],
+            input=str(private_key).strip() + "\n",
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        raise RuntimeError(f"Не удалось запустить {wg_bin} pubkey: {e}")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Не удалось вычислить публичный ключ через {wg_bin}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    public_key = result.stdout.strip()
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", public_key):
+        raise RuntimeError(f"{wg_bin} вернул публичный ключ некорректного формата")
+    return public_key
+
+def generate_awg_params(profile="legacy"):
+    """Генерирует явно выбранный профиль без изменения сохранённого состояния."""
+    if profile == "awg31":
+        return generate_awg31_params()
+    if profile != "legacy":
+        raise RuntimeError("Неизвестный профиль AmneziaWG; допустимы legacy и awg31")
     s1 = 15 + secrets.randbelow(136)
     s2 = 15 + secrets.randbelow(136)
     while s1 + 56 == s2:
@@ -160,38 +250,99 @@ def generate_awg_params():
         "H4": h4,
     }
 
+def generate_awg31_params():
+    """Создаёт полный профиль AWG 3.1 по официальному профилю клиента 5.0.3.0."""
+    return {
+        "Jc": 4 + secrets.randbelow(3), "Jmin": 10, "Jmax": 50,
+        "S1": 12, "S2": 12, "S3": 12, "S4": 12,
+        "H1": 1, "H2": 2, "H3": 3, "H4": 4,
+        "HeaderProtectionKey": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        "RekeyAfterTime": "100-120", "RekeyTimeout": "3-7",
+        "RejectAfterTime": "150-180", "KeepaliveTimeout": "5-15",
+        "MaxHandshakeAttempts": "15-20", "ContentPaddingAddition": "10-100",
+        "RandomTrailers": "on", "DisableCookies": "on",
+    }
+
+def _validate_awg_number(value, key, maximum, minimum=0):
+    """Проверяет целое или диапазон, не включая исходное значение в ошибку."""
+    text = str(value)
+    match = re.fullmatch(r"([0-9]{1,10})(?:-([0-9]{1,10}))?", text)
+    if not match:
+        raise RuntimeError(f"Некорректный параметр AmneziaWG {key}: ожидается число или диапазон")
+    lower = int(match.group(1))
+    upper = int(match.group(2)) if match.group(2) is not None else lower
+    if not minimum <= lower <= upper <= maximum:
+        raise RuntimeError(f"Некорректный диапазон параметра AmneziaWG {key}")
+    normalized = lower if match.group(2) is None else f"{lower}-{upper}"
+    return normalized, lower, upper
+
 def validate_awg_params(params):
-    """Проверяет параметры AmneziaWG перед применением."""
-    missing = [key for key in AWG_PARAM_KEYS if key not in params]
+    """Строго проверяет прежний или полный современный профиль без потери полей."""
+    unsupported = set(params) - set(AWG31_PARAM_KEYS)
+    if unsupported:
+        raise RuntimeError("В профиле AmneziaWG есть неподдерживаемые поля; I1-I5 пока не поддерживаются")
+    modern = any(key in params for key in AWG31_EXTRA_KEYS)
+    required = AWG31_PARAM_KEYS if modern else AWG_PARAM_KEYS
+    missing = [key for key in required if key not in params]
     if missing:
         raise RuntimeError("В параметрах AmneziaWG отсутствуют поля: " + ", ".join(missing))
 
-    try:
-        values = {key: int(params[key]) for key in AWG_PARAM_KEYS}
-    except (TypeError, ValueError) as e:
-        raise RuntimeError(f"Параметры AmneziaWG должны быть целыми числами: {e}")
+    values = {}
+    bounds = {}
+    for key in required:
+        if key == "HeaderProtectionKey":
+            try:
+                value = params[key]
+                if not isinstance(value, str):
+                    raise ValueError
+                decoded = base64.b64decode(value, validate=True)
+                if len(decoded) != 32 or not any(decoded) or base64.b64encode(decoded).decode("ascii") != value:
+                    raise ValueError
+            except (ValueError, TypeError, binascii.Error):
+                raise RuntimeError("Некорректный HeaderProtectionKey: требуется ключ из 32 байт в base64") from None
+            values[key] = value
+        elif key in ("RandomTrailers", "DisableCookies"):
+            value = str(params[key]).lower()
+            if value not in ("on", "off"):
+                raise RuntimeError(f"Некорректный параметр AmneziaWG {key}: ожидается on или off")
+            values[key] = value
+        else:
+            maximum = 4294967295 if key.startswith("H") else 65535
+            minimum = 1 if key == "Jc" else 0
+            value, lower, upper = _validate_awg_number(params[key], key, maximum, minimum)
+            if not isinstance(value, int) and key not in AWG31_TIMER_KEYS and not key.startswith("H"):
+                raise RuntimeError(f"Параметр AmneziaWG {key} должен быть целым числом")
+            if not modern and not isinstance(value, int):
+                raise RuntimeError(f"Диапазон {key} требует полного профиля AWG 3.1")
+            values[key] = value
+            bounds[key] = (lower, upper)
 
-    if not 1 <= values["Jc"] <= 128:
-        raise RuntimeError("Некорректный параметр AmneziaWG Jc: ожидается 1..128")
-    if not 0 <= values["Jmin"] < values["Jmax"] <= 1280:
-        raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax: ожидается 0 <= Jmin < Jmax <= 1280")
-    if not 0 <= values["S1"] <= 1132:
-        raise RuntimeError("Некорректный параметр AmneziaWG S1: ожидается 0..1132")
-    if not 0 <= values["S2"] <= 1188:
-        raise RuntimeError("Некорректный параметр AmneziaWG S2: ожидается 0..1188")
-    if values["S1"] + 56 == values["S2"]:
-        raise RuntimeError("Некорректные параметры AmneziaWG: S1 + 56 не должно совпадать с S2")
+    if (bounds["Jmin"][1] > bounds["Jmax"][0] or
+            (not modern and bounds["Jmin"][1] == bounds["Jmax"][0])):
+        raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax")
+    if modern:
+        if any(bounds[key][0] < 12 for key in ("S1", "S2", "S3", "S4")):
+            raise RuntimeError("Параметры S1-S4 с HeaderProtectionKey должны быть не меньше 12")
+    else:
+        if not 1 <= values["Jc"] <= 128:
+            raise RuntimeError("Некорректный параметр AmneziaWG Jc: ожидается 1..128")
+        if values["Jmax"] > 1280:
+            raise RuntimeError("Некорректные параметры AmneziaWG Jmin/Jmax: ожидается Jmax <= 1280")
+        if values["S1"] > 1132 or values["S2"] > 1188:
+            raise RuntimeError("Некорректные параметры AmneziaWG S1/S2")
+        if values["S1"] + 56 == values["S2"]:
+            raise RuntimeError("Некорректные параметры AmneziaWG: S1 + 56 не должно совпадать с S2")
+        if any(not 5 <= values[key] <= 2147483647 for key in ("H1", "H2", "H3", "H4")):
+            raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть в диапазоне 5..2147483647")
 
-    headers = [values["H1"], values["H2"], values["H3"], values["H4"]]
-    if len(set(headers)) != 4:
-        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть уникальными")
-    if any(value < 5 or value > 2147483647 for value in headers):
-        raise RuntimeError("Параметры AmneziaWG H1-H4 должны быть в диапазоне 5..2147483647")
-
+    headers = [bounds[key] for key in ("H1", "H2", "H3", "H4")]
+    for i, (lower, upper) in enumerate(headers):
+        if any(lower <= other_upper and other_lower <= upper for other_lower, other_upper in headers[:i]):
+            raise RuntimeError("Параметры AmneziaWG H1-H4 не должны пересекаться")
     return values
 
 def read_awg_params_file():
-    """Читает параметры AmneziaWG из файла."""
+    """Читает профиль без создания состояния и без вывода его содержимого."""
     params = {}
     with open(AWG_PARAMS_PATH, "r", encoding="utf-8") as f:
         for line in f:
@@ -199,42 +350,69 @@ def read_awg_params_file():
             if not line or line.startswith("#"):
                 continue
             if "=" not in line:
-                raise RuntimeError(f"Некорректная строка параметров AmneziaWG: {line}")
+                raise RuntimeError("Некорректная строка параметров AmneziaWG")
             key, value = line.split("=", 1)
-            params[key.strip()] = value.strip()
+            key = key.strip()
+            if key in params:
+                raise RuntimeError("Повторяющееся поле параметров AmneziaWG")
+            params[key] = value.strip()
     return validate_awg_params(params)
 
 def write_awg_params_file(params):
-    """Сохраняет параметры AmneziaWG."""
+    """Сохраняет все проверенные поля с правами 0600."""
     params = validate_awg_params(params)
     Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True)
-    text = "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS) + "\n"
-    Path(AWG_PARAMS_PATH).write_text(text, encoding="utf-8")
-    os.chmod(AWG_PARAMS_PATH, 0o600)
+    write_private_file(AWG_PARAMS_PATH, format_awg_params(params) + "\n")
 
-def get_or_create_awg_params():
-    """Возвращает сохранённые параметры AmneziaWG или создаёт новые."""
+def get_or_create_awg_params(profile="legacy"):
+    """Создаёт профиль только при отсутствии файла и явно заданном формате."""
+    if profile not in ("legacy", "awg31"):
+        raise RuntimeError("Неизвестный профиль AmneziaWG; допустимы legacy и awg31")
     if os.path.exists(AWG_PARAMS_PATH):
-        return read_awg_params_file()
+        params = read_awg_params_file()
+        actual = "awg31" if "HeaderProtectionKey" in params else "legacy"
+        if profile != actual:
+            raise RuntimeError("Сохранённый профиль AmneziaWG отличается от выбранного; автоматическая замена запрещена")
+        return params
 
-    params = generate_awg_params()
+    params = generate_awg_params(profile=profile)
     write_awg_params_file(params)
     log.info(f"Параметры AmneziaWG созданы: {AWG_PARAMS_PATH}")
     return params
 
 def format_awg_params(params):
-    """Формирует блок параметров AmneziaWG для .conf."""
+    """Формирует полный проверенный блок параметров для .conf."""
     params = validate_awg_params(params)
-    return "\n".join(f"{key} = {params[key]}" for key in AWG_PARAM_KEYS)
+    keys = AWG31_PARAM_KEYS if "HeaderProtectionKey" in params else AWG_PARAM_KEYS
+    return "\n".join(f"{key} = {params[key]}" for key in keys)
 
-def build_setconf(priv, backend):
-    """Формирует конфиг для wg/awg setconf."""
+def validate_listen_port(value):
+    """Проверяет порт без включения исходного значения в ошибку."""
+    if not re.fullmatch(r"[0-9]{1,5}", str(value)) or not 1 <= int(value) <= 65535:
+        raise RuntimeError("ListenPort должен быть целым числом 1..65535")
+    return int(value)
+
+def read_listen_port():
+    """Отсутствие файла означает прежний порт; повреждение не исправляется."""
+    try:
+        value = Path(LISTEN_PORT_PATH).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return WG_BASE_PORT
+    return validate_listen_port(value)
+
+def write_listen_port(value):
+    write_private_file(LISTEN_PORT_PATH, str(validate_listen_port(value)) + "\n")
+
+def build_setconf(priv, backend, awg_params=None, listen_port=None):
+    """Формирует конфиг для wg/awg setconf без неявного создания состояния."""
+    port = read_listen_port() if listen_port is None else validate_listen_port(listen_port)
     conf = f"""[Interface]
 PrivateKey = {priv}
-ListenPort = {WG_BASE_PORT}
+ListenPort = {port}
 """
     if backend == "awg":
-        conf += format_awg_params(get_or_create_awg_params()) + "\n"
+        params = read_awg_params_file() if awg_params is None else validate_awg_params(awg_params)
+        conf += format_awg_params(params) + "\n"
     return conf
 
 def write_private_file(path, content):
@@ -250,164 +428,753 @@ def write_private_file(path, content):
         if fd is not None:
             os.close(fd)
 
-def write_setconf(priv, backend):
-    """Сохраняет конфиг для wg/awg setconf."""
+def write_setconf(priv, backend, awg_params=None, listen_port=None):
+    """Сохраняет производный конфиг для wg/awg setconf."""
     setconf_path = Path(f"/etc/wireguard/{WG_IF}.setconf")
-    write_private_file(setconf_path, build_setconf(priv, backend))
+    write_private_file(setconf_path, build_setconf(priv, backend, awg_params=awg_params, listen_port=listen_port))
     return setconf_path
 
 def ensure_awg_setconf():
-    """Обновляет setconf AmneziaWG сохранёнными параметрами маскировки."""
-    priv_path = f"/etc/wireguard/{WG_IF}.private"
-    if not os.path.exists(priv_path):
-        raise RuntimeError(f"Приватный ключ сервера отсутствует: {priv_path}. Выполните init")
-    priv = Path(priv_path).read_text(encoding="utf-8").strip()
-    return write_setconf(priv, "awg")
+    """Пересобирает setconf только из уже существующих проверенных данных."""
+    priv, _ = read_server_key_material("awg")
+    params = read_awg_params_file()
+    return write_setconf(priv, "awg", awg_params=params)
+
+def read_server_key_material(backend):
+    """Строго читает и сверяет серверную пару ключей, не выводя приватный ключ."""
+    priv_path = Path(f"/etc/wireguard/{WG_IF}.private")
+    pub_path = Path(f"/etc/wireguard/{WG_IF}.public")
+    if not priv_path.is_file():
+        raise RuntimeError(f"Приватный ключ сервера отсутствует: {priv_path}")
+    if not pub_path.is_file():
+        raise RuntimeError(f"Публичный ключ сервера отсутствует: {pub_path}")
+    priv = priv_path.read_text(encoding="utf-8").strip()
+    pub = pub_path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", priv or ""):
+        raise RuntimeError("Приватный ключ сервера имеет некорректный формат")
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pub or ""):
+        raise RuntimeError("Публичный ключ сервера имеет некорректный формат")
+    wg_bin = "awg" if backend == "awg" else "wg"
+    if derive_public_key(priv, wg_bin) != pub:
+        raise RuntimeError("Сохранённые приватный и публичный ключи сервера не соответствуют друг другу")
+    return priv, pub
+
+def validate_user_rows(rows, wg_bin):
+    """Проверяет записи пользователей и соответствие их пар ключей."""
+    network = ipaddress.ip_network(VPN_NET)
+    seen_ips = set()
+    seen_pubkeys = set()
+    for row in rows:
+        name = str(row["name"] or "")
+        pubkey = str(row["pubkey"] or "")
+        privkey = str(row["privkey"] or "")
+        ip_text = str(row["ip"] or "")
+        if not name:
+            raise RuntimeError("В БД обнаружена учётная запись без имени")
+        if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pubkey):
+            raise RuntimeError(f"Некорректный публичный ключ пользователя {name}")
+        if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", privkey):
+            raise RuntimeError(f"Некорректный приватный ключ пользователя {name}")
+        if derive_public_key(privkey, wg_bin) != pubkey:
+            raise RuntimeError(f"Пара ключей пользователя {name} не соответствует друг другу")
+        try:
+            address = ipaddress.ip_address(ip_text)
+        except ValueError:
+            raise RuntimeError(f"Некорректный IP пользователя {name}: {ip_text}")
+        if address not in network or ip_text == SERVER_IP or address == network.network_address or address == network.broadcast_address:
+            raise RuntimeError(f"IP пользователя {name} находится вне допустимого пула: {ip_text}")
+        if ip_text in seen_ips:
+            raise RuntimeError(f"В БД повторяется IP: {ip_text}")
+        if pubkey in seen_pubkeys:
+            raise RuntimeError(f"В БД повторяется публичный ключ пользователя {name}")
+        seen_ips.add(ip_text)
+        seen_pubkeys.add(pubkey)
+        for field in ("admin", "internet", "blocked"):
+            if int(row[field]) not in (0, 1):
+                raise RuntimeError(f"Некорректный флаг {field} у пользователя {name}")
+
+def load_state_snapshot(expected_backend=None):
+    """Строго читает сохранённое состояние без создания или исправления данных."""
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Для восстановления LanFabric требуется Python 3.10+")
+    backend = require_backend()
+    if expected_backend is not None and backend != expected_backend:
+        raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
+    wg_bin = "awg" if backend == "awg" else "wg"
+    if not run_cmd(f"command -v {wg_bin}", check=False):
+        raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
+    module = "amneziawg" if backend == "awg" else "wireguard"
+    if not command_succeeds(f"modprobe -n {module}"):
+        raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
+    priv, pub = read_server_key_material(backend)
+    awg_params = read_awg_params_file() if backend == "awg" else None
+    listen_port = read_listen_port()
+    conn = init_db(read_only=True)
+    try:
+        quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
+        if str(quick_check).lower() != "ok":
+            raise RuntimeError(f"Проверка SQLite завершилась ошибкой: {quick_check}")
+        rows = [dict(row) for row in conn.execute(
+            "SELECT name, pubkey, privkey, ip, admin, internet, blocked, comment FROM users ORDER BY ip"
+        ).fetchall()]
+    finally:
+        conn.close()
+    validate_user_rows(rows, wg_bin)
+    return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "listen_port": listen_port, "users": rows}
 
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
     check_rule = rule.replace(" -A ", " -C ", 1)
-    add_rule = rule
     res = subprocess.run(check_rule, shell=True, capture_output=True, text=True)
     if res.returncode != 0:
-        run_cmd(add_rule)
+        run_cmd(rule)
 
 def delete_iptables_rule(rule):
-    """Удаляет правило iptables, если оно существует."""
+    """Удаляет одно точное правило iptables, если оно существует."""
     delete_rule = rule.replace(" -A ", " -D ", 1)
     run_cmd(f"{delete_rule} 2>/dev/null || true", check=False)
 
-def cleanup_firewall_rules():
-    """Удаляет базовые и пользовательские правила LanFabric."""
-    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
+def get_wan_interface(ip):
+    """Проверяет однозначный физический выход для пересылаемого IPv4 клиента."""
+    if ipaddress.ip_address(ip) not in ipaddress.ip_network(VPN_NET):
+        raise RuntimeError("IP клиента вне VPN-сети; определение WAN прекращено")
+    rules = [line.split() for line in run_cmd("ip -4 rule show").splitlines()]
+    if rules != [["0:", "from", "all", "lookup", "local"],
+                 ["32766:", "from", "all", "lookup", "main"],
+                 ["32767:", "from", "all", "lookup", "default"]]:
+        raise RuntimeError("Дополнительные IPv4 policy rules: выход клиента неоднозначен")
+
+    defaults = run_cmd("ip -4 route show table main default").splitlines()
+    if len(defaults) != 1:
+        raise RuntimeError("Нужен ровно один маршрут IPv4 по умолчанию для клиентов")
+    parts = defaults[0].split()
+    if (parts[:2] != ["default", "via"] or parts.count("via") != 1 or parts.count("dev") != 1 or
+            parts.index("via") + 1 >= len(parts) or parts.index("dev") + 1 >= len(parts)):
+        raise RuntimeError("Неоднозначный IPv4 маршрут по умолчанию для NAT")
+    gateway = parts[parts.index("via") + 1]
+    interface = parts[parts.index("dev") + 1]
+    if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", interface) or interface in (WG_IF, "lo"):
+        raise RuntimeError("Внешний IPv4-интерфейс для NAT отсутствует или является туннелем")
+    try:
+        ipaddress.IPv4Address(gateway)
+        links = json.loads(run_cmd(f"ip -d -j link show dev {interface}"))
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(f"Не удалось проверить внешний интерфейс NAT: {e}") from e
+    if (not isinstance(links, list) or len(links) != 1 or not isinstance(links[0], dict) or
+            links[0].get("ifname") != interface or
+            links[0].get("link_type") != "ether" or links[0].get("linkinfo") or
+            not isinstance(links[0].get("flags"), list) or
+            "UP" not in links[0].get("flags", [])):
+        raise RuntimeError("Интерфейс NAT не подтверждён как активный физический Ethernet")
+
+    for probe in ("1.1.1.1", "8.8.8.8"):
+        if run_cmd(f"ip -4 route show table main match {probe}/32").splitlines() != defaults:
+            raise RuntimeError("Для контрольного адреса есть особый маршрут; выбор WAN неоднозначен")
+        route = run_cmd(f"ip -4 route get {probe} from {ip} iif {WG_IF}").splitlines()
+        tokens = route[0].split() if route else []
+        if (not tokens or tokens[0] != probe or tokens.count("dev") != 1 or
+                tokens.count("via") != 1 or tokens.index("dev") + 1 >= len(tokens) or
+                tokens.index("via") + 1 >= len(tokens) or
+                tokens[tokens.index("dev") + 1] != interface or
+                tokens[tokens.index("via") + 1] != gateway):
+            raise RuntimeError("Пересылаемый трафик клиента идёт не по проверенному WAN-маршруту")
+    return interface
+
+def _iptables_prefix(table):
+    return "iptables" if table == "filter" else f"iptables -t {table}"
+
+def _chain_exists(table, chain):
+    return subprocess.run(
+        f"{_iptables_prefix(table)} -S {chain}",
+        shell=True, capture_output=True, text=True
+    ).returncode == 0
+
+def _ensure_chain(table, chain):
+    if not _chain_exists(table, chain):
+        run_cmd(f"{_iptables_prefix(table)} -N {chain}")
+
+def _delete_rule_all(table, chain, spec, limit=64):
+    """Удаляет все точные копии правила с конечным пределом повторов."""
+    prefix = _iptables_prefix(table)
+    for _ in range(limit):
+        check = subprocess.run(
+            f"{prefix} -C {chain} {spec}",
+            shell=True, capture_output=True, text=True
+        )
+        if check.returncode != 0:
+            return
+        run_cmd(f"{prefix} -D {chain} {spec}")
+    raise RuntimeError(f"Слишком много повторов правила iptables: {table}/{chain} {spec}")
+
+def _chain_rule_lines(table, chain):
+    output = run_cmd(f"{_iptables_prefix(table)} -S {chain}", check=False)
+    return [line for line in output.splitlines() if line.startswith("-A ")]
+
+def _remove_legacy_firewall_rules():
+    """Удаляет только узнаваемые правила LanFabric 0.0.17 для выделенной VPN-подсети."""
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -o {WG_IF} -j ACCEPT")
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j DROP")
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j MASQUERADE")
+
+    network = ipaddress.ip_network(VPN_NET)
+    for line in run_cmd("iptables -S FORWARD", check=False).splitlines():
+        match = re.fullmatch(r"-A FORWARD -s (\d+\.\d+\.\d+\.\d+)/32 -j ACCEPT", line)
+        if match:
+            try:
+                address = ipaddress.ip_address(match.group(1))
+            except ValueError:
+                continue
+            if address in network:
+                _delete_rule_all("filter", "FORWARD", f"-s {address}/32 -j ACCEPT")
+
+    for line in run_cmd("iptables -t nat -S POSTROUTING", check=False).splitlines():
+        match = re.fullmatch(r"-A POSTROUTING -s (\d+\.\d+\.\d+\.\d+)/32 -o eth0 -j MASQUERADE", line)
+        if match:
+            try:
+                address = ipaddress.ip_address(match.group(1))
+            except ValueError:
+                continue
+            if address in network:
+                _delete_rule_all("nat", "POSTROUTING", f"-s {address}/32 -o eth0 -j MASQUERADE")
+
+def close_firewall_guard(persist=True):
+    """Закрывает трафик wg0 до любых изменений runtime и ставит свой hook первым."""
+    _ensure_chain("filter", FW_GUARD_CHAIN)
+    _ensure_chain("filter", FW_FORWARD_CHAIN)
+    _ensure_chain("nat", FW_NAT_CHAIN)
+
+    run_cmd(f"iptables -I {FW_GUARD_CHAIN} 1 -j DROP")
+    hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
+    current_rules = _chain_rule_lines("filter", "FORWARD")
+    if not current_rules or current_rules[0] != hook:
+        run_cmd(f"iptables -I FORWARD 1 -i {WG_IF} -j {FW_GUARD_CHAIN}")
+        current_rules = _chain_rule_lines("filter", "FORWARD")
+
+    duplicate_positions = [
+        index + 1 for index, rule in enumerate(current_rules)
+        if rule == hook and index != 0
+    ]
+    for position in reversed(duplicate_positions):
+        run_cmd(f"iptables -D FORWARD {position}")
+
+    if persist:
+        run_cmd("netfilter-persistent save")
+
+def public_client_firewall_rules():
+    """Проверяет внешние клиентские правила; возвращает только доказанно свои."""
+    owned = []
+    network = ipaddress.ip_network(VPN_NET)
+    for table, chain, target, marker in (
+        ("filter", "FORWARD", "ACCEPT", FORWARD_MARK),
+        ("nat", "POSTROUTING", "MASQUERADE", NAT_MARK),
+    ):
+        for line in run_cmd(f"{_iptables_prefix(table)} -S {chain}").splitlines():
+            parts = shlex.split(line)
+            if parts[:2] != ["-A", chain] or "-s" not in parts or "-j" not in parts:
+                continue
+            source_index = parts.index("-s") + 1
+            target_index = parts.index("-j") + 1
+            if source_index >= len(parts) or target_index >= len(parts):
+                raise RuntimeError("Не удалось разобрать клиентское правило; нужна отдельная миграция")
+            if parts[target_index] not in (target, "SNAT" if table == "nat" else target):
+                continue
+            try:
+                source = ipaddress.ip_network(parts[source_index], strict=False)
+            except ValueError:
+                raise RuntimeError("Не удалось проверить источник клиентского правила; нужна отдельная миграция")
+            if source.version != network.version or not source.overlaps(network):
+                continue
+            address = source.network_address
+            expected = ["-A", chain, "-s", parts[source_index]]
+            if table == "nat":
+                if len(parts) < 6 or parts[4] != "-o" or not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", parts[5]):
+                    raise RuntimeError("NAT без доказанной принадлежности LanFabric; нужна отдельная миграция")
+                expected += ["-o", parts[5]]
+            expected += ["-m", "comment", "--comment", marker, "-j", target]
+            if source.prefixlen != 32 or address not in network or parts != expected:
+                raise RuntimeError("Правило VPN без доказанной принадлежности LanFabric; нужна отдельная миграция")
+            owned.append((table, chain, shlex.join(parts[2:])))
+    return owned
+
+def _remove_owned_public_client_rules():
+    """Удаляет и перепроверяет только маркированные правила прежней ветки NAT."""
+    for table, chain, spec in public_client_firewall_rules():
+        _delete_rule_all(table, chain, spec)
+    if public_client_firewall_rules():
+        raise RuntimeError("Маркированные правила остались после удаления; очистка не подтверждена")
+
+def prepare_internet_policy(snapshot):
+    """Выбирает WAN для активных клиентов до замены участников и правил."""
+    interfaces = {}
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            interfaces[row["ip"]] = get_wan_interface(row["ip"])
+    if len(set(interfaces.values())) > 1:
+        raise RuntimeError("Активные клиенты используют разные WAN-интерфейсы; применение остановлено")
+    if "wan_interfaces" in snapshot and snapshot["wan_interfaces"] != interfaces:
+        raise RuntimeError("WAN изменился во время применения; защитный запрет трафика должен остаться закрытым")
+    return dict(snapshot, wan_interfaces=interfaces)
+
+def rebuild_policy_chains(snapshot):
+    """Пересобирает принадлежащие LanFabric цепочки при закрытом guard."""
+    snapshot = prepare_internet_policy(snapshot)
+    _remove_owned_public_client_rules()
+    _ensure_chain("filter", FW_FORWARD_CHAIN)
+    _ensure_chain("nat", FW_NAT_CHAIN)
+    run_cmd(f"iptables -F {FW_FORWARD_CHAIN}")
+    run_cmd(f"iptables -t nat -F {FW_NAT_CHAIN}")
+
+    run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -o {WG_IF} -j ACCEPT")
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -s {row['ip']}/32 -j ACCEPT")
+            interface = snapshot["wan_interfaces"][row["ip"]]
+            run_cmd(f"iptables -t nat -A {FW_NAT_CHAIN} -s {row['ip']}/32 -o {interface} -j MASQUERADE")
+    run_cmd(f"iptables -A {FW_FORWARD_CHAIN} -j DROP")
+
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
+    run_cmd(f"iptables -t nat -I POSTROUTING 1 -s {VPN_NET} -j {FW_NAT_CHAIN}")
+
+def open_firewall_guard():
+    """Переводит guard из DROP в проверенную рабочую policy без открытого промежутка."""
+    _delete_rule_all("filter", FW_GUARD_CHAIN, f"-j {FW_FORWARD_CHAIN}")
+    run_cmd(f"iptables -A {FW_GUARD_CHAIN} -j {FW_FORWARD_CHAIN}")
+    _delete_rule_all("filter", FW_GUARD_CHAIN, "-j DROP")
+
+def cleanup_owned_firewall(allow_missing=False):
+    """Удаляет только собственные цепочки и доказанно свои клиентские правила."""
+    if allow_missing and not command_succeeds("command -v iptables"):
+        if interface_exists():
+            raise RuntimeError("Есть интерфейс VPN, но нет iptables для проверки правил; установка остановлена")
+        return
+    _remove_owned_public_client_rules()
+    _delete_rule_all("filter", "FORWARD", f"-i {WG_IF} -j {FW_GUARD_CHAIN}")
+    _delete_rule_all("nat", "POSTROUTING", f"-s {VPN_NET} -j {FW_NAT_CHAIN}")
+
+    if _chain_exists("filter", FW_GUARD_CHAIN):
+        run_cmd(f"iptables -F {FW_GUARD_CHAIN}")
+    if _chain_exists("filter", FW_FORWARD_CHAIN):
+        run_cmd(f"iptables -F {FW_FORWARD_CHAIN}")
+    if _chain_exists("nat", FW_NAT_CHAIN):
+        run_cmd(f"iptables -t nat -F {FW_NAT_CHAIN}")
+
+    if _chain_exists("filter", FW_GUARD_CHAIN):
+        run_cmd(f"iptables -X {FW_GUARD_CHAIN}")
+    if _chain_exists("filter", FW_FORWARD_CHAIN):
+        run_cmd(f"iptables -X {FW_FORWARD_CHAIN}")
+    if _chain_exists("nat", FW_NAT_CHAIN):
+        run_cmd(f"iptables -t nat -X {FW_NAT_CHAIN}")
+
+
+def ensure_legacy_base_firewall_rules():
+    """Сохраняет прежний firewall-контракт только для backend wg."""
     delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
-    delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {VPN_NET} -j MASQUERADE")
-
-    if os.path.exists(DB_PATH):
-        try:
-            conn = init_db()
-            rows = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-            for row in rows:
-                ip = row[0]
-                delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-                delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-        except Exception as e:
-            log.warning(f"Не удалось очистить правила клиентов из БД: {e}")
-
-def forward_drop_rule():
-    """Возвращает базовое запрещающее правило для трафика из VPN."""
-    return f"iptables -A FORWARD -i {WG_IF} -j DROP"
-
-
-def ensure_forward_drop_last():
-    """Ставит общий DROP последним, чтобы разрешающие правила успели сработать."""
-    rule = forward_drop_rule()
-    delete_iptables_rule(rule)
-    ensure_iptables_rule(rule)
-
-
-def ensure_base_firewall_rules():
-    """Восстанавливает базовые правила LanFabric в правильном порядке."""
-    delete_iptables_rule(forward_drop_rule())
     ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    ensure_forward_drop_last()
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
 
-
-def ensure_client_internet_rules(ip):
-    """Разрешает пользователю интернет до общего DROP и включает NAT."""
-    delete_iptables_rule(forward_drop_rule())
+def ensure_legacy_client_internet_rules(ip):
+    """Сохраняет прежний internet-контракт только для backend wg."""
+    delete_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
     ensure_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
     ensure_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-    ensure_forward_drop_last()
+    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -j DROP")
+
+def load_runtime_identity(expected_backend=None):
+    """Читает минимум данных для безопасной остановки/проверки владения интерфейсом."""
+    backend = require_backend()
+    if expected_backend is not None and backend != expected_backend:
+        raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
+    _, pub = read_server_key_material(backend)
+    return {"backend": backend, "wg_bin": "awg" if backend == "awg" else "wg", "server_public_key": pub}
+
+def interface_exists():
+    return subprocess.run(
+        f"ip link show {WG_IF}", shell=True, capture_output=True, text=True
+    ).returncode == 0
+
+def awg_interface_ownership(identity):
+    """Возвращает absent/owned/unknown для wg0."""
+    if not interface_exists():
+        return "absent"
+    detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
+    if "amneziawg" not in detail.lower():
+        return "unknown"
+    actual_pub = run_cmd(f"awg show {WG_IF} public-key", check=False).strip()
+    return "owned" if actual_pub == identity["server_public_key"] else "unknown"
+
+def _apply_awg_peers(snapshot):
+    current = run_cmd(f"awg show {WG_IF} peers", check=False)
+    for peer in current.splitlines():
+        if peer:
+            run_cmd(f"awg set {WG_IF} peer {peer} remove")
+    for row in _active_users(snapshot):
+        run_cmd(
+            f"awg set {WG_IF} peer {row['pubkey']} "
+            f"allowed-ips {row['ip']}/32 persistent-keepalive 25"
+        )
+
+def firewall_readiness_errors(snapshot, guard_open=True):
+    """Проверяет точную принадлежащую LanFabric firewall policy."""
+    errors = []
+    try:
+        snapshot = prepare_internet_policy(snapshot)
+        if public_client_firewall_rules():
+            errors.append("Вне собственных цепочек остались маркированные правила клиентов")
+    except RuntimeError as e:
+        errors.append(str(e))
+        return errors
+    forward_rules = _chain_rule_lines("filter", "FORWARD")
+    hook = f"-A FORWARD -i {WG_IF} -j {FW_GUARD_CHAIN}"
+    if not forward_rules or forward_rules[0] != hook:
+        errors.append("Hook LanFabric не является первым правилом FORWARD для wg0")
+    if forward_rules.count(hook) != 1:
+        errors.append("Hook LanFabric присутствует в FORWARD не ровно один раз")
+
+    guard_rules = _chain_rule_lines("filter", FW_GUARD_CHAIN)
+    if guard_open:
+        expected_guard = [f"-A {FW_GUARD_CHAIN} -j {FW_FORWARD_CHAIN}"]
+        if guard_rules != expected_guard:
+            errors.append("Защитный guard LanFabric не находится в рабочем состоянии")
+    elif not guard_rules or guard_rules[0] != f"-A {FW_GUARD_CHAIN} -j DROP":
+        errors.append("Защитный guard LanFabric не закрыт во время применения")
+
+    expected_forward = [f"-A {FW_FORWARD_CHAIN} -o {WG_IF} -j ACCEPT"]
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            expected_forward.append(f"-A {FW_FORWARD_CHAIN} -s {row['ip']}/32 -j ACCEPT")
+    expected_forward.append(f"-A {FW_FORWARD_CHAIN} -j DROP")
+    if _chain_rule_lines("filter", FW_FORWARD_CHAIN) != expected_forward:
+        errors.append("Цепочка FORWARD LanFabric не совпадает с политиками БД")
+
+    expected_nat = []
+    for row in _active_users(snapshot):
+        if int(row["internet"]):
+            interface = snapshot["wan_interfaces"][row["ip"]]
+            expected_nat.append(f"-A {FW_NAT_CHAIN} -s {row['ip']}/32 -o {interface} -j MASQUERADE")
+    if _chain_rule_lines("nat", FW_NAT_CHAIN) != expected_nat:
+        errors.append("Цепочка NAT LanFabric не совпадает с политиками БД")
+
+    nat_rules = _chain_rule_lines("nat", "POSTROUTING")
+    nat_hook = f"-A POSTROUTING -s {VPN_NET} -j {FW_NAT_CHAIN}"
+    if not nat_rules or nat_rules[0] != nat_hook or nat_rules.count(nat_hook) != 1:
+        errors.append("Переход в цепочку NAT LanFabric должен быть первым и единственным")
+    return errors
+
+def _verify_awg_before_open(snapshot):
+    errors = runtime_readiness_errors(snapshot, check_firewall=False)
+    errors.extend(firewall_readiness_errors(snapshot, guard_open=False))
+    if errors:
+        raise RuntimeError("Runtime не готов к открытию guard: " + "; ".join(errors))
+
+def _verify_awg_ready(snapshot):
+    errors = runtime_readiness_errors(snapshot, check_firewall=False)
+    errors.extend(firewall_readiness_errors(snapshot, guard_open=True))
+    if errors:
+        raise RuntimeError("Runtime AWG не прошёл финальную проверку: " + "; ".join(errors))
+
+def _restore_awg_runtime_locked(snapshot):
+    """Fail-closed восстановление AWG из одного проверенного снимка."""
+    ownership = awg_interface_ownership(snapshot)
+    if ownership == "unknown":
+        raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
+
+    close_firewall_guard(persist=True)
+    created = ownership == "absent"
+    try:
+        run_cmd("modprobe amneziawg")
+        setconf_path = str(write_setconf(
+            snapshot["server_private_key"], "awg", awg_params=snapshot["awg_params"],
+            listen_port=snapshot.get("listen_port", WG_BASE_PORT)
+        ))
+        if created:
+            run_cmd(f"ip link add {WG_IF} type amneziawg")
+        else:
+            run_cmd(f"ip link set down dev {WG_IF}")
+        try:
+            run_cmd(f"awg setconf {WG_IF} {setconf_path}")
+        except (RuntimeError, OSError):
+            # tools может включить отвергнутую строку с HPK в stderr.
+            raise RuntimeError("Не удалось применить конфигурацию AWG; проверьте совместимость tools и модуля") from None
+        run_cmd(f"ip -4 addr flush dev {WG_IF}")
+        run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
+        snapshot = prepare_internet_policy(snapshot)
+        public_client_firewall_rules()
+        _apply_awg_peers(snapshot)
+        rebuild_policy_chains(snapshot)
+        run_cmd(f"ip link set up dev {WG_IF}")
+        _verify_awg_before_open(snapshot)
+        open_firewall_guard()
+        _verify_awg_ready(snapshot)
+        run_cmd("netfilter-persistent save")
+    except Exception as original:
+        try:
+            if awg_interface_ownership(snapshot) == "owned":
+                run_cmd(f"ip link set down dev {WG_IF}", check=False)
+            close_firewall_guard(persist=True)
+        except Exception as cleanup_error:
+            log.error(f"Аварийная стабилизация также завершилась ошибкой: {cleanup_error}")
+        raise original
+
+def _sync_awg_runtime_locked(snapshot):
+    """Безопасно применяет peers/policy к уже работающему собственному AWG runtime."""
+    if awg_interface_ownership(snapshot) != "owned":
+        raise RuntimeError("sync разрешён только для подтверждённого runtime LanFabric")
+    close_firewall_guard(persist=True)
+    try:
+        snapshot = prepare_internet_policy(snapshot)
+        public_client_firewall_rules()
+        _apply_awg_peers(snapshot)
+        rebuild_policy_chains(snapshot)
+        _verify_awg_before_open(snapshot)
+        open_firewall_guard()
+        _verify_awg_ready(snapshot)
+        run_cmd("netfilter-persistent save")
+    except Exception as original:
+        try:
+            close_firewall_guard(persist=True)
+        except Exception as cleanup_error:
+            log.error(f"Не удалось сохранить закрытый guard после ошибки sync: {cleanup_error}")
+        raise original
+
+def _stop_awg_runtime_locked():
+    identity = load_runtime_identity(expected_backend="awg")
+    ownership = awg_interface_ownership(identity)
+    if ownership == "unknown":
+        raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
+    if ownership == "owned":
+        close_firewall_guard(persist=True)
+        run_cmd(f"ip link set down dev {WG_IF}", check=False)
+        run_cmd(f"ip link del {WG_IF}")
+        if interface_exists():
+            close_firewall_guard(persist=True)
+            raise RuntimeError(f"Не удалось подтвердить удаление интерфейса {WG_IF}; защитный guard сохранён")
+    cleanup_owned_firewall()
+    run_cmd("netfilter-persistent save")
 
 def cmd_stop():
     """Останавливает VPN runtime без удаления пакетов и данных."""
     backend = require_backend()
     log.info(f"Остановка VPN runtime. Backend: {backend}")
-
     if backend == "wg":
         run_cmd(f"systemctl stop wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+        _remove_legacy_firewall_rules()
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
     else:
-        run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
-
-    cleanup_firewall_rules()
-    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+        _stop_awg_runtime_locked()
     log.info("VPN runtime остановлен")
     add_advice("Для повторного запуска выполните start, для проверки состояния — status или health")
 
 def cmd_start():
     """Запускает VPN runtime по сохранённому backend без полного init."""
     backend = require_backend()
-    wg_bin = get_wg_cmd()
     log.info(f"Запуск VPN runtime. Backend: {backend}")
-
     if backend == "wg":
         run_cmd(f"systemctl enable wg-quick@{WG_IF}")
         run_cmd(f"systemctl restart wg-quick@{WG_IF}")
+        cmd_sync()
     else:
-        setconf_path = str(ensure_awg_setconf())
-
-        run_cmd("command -v awg")
-        run_cmd("modprobe amneziawg")
-
-        iface_exists = subprocess.run(
-            f"ip link show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-        if iface_exists:
-            backend_ok = subprocess.run(
-                f"{wg_bin} show {WG_IF}",
-                shell=True,
-                capture_output=True,
-                text=True
-            ).returncode == 0
-            if not backend_ok:
-                log.warning(f"Интерфейс {WG_IF} существует, но backend {backend} не может его прочитать. Пересоздание интерфейса")
-                run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
-                iface_exists = False
-
-        if not iface_exists:
-            run_cmd(f"ip link add {WG_IF} type amneziawg")
-
-        run_cmd(f"{wg_bin} setconf {WG_IF} {setconf_path}")
-        if not iface_exists:
-            run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
-
-        run_cmd(f"ip link set up dev {WG_IF}")
-        ensure_base_firewall_rules()
-
-    run_cmd(f"ip link show {WG_IF}")
-    run_cmd(f"{wg_bin} show {WG_IF}")
-    cmd_sync()
+        snapshot = load_state_snapshot(expected_backend="awg")
+        _restore_awg_runtime_locked(snapshot)
     log.info("VPN runtime запущен")
     add_advice("Выполните status или health. Для подключения клиента скачайте конфиг командой config <имя>")
 
 def cmd_restart():
-    """Перезапускает VPN runtime без полного init."""
+    """Перезапускает VPN runtime без полного init под общей внешней блокировкой."""
     log.info("Перезапуск VPN runtime")
     cmd_stop()
     cmd_start()
 
 def cleanup_runtime():
-    """Останавливает VPN и удаляет runtime-состояние без удаления данных."""
-    log.info("Остановка WireGuard/AmneziaWG и очистка runtime-состояния")
+    """Останавливает подтверждённый runtime и удаляет только принадлежащее LanFabric состояние."""
+    backend = require_backend()
+    if backend == "awg":
+        _stop_awg_runtime_locked()
+    else:
+        run_cmd(f"systemctl disable --now wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+        if interface_exists():
+            run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+        _remove_legacy_firewall_rules()
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+        run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
+    if backend == "awg":
+        run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
 
-    # systemd WireGuard
-    run_cmd(f"systemctl disable --now wg-quick@{WG_IF} 2>/dev/null || true", check=False)
+def _atomic_write_root_file(path, content, mode=0o644):
+    """Атомарно записывает root-owned служебный файл."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.new-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+        dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
-    # Интерфейс
-    run_cmd(f"ip link del {WG_IF} 2>/dev/null || true", check=False)
+def trusted_python_path():
+    """Возвращает реальный доверенный путь текущего Python 3.10+."""
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Для root-службы требуется Python 3.10+")
+    path = Path(os.path.realpath(sys.executable))
+    if not path.is_file():
+        raise RuntimeError(f"Интерпретатор Python не найден: {path}")
+    for parent in [path, *path.parents]:
+        st = parent.stat()
+        if st.st_uid != 0:
+            raise RuntimeError(f"Путь Python не принадлежит root: {parent}")
+        if st.st_mode & 0o022:
+            raise RuntimeError(f"Путь Python доступен для записи группе или остальным: {parent}")
+        if str(parent) == "/":
+            break
+    return str(path)
 
-    # Правила LanFabric
-    cleanup_firewall_rules()
-    run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
+def awg_autostart_unit_text(python_path=None):
+    """Возвращает узкий boot-only systemd contract для AWG."""
+    python_path = python_path or "/usr/bin/python3"
+    return f"""[Unit]
+Description=LanFabric AWG boot restore
+After=systemd-sysctl.service netfilter-persistent.service
+Wants=netfilter-persistent.service
 
-    # Модули
-    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
-    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
+[Service]
+Type=oneshot
+ExecStart={python_path} -u {REMOTE_DIR}/vsrv-admin.py _boot-awg
+TimeoutStartSec={AWG_AUTOSTART_TIMEOUT_SECONDS}s
+Restart=no
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+[Install]
+WantedBy=multi-user.target
+"""
+
+def state_permission_errors():
+    """Проверяет доверенную цепочку root entrypoint без исправления состояния."""
+    errors = []
+    for path_text in (
+        "/", "/opt", REMOTE_DIR,
+        "/etc", "/etc/systemd", "/etc/systemd/system", WG_DIR,
+    ):
+        path = Path(path_text)
+        try:
+            st = path.stat()
+        except OSError as e:
+            errors.append(f"Не удалось проверить права {path}: {e}")
+            continue
+        if st.st_uid != 0:
+            errors.append(f"Каталог {path} не принадлежит root")
+        if st.st_mode & 0o022:
+            errors.append(f"Каталог {path} доступен для записи группе или остальным")
+
+    for path_text in (
+        f"{REMOTE_DIR}/vsrv-admin.py", DB_PATH, BACKEND_PATH,
+        AWG_PARAMS_PATH, f"{WG_DIR}/{WG_IF}.private", LISTEN_PORT_PATH,
+    ):
+        path = Path(path_text)
+        if path_text == LISTEN_PORT_PATH and not path.exists():
+            continue  # прежнее состояние без файла порта поддерживается
+        try:
+            st = path.stat()
+        except OSError as e:
+            errors.append(f"Не удалось проверить защищённый файл {path}: {e}")
+            continue
+        if st.st_uid != 0:
+            errors.append(f"Файл {path} не принадлежит root")
+        if st.st_mode & 0o077:
+            errors.append(f"Файл {path} доступен группе или остальным")
+
+    try:
+        trusted_python_path()
+    except Exception as e:
+        errors.append(str(e))
+    return errors
+
+def ensure_awg_autostart_unit():
+    """Устанавливает и разрешает boot-only unit без запуска/перезапуска VPN."""
+    load_state_snapshot(expected_backend="awg")
+    ensure_state_permissions()
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нельзя включить AWG autostart: " + "; ".join(errors))
+    python_path = trusted_python_path()
+    _atomic_write_root_file(
+        AWG_AUTOSTART_PATH,
+        awg_autostart_unit_text(python_path=python_path),
+        mode=0o644,
+    )
+    run_cmd("systemctl daemon-reload")
+    run_cmd(f"systemctl enable {AWG_AUTOSTART_UNIT}")
+    enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
+    if enabled != "enabled":
+        raise RuntimeError(f"AWG autostart не включён после установки unit: {enabled or 'unknown'}")
+
+def cancel_awg_boot_before_lock():
+    """Останавливает незавершённую boot-задачу ДО захвата runtime lock."""
+    run_cmd(f"systemctl stop {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+
+def disable_awg_autostart(remove_unit=False):
+    """Отключает будущий boot restore; текущий wg0 отдельно не останавливает."""
+    run_cmd(f"systemctl disable {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+    if remove_unit:
+        run_cmd(f"rm -f {AWG_AUTOSTART_PATH}", check=False)
+        run_cmd("systemctl daemon-reload")
+        run_cmd(f"systemctl reset-failed {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
+
+def awg_autostart_state():
+    installed = os.path.isfile(AWG_AUTOSTART_PATH)
+    enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
+    result = run_cmd(
+        f"systemctl show {AWG_AUTOSTART_UNIT} -p Result --value 2>/dev/null",
+        check=False
+    ).strip()
+    return {
+        "installed": installed,
+        "enabled": enabled == "enabled",
+        "enabled_raw": enabled or "not-found",
+        "last_result": result or "unknown",
+    }
+
+def cmd_autostart(args):
+    """Явно управляет persistent AWG autostart, не меняя текущий runtime."""
+    if args.autostart_action == "enable":
+        ensure_awg_autostart_unit()
+        log.info("AWG autostart установлен и разрешён. Текущий runtime не перезапускался.")
+    elif args.autostart_action == "disable":
+        disable_awg_autostart(remove_unit=False)
+        log.info("AWG autostart отключён. Текущий runtime не останавливался.")
+    else:
+        state = awg_autostart_state()
+        log.info(f"AWG autostart unit установлен: {'ДА' if state['installed'] else 'НЕТ'}")
+        log.info(f"AWG autostart enabled: {'ДА' if state['enabled'] else 'НЕТ'} ({state['enabled_raw']})")
+        log.info(f"Результат последней systemd-попытки: {state['last_result']}")
+        try:
+            snapshot = load_state_snapshot(expected_backend="awg")
+            errors = runtime_readiness_errors(snapshot, check_firewall=True)
+            log.info(f"Фактический AWG runtime готов: {'ДА' if not errors else 'НЕТ'}")
+        except Exception as e:
+            log.warning(f"Фактический AWG runtime готов: НЕТ ({e})")
+
+def cmd_boot_awg():
+    """Внутренняя точка входа systemd: только строгий restore, без init/fallback."""
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нарушена доверенная граница AWG autostart: " + "; ".join(errors))
+    snapshot = load_state_snapshot(expected_backend="awg")
+    _restore_awg_runtime_locked(snapshot)
+    log.info("AWG runtime автоматически восстановлен после загрузки")
 
 def remove_packages(purge=False):
     """Удаляет установленные VPN-пакеты."""
@@ -448,6 +1215,7 @@ def cmd_remove(args):
 
     log.info("Начало remove: удаление runtime и пакетов, данные сохраняются")
 
+    disable_awg_autostart(remove_unit=True)
     cleanup_runtime()
     remove_packages(purge=False)
 
@@ -462,6 +1230,7 @@ def cmd_purge(args):
 
     log.info("Начало purge: полное удаление LanFabric с сервера")
 
+    disable_awg_autostart(remove_unit=True)
     cleanup_runtime()
     remove_packages(purge=True)
     cleanup_amnezia_repo()
@@ -477,23 +1246,41 @@ def cmd_purge(args):
     print("Purge завершён. LanFabric полностью удалён с сервера.")
     add_advice("Для новой установки заново выполните init с клиента")
 
-def init_db():
-    """Создаёт или подключается к SQLite базе."""
-    conn = sqlite3.connect(DB_PATH)
+def validate_db_schema(conn):
+    """Проверяет обязательную схему БД без её изменения."""
+    expected = ["name", "pubkey", "privkey", "ip", "admin", "internet", "blocked", "comment"]
+    rows = conn.execute("PRAGMA table_info(users)").fetchall()
+    actual = [row[1] for row in rows]
+    if actual != expected:
+        raise RuntimeError("Некорректная схема БД users: " f"ожидались поля {', '.join(expected)}, получено {', '.join(actual) or 'нет таблицы'}")
+
+def init_db(create=False, read_only=False):
+    """Открывает БД. Создание разрешено только явному init-пути."""
+    if read_only and create:
+        raise RuntimeError("Нельзя одновременно создавать БД и открывать её только для чтения")
+    if not os.path.exists(DB_PATH) and not create:
+        raise RuntimeError(f"База данных отсутствует: {DB_PATH}. Автоматическое создание запрещено")
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) if read_only else sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            name TEXT PRIMARY KEY,
-            pubkey TEXT NOT NULL,
-            privkey TEXT NOT NULL,
-            ip TEXT NOT NULL UNIQUE,
-            admin INTEGER DEFAULT 0,
-            internet INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            comment TEXT DEFAULT ''
-        )
-    """)
-    conn.commit()
+    if create:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                name TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                privkey TEXT NOT NULL,
+                ip TEXT NOT NULL UNIQUE,
+                admin INTEGER DEFAULT 0,
+                internet INTEGER DEFAULT 0,
+                blocked INTEGER DEFAULT 0,
+                comment TEXT DEFAULT ''
+            )
+        """)
+        conn.commit()
+    try:
+        validate_db_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 def allocate_ip(conn):
@@ -513,33 +1300,94 @@ def allocate_ip(conn):
 
 def ensure_dirs():
     """Создаёт необходимые директории."""
-    Path(CONF_DIR).mkdir(parents=True, exist_ok=True)
+    conf_dir = Path(CONF_DIR)
+    conf_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    conf_dir.chmod(0o700)
     wg_dir = Path(WG_DIR)
     wg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     wg_dir.chmod(0o700)
 
+def ensure_state_permissions():
+    """Закрепляет root-only границу кода и состояния перед запуском root-службы."""
+    for directory in (Path(REMOTE_DIR), Path(CONF_DIR), Path(WG_DIR)):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chown(directory, 0, 0)
+        directory.chmod(0o700)
+
+    protected_files = [
+        Path(REMOTE_DIR) / "vsrv-admin.py",
+        Path(DB_PATH),
+        Path(BACKEND_PATH),
+        Path(AWG_PARAMS_PATH),
+        Path(LISTEN_PORT_PATH),
+        Path(WG_DIR) / f"{WG_IF}.private",
+        Path(WG_DIR) / f"{WG_IF}.setconf",
+    ]
+    for path in protected_files:
+        if path.exists():
+            os.chown(path, 0, 0)
+            path.chmod(0o600)
+
+    public_key = Path(WG_DIR) / f"{WG_IF}.public"
+    if public_key.exists():
+        os.chown(public_key, 0, 0)
+        public_key.chmod(0o644)
+
+    for cfg in Path(CONF_DIR).glob("*.conf"):
+        if cfg.is_file():
+            os.chown(cfg, 0, 0)
+            cfg.chmod(0o600)
+
 def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
+    # Временная установка AWG 3.1 имеет отдельные ключи, сеть и службу.
+    # init не является её миграцией и не должен создавать второй VPN рядом.
+    if os.path.lexists("/opt/lanfabric-awg31") or os.path.lexists("/etc/systemd/system/lanfabric-awg31.service"):
+        raise RuntimeError(
+            "Обнаружена отдельная установка AWG 3.1. init остановлен до изменений. "
+            "Для сохранения профилей нужна согласованная миграция по задаче #28."
+        )
+    # Проверить выбор и существующее состояние до очистки ключей/БД/runtime.
+    requested_port = getattr(args, "listen_port", None)
+    listen_port = read_listen_port() if requested_port is None else validate_listen_port(requested_port)
+    profile = getattr(args, "awg_profile", None)
+    if args.no_amnezia and profile is not None:
+        raise RuntimeError("--awg-profile несовместим с --no-amnezia")
+    awg_params = None
+    if not args.no_amnezia:
+        if profile not in (None, "legacy", "awg31"):
+            raise RuntimeError("Неизвестный профиль AmneziaWG")
+        if os.path.exists(AWG_PARAMS_PATH):
+            awg_params = read_awg_params_file()
+            saved_profile = "awg31" if "HeaderProtectionKey" in awg_params else "legacy"
+            if profile is not None and profile != saved_profile:
+                raise RuntimeError("Сохранённый профиль отличается от выбранного; автоматическая замена запрещена")
+        else:
+            awg_params = validate_awg_params(generate_awg_params(profile=profile or "legacy"))
     log.info("Начало инициализации сервера")
     ensure_dirs()
+    ensure_state_permissions()
 
     # --- Очистка предыдущего состояния ---
     log.info("Очистка предыдущего состояния VPN (если есть)")
+    disable_awg_autostart(remove_unit=True)
 
-    run_cmd("systemctl disable --now wg-quick@wg0 2>/dev/null || true", check=False)
-    run_cmd("ip link del wg0 2>/dev/null || true", check=False)
-
-    run_cmd("iptables -D FORWARD -i wg0 -o wg0 -j ACCEPT 2>/dev/null || true", check=False)
-    run_cmd("iptables -D FORWARD -i wg0 -j DROP 2>/dev/null || true", check=False)
-    run_cmd("iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true", check=False)
+    if os.path.exists(BACKEND_PATH):
+        cleanup_runtime()
+    elif interface_exists():
+        raise RuntimeError(
+            f"Интерфейс {WG_IF} существует без сохранённого backend; "
+            "его принадлежность LanFabric не подтверждена, init остановлен"
+        )
+    else:
+        cleanup_owned_firewall(allow_missing=True)
+        run_cmd("netfilter-persistent save 2>/dev/null || true", check=False)
 
     run_cmd("rm -f /etc/wireguard/wg0.conf", check=False)
     run_cmd("rm -f /etc/wireguard/wg0.private /etc/wireguard/wg0.public", check=False)
-
-    run_cmd("modprobe -r wireguard 2>/dev/null || true", check=False)
-    run_cmd("modprobe -r amneziawg 2>/dev/null || true", check=False)
-
     run_cmd("rm -f /opt/vpn-admin/backend", check=False)
+    init_db(create=True).close()
+    ensure_state_permissions()
 
     # --- Установка пакетов ---
     log.info("Обновление списка пакетов")
@@ -621,7 +1469,7 @@ def cmd_init(args):
     priv = run_cmd(f"{wg_bin} genkey")
     write_private_file(priv_path, priv)
 
-    server_pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey").strip()
+    server_pub = derive_public_key(priv, wg_bin)
     with open(pub_path, "w") as f:
         f.write(server_pub)
 
@@ -631,13 +1479,16 @@ def cmd_init(args):
     conf = f"""[Interface]
 PrivateKey = {priv}
 Address = {SERVER_IP}/24
-ListenPort = {WG_BASE_PORT}
+ListenPort = {listen_port}
 PostUp = iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -A FORWARD -i {WG_IF} -j DROP
 PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORWARD -i {WG_IF} -j DROP || true
 """
     write_private_file(f"/etc/wireguard/{WG_IF}.conf", conf)
 
-    write_setconf(priv, backend)
+    write_listen_port(listen_port)
+    if backend == "awg":
+        write_awg_params_file(awg_params)
+    write_setconf(priv, backend, awg_params=awg_params, listen_port=listen_port)
 
     # --- Поднятие интерфейса ---
     log.info("Запуск интерфейса")
@@ -646,289 +1497,228 @@ PostDown = iptables -D FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT; iptables -D FORW
         run_cmd("systemctl enable wg-quick@wg0")
         run_cmd("systemctl restart wg-quick@wg0")
     else:
-        try:
-            run_cmd("ip link add wg0 type amneziawg")
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"Не удалось создать интерфейс AmneziaWG wg0: {e}. "
-                "Модуль amneziawg загружен, но тип интерфейса amneziawg недоступен"
-            )
-        run_cmd(f"{wg_bin} setconf wg0 /etc/wireguard/{WG_IF}.setconf")
-        run_cmd(f"ip addr add {SERVER_IP}/24 dev wg0")
-        run_cmd("ip link set up dev wg0")
-        ensure_base_firewall_rules()        
+        snapshot = load_state_snapshot(expected_backend="awg")
+        _restore_awg_runtime_locked(snapshot)
 
     # --- Проверка ---
     run_cmd("ip link show wg0")
-    run_cmd(f"{wg_bin} show {WG_IF}")
+    run_cmd(f"{wg_bin} show {WG_IF} public-key")
 
     # --- Сохранение правил ---
     run_cmd("netfilter-persistent save")
+    ensure_state_permissions()
+    if backend == "awg":
+        ensure_awg_autostart_unit()
 
     log.info("Инициализация завершена. Интерфейс поднят, правила сохранены.")
     add_advice("Выполните add <имя> для создания пользователя или health для проверки системы")
 
 def cmd_status():
-    """Быстрая проверка состояния."""
-    backend = get_backend()
-    wg_bin = get_wg_cmd()
-
+    """Быстрая немутирующая проверка фактического состояния."""
+    try:
+        backend = require_backend()
+    except Exception as e:
+        log.warning(f"Backend: ошибка ({e})")
+        log.info("Состояние VPN: BROKEN")
+        add_advice("Выполните health для подробной диагностики")
+        return
     log.info(f"Backend: {backend}")
-
-    state = "UNKNOWN"
-
-    if backend == "wg":
-        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False).strip()
-        log.info(f"Сервис wg-quick@wg0: {svc or 'unknown'}")
-        state = "RUNNING" if svc == "active" else "STOPPED"
-    elif backend == "awg":
-        log.info("Сервис wg-quick@wg0: не используется для backend awg")
-        iface_exists = subprocess.run(
-            f"ip link show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-        backend_ok = subprocess.run(
-            f"{wg_bin} show {WG_IF}",
-            shell=True,
-            capture_output=True,
-            text=True
-        ).returncode == 0
-
-        if not iface_exists:
-            state = "STOPPED"
-        elif backend_ok:
-            state = "RUNNING"
-        else:
-            state = "BROKEN"
-    else:
-        log.warning(f"Неизвестный backend: {backend}")
+    snapshot = None
+    snapshot_error = None
+    try:
+        snapshot = load_state_snapshot(expected_backend=backend)
+    except Exception as e:
+        snapshot_error = str(e)
+    iface_exists = subprocess.run(f"ip link show {WG_IF}", shell=True, capture_output=True, text=True).returncode == 0
+    if not iface_exists:
+        state = "STOPPED" if snapshot_error is None else "BROKEN"
+    elif snapshot_error is not None:
         state = "BROKEN"
-
-    iface = run_cmd("ip -brief link show wg0 || echo 'не найден'", check=False)
-    log.info("Состояние интерфейса: " + iface)
-
-    wg_state = run_cmd(f"{wg_bin} show {WG_IF}", check=False)
-    if wg_state:
-        log.info(f"Состояние backend {backend}: OK")
+    elif backend == "wg":
+        svc = run_cmd(f"systemctl is-active wg-quick@{WG_IF}", check=False).strip()
+        state = "RUNNING" if svc == "active" and not runtime_readiness_errors(snapshot, check_firewall=False) else "BROKEN"
     else:
-        log.warning(f"Backend {backend} не вернул состояние интерфейса {WG_IF}")
-
+        state = "RUNNING" if not runtime_readiness_errors(snapshot, check_firewall=True) else "BROKEN"
+    iface = run_cmd(f"ip -brief link show {WG_IF} || echo 'не найден'", check=False)
+    log.info("Состояние интерфейса: " + iface)
+    if snapshot_error:
+        log.warning("Сохранённое состояние некорректно: " + snapshot_error)
     log.info(f"Состояние VPN: {state}")
+    if backend == "awg":
+        auto = awg_autostart_state()
+        log.info(
+            "AWG autostart: "
+            f"installed={'yes' if auto['installed'] else 'no'}, "
+            f"enabled={'yes' if auto['enabled'] else 'no'}, "
+            f"last_result={auto['last_result']}"
+        )
     if state == "RUNNING":
         add_advice("Можно скачивать клиентские конфиги командой config <имя> или выполнить health для полной проверки")
     elif state == "STOPPED":
         add_advice("Выполните start для запуска VPN runtime")
-    elif state == "BROKEN":
-        add_advice("Выполните health для подробной диагностики, затем restart или init при необходимости")
+    else:
+        add_advice("Выполните health для подробной диагностики; автоматическое создание потерянных данных запрещено")
+    if snapshot is not None:
+        total = len(snapshot["users"])
+        active = sum(1 for row in snapshot["users"] if not int(row["blocked"]))
+        log.info(f"Учётные записи: всего {total}, активных {active}")
 
-    conn = init_db()
-    total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
-    active = conn.execute("SELECT count(*) FROM users WHERE blocked=0").fetchone()[0]
-    log.info(f"Учётные записи: всего {total}, активных {active}")
+def _active_users(snapshot):
+    return [row for row in snapshot["users"] if not int(row["blocked"])]
+
+def _expected_peer_map(snapshot):
+    return {row["pubkey"]: f"{row['ip']}/32" for row in _active_users(snapshot)}
+
+def awg31_runtime_errors(params):
+    """Сверяет применённые поля; секретные ответы никогда не включаются в ошибки."""
+    if not params or "HeaderProtectionKey" not in params:
+        return []
+    fields = {key: key.lower() for key in AWG_PARAM_KEYS + ("S3", "S4")}
+    fields.update({
+        "HeaderProtectionKey": "header-protection-key",
+        "ContentPaddingAddition": "content-padding-addition",
+        "RekeyAfterTime": "rekey-after-time", "RekeyTimeout": "rekey-timeout",
+        "RejectAfterTime": "reject-after-time", "KeepaliveTimeout": "keepalive-timeout",
+        # В закреплённом upstream tools v3.1.20260812 поле действительно содержит эту опечатку.
+        "MaxHandshakeAttempts": "max-handshake-attemps",
+        "RandomTrailers": "random-trailers", "DisableCookies": "disable-cookies",
+    })
+    for key, field in fields.items():
+        try:
+            result = subprocess.run(["awg", "show", WG_IF, field], capture_output=True,
+                                    text=True, timeout=2)
+            if result.returncode != 0:
+                return [f"AWG 3.1: невозможно прочитать поле {key}"]
+            actual = result.stdout.strip()
+            if key == "HeaderProtectionKey":
+                matches = secrets.compare_digest(actual, str(params[key]))
+            elif key in ("RandomTrailers", "DisableCookies"):
+                matches = actual == params[key]
+            else:
+                maximum = 4294967295 if key.startswith("H") else 65535
+                _, lower, upper = _validate_awg_number(actual, key, maximum)
+                _, expected_lower, expected_upper = _validate_awg_number(params[key], key, maximum)
+                matches = (lower, upper) == (expected_lower, expected_upper)
+            if not matches:
+                return [f"AWG 3.1: применённое поле {key} не совпадает с сохранённым"]
+        except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+            return [f"AWG 3.1: не удалось проверить поле {key}"]
+    return []
+
+def runtime_readiness_errors(snapshot, check_firewall=True):
+    """Возвращает нарушения обязательных runtime-инвариантов без изменения системы."""
+    errors = []
+    backend = snapshot["backend"]
+    wg_bin = snapshot["wg_bin"]
+    detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
+    link_state = run_cmd(f"ip link show {WG_IF}", check=False)
+    if not detail or not link_state:
+        return [f"Интерфейс {WG_IF} отсутствует"]
+    flags_match = re.search(r"<([^>]*)>", link_state)
+    flags = set(flags_match.group(1).split(",")) if flags_match else set()
+    if "UP" not in flags:
+        errors.append(f"Интерфейс {WG_IF} не находится в административном состоянии UP")
+    if backend == "awg" and "amneziawg" not in detail.lower():
+        errors.append(f"Интерфейс {WG_IF} не имеет тип amneziawg")
+    actual_pub = run_cmd(f"{wg_bin} show {WG_IF} public-key", check=False).strip()
+    if actual_pub != snapshot["server_public_key"]:
+        errors.append("Публичный ключ runtime не совпадает с сохранённым ключом сервера")
+    addresses = []
+    for line in run_cmd(f"ip -4 -o addr show dev {WG_IF}", check=False).splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == "inet":
+            addresses.append(parts[3])
+    expected_address = f"{SERVER_IP}/24"
+    if addresses != [expected_address]:
+        errors.append(f"IPv4-адрес интерфейса {WG_IF}: ожидался только {expected_address}, получено {', '.join(addresses) or 'нет'}")
+    port = snapshot.get("listen_port", WG_BASE_PORT)
+    listen_port = run_cmd(f"{wg_bin} show {WG_IF} listen-port", check=False).strip()
+    if listen_port != str(port):
+        errors.append(f"ListenPort: ожидался {port}, получено {listen_port or 'нет'}")
+    if backend == "awg":
+        errors.extend(awg31_runtime_errors(snapshot.get("awg_params")))
+    actual_peers = set(filter(None, run_cmd(f"{wg_bin} show {WG_IF} peers", check=False).splitlines()))
+    expected_peers = set(_expected_peer_map(snapshot))
+    if actual_peers != expected_peers:
+        errors.append("Состав peers runtime не совпадает с активными пользователями БД")
+    allowed = {}
+    for line in run_cmd(f"{wg_bin} show {WG_IF} allowed-ips", check=False).splitlines():
+        parts = line.split()
+        if parts:
+            allowed[parts[0]] = " ".join(parts[1:])
+    if allowed != _expected_peer_map(snapshot):
+        errors.append("AllowedIPs peers не совпадают с адресами активных пользователей БД")
+    if not run_cmd(f"ss -ulnH 'sport = :{port}'", check=False):
+        errors.append(f"Порт {port}/UDP не слушается")
+    if run_cmd("sysctl -n net.ipv4.ip_forward", check=False).strip() != "1":
+        errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
+    if backend == "wg":
+        svc = run_cmd(f"systemctl is-active wg-quick@{WG_IF}", check=False).strip()
+        if svc != "active":
+            errors.append(f"Сервис wg-quick@{WG_IF} не активен (сейчас: {svc or 'unknown'})")
+    if check_firewall:
+        if backend == "awg":
+            errors.extend(firewall_readiness_errors(snapshot, guard_open=True))
+        else:
+            if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT", shell=True, capture_output=True, text=True).returncode != 0:
+                errors.append("Базовое правило ACCEPT между VPN-клиентами отсутствует")
+            if subprocess.run(f"iptables -C FORWARD -i {WG_IF} -j DROP", shell=True, capture_output=True, text=True).returncode != 0:
+                errors.append("Базовое правило DROP для трафика из VPN отсутствует")
+    return errors
 
 def cmd_health():
-    """Глубокая диагностика."""
+    """Строгая немутирующая диагностика; при нарушении инвариантов код выхода ненулевой."""
     log.info("=== Глубокая диагностика ===")
-    errors = []
-    advices = []
-
-    # Проверка backend
-    backend = None
     try:
-        backend = get_backend()
-        log.info(f"Backend: {backend}")
-        if backend not in ("wg", "awg"):
-            errors.append(f"Неизвестный backend: {backend}")
-            advices.append("Исправьте /opt/vpn-admin/backend или выполните init заново с явным выбором backend")
+        snapshot = load_state_snapshot()
     except Exception as e:
-        errors.append(f"Backend не определён: {e}")
-        advices.append("Выполните init, чтобы явно выбрать backend и создать /opt/vpn-admin/backend")
-
-    # Проверка наличия WireGuard / AmneziaWG
-    wg_bin = get_wg_cmd(allow_missing=True)
-    if not wg_bin:
-        errors.append("Backend-команда не определена: wg/awg недоступен")
-        advices.append("Проверьте backend-файл. Backend не должен угадываться по бинарникам")
-    else:
-        bin_path = run_cmd(f"command -v {wg_bin}", check=False)
-        if bin_path:
-            log.info(f"Обнаружен бинарник backend: {wg_bin} ({bin_path})")
-        else:
-            errors.append(f"Бинарник backend не найден: {wg_bin}")
-            if backend == "awg":
-                advices.append("AmneziaWG не установлен или удалён. Если это штатное удаление — выполните init; если нужен WireGuard — выполните init --no-amnezia")
-            elif backend == "wg":
-                advices.append("WireGuard не установлен или удалён. Выполните init --no-amnezia")
-
-    # Проверка интерфейса wg0
-    iface_ok = True
-    try:
-        run_cmd(f"ip link show {WG_IF}")
-    except RuntimeError:
-        iface_ok = False
-        errors.append(f"Интерфейс {WG_IF} не поднят или отсутствует")
-        if backend == "awg":
-            advices.append("Похоже, runtime AmneziaWG потерян после остановки VPS. Выполните start, полный init не требуется")
-        elif backend == "wg":
-            advices.append("Выполните start или проверьте systemd-сервис wg-quick@wg0")
-
-    # Проверка, что backend может читать состояние интерфейса
-    backend_show_ok = True
-    if wg_bin:
-        try:
-            run_cmd(f"{wg_bin} show {WG_IF}")
-            log.info(f"Backend {backend or '?'} читает состояние интерфейса {WG_IF}")
-        except RuntimeError:
-            backend_show_ok = False
-            errors.append(f"Backend {backend or '?'} не может прочитать состояние интерфейса {WG_IF}")
-            if iface_ok:
-                advices.append("Интерфейс существует, но не соответствует выбранному backend. Выполните restart; если ошибка повторится — проверьте тип интерфейса")
-
-    # Проверка порта
-    port_open = run_cmd(f"ss -ulnH | grep :{WG_BASE_PORT}", check=False)
-    if not port_open:
-        errors.append(f"Порт {WG_BASE_PORT}/UDP не слушается")
-        if backend == "awg" and (not iface_ok or not backend_show_ok):
-            advices.append("После start порт должен появиться автоматически. Если нет — проверьте awg show wg0")
-        elif backend == "wg":
-            advices.append("Проверьте wg-quick@wg0 через status или выполните restart")
-
-    # Проверка iptables: базовое разрешение VPN-клиентам общаться между собой
-    accept_check = subprocess.run(
-        f"iptables -C FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    if accept_check.returncode != 0:
-        errors.append("Базовое правило ACCEPT для FORWARD между VPN-клиентами отсутствует")
-        advices.append("Выполните start или restart для восстановления базовых iptables-правил")
-
-    drop_check = subprocess.run(
-        f"iptables -C FORWARD -i {WG_IF} -j DROP",
-        shell=True,
-        capture_output=True,
-        text=True
-    )
-    if drop_check.returncode != 0:
-        errors.append("Базовое правило DROP для FORWARD отсутствует")
-        advices.append("Выполните start или restart для восстановления изоляции клиентов от интернета по умолчанию")
-
-    # Проверка IP forward
-    try:
-        ipf = run_cmd("sysctl -n net.ipv4.ip_forward", check=False)
-        if ipf.strip() != "1":
-            errors.append("IPv4 forward выключен (net.ipv4.ip_forward != 1)")
-            advices.append("Включите net.ipv4.ip_forward или выполните init, если sysctl-конфигурация потеряна")
-    except Exception:
-        errors.append("Не удалось проверить net.ipv4.ip_forward")
-        advices.append("Проверьте доступность sysctl на сервере")
-
-    # Проверка systemd сервиса
-    if backend == "wg":
-        svc = run_cmd("systemctl is-active wg-quick@wg0", check=False)
-        if svc.strip() != "active":
-            errors.append(f"Сервис wg-quick@wg0 не активен (сейчас: {svc.strip() or 'unknown'})")
-            advices.append("Выполните start или restart. Для WireGuard используется wg-quick@wg0")
-    elif backend == "awg":
-        log.info("Сервис wg-quick@wg0: не требуется для backend awg")
-
-    # Проверка базы данных
-    try:
-        conn = init_db()
-        total = conn.execute("SELECT count(*) FROM users").fetchone()[0]
-        log.info(f"База данных: пользователей {total}")
-    except Exception as e:
-        errors.append(f"Ошибка базы данных: {e}")
-        advices.append("Проверьте /opt/vpn-admin/vpn.db. Если БД потеряна, потребуется восстановление из резервной копии или новый init")
-
-    # Проверка порядка правил FORWARD: пользовательские ACCEPT должны быть до общего DROP.
-    try:
-        conn = init_db()
-        internet_rows = conn.execute("SELECT name, ip FROM users WHERE internet=1 AND blocked=0").fetchall()
-        forward_rules = run_cmd("iptables -S FORWARD", check=False).splitlines()
-        drop_index = None
-        for index, rule in enumerate(forward_rules):
-            if rule == f"-A FORWARD -i {WG_IF} -j DROP":
-                drop_index = index
-                break
-        if drop_index is not None:
-            for row in internet_rows:
-                accept_rule = f"-A FORWARD -s {row['ip']}/32 -j ACCEPT"
-                accept_index = None
-                for index, rule in enumerate(forward_rules):
-                    if rule == accept_rule:
-                        accept_index = index
-                        break
-                if accept_index is None:
-                    errors.append(f"Отсутствует FORWARD ACCEPT для пользователя {row['name']} ({row['ip']})")
-                    advices.append("Выполните sync для восстановления правил интернет-доступа")
-                elif accept_index > drop_index:
-                    errors.append(f"Правило ACCEPT для пользователя {row['name']} стоит после общего DROP")
-                    advices.append("Выполните sync: он переставит пользовательские ACCEPT перед общим DROP")
-    except Exception as e:
-        errors.append(f"Не удалось проверить порядок правил FORWARD: {e}")
-        advices.append("Выполните sync и затем health для повторной проверки firewall")
-
-    # Итог
+        log.warning(f"- Сохранённое состояние некорректно: {e}")
+        add_advice("Восстановите обязательные данные из резервной копии или выполните отдельный согласованный init")
+        raise RuntimeError("Health завершён с ошибкой: сохранённое состояние недостоверно")
+    errors = runtime_readiness_errors(snapshot, check_firewall=True)
     if errors:
         log.warning("Обнаружены проблемы:")
         for err in errors:
             log.warning(f"- {err}")
-        if advices:
-            for advice in dict.fromkeys(advices):
-                add_advice(advice)
-    else:
-        log.info("Система работает штатно, нарушений не выявлено")
+        add_advice("Исправьте указанное нарушение и повторите health; диагностика сама состояние не изменяет")
+        raise RuntimeError(f"Health завершён с ошибкой: нарушений {len(errors)}")
+    log.info(f"Backend: {snapshot['backend']}")
+    log.info(f"База данных: пользователей {len(snapshot['users'])}")
+    log.info("Система работает штатно, обязательные runtime-инварианты подтверждены")
 
 def cmd_sync():
-    """Пересборка состояния из базы данных."""
+    """Пересборка состояния из одного согласованного снимка БД."""
     log.info("Синхронизация состояния интерфейса и правил")
-    wg_bin = get_wg_cmd()
-    # Удаление всех пиров из интерфейса
-    current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
-    for peer in current_peers.splitlines():
-        pub = peer.split()[0] if peer else None
-        if pub:
-            run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
-
-    conn = init_db()
-    # Очистка динамических правил клиентов и временное удаление общего DROP.
-    # DROP будет добавлен последним после пользовательских ACCEPT.
-    delete_iptables_rule(forward_drop_rule())
-    rows_all = conn.execute("SELECT ip FROM users WHERE ip IS NOT NULL").fetchall()
-    for row in rows_all:
-        ip = row[0]
-        delete_iptables_rule(f"iptables -A FORWARD -s {ip} -j ACCEPT")
-        delete_iptables_rule(f"iptables -t nat -A POSTROUTING -s {ip} -o eth0 -j MASQUERADE")
-
-    ensure_iptables_rule(f"iptables -A FORWARD -i {WG_IF} -o {WG_IF} -j ACCEPT")
-    
-    # Восстановление пиров и правил
-    rows = conn.execute("SELECT pubkey, ip, internet, blocked FROM users WHERE blocked=0").fetchall()
-    for row in rows:
-        pub, ip, internet, _ = row
-        allowed = f"{ip}/32"
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {allowed} persistent-keepalive 25")
-        if internet:
-            ensure_client_internet_rules(ip)
-
-    ensure_forward_drop_last()
-    run_cmd("netfilter-persistent save")
+    snapshot = load_state_snapshot()
+    if snapshot["backend"] == "awg":
+        _sync_awg_runtime_locked(snapshot)
+    else:
+        wg_bin = snapshot["wg_bin"]
+        current_peers = run_cmd(f"{wg_bin} show {WG_IF} peers")
+        for peer in current_peers.splitlines():
+            if peer:
+                run_cmd(f"{wg_bin} set {WG_IF} peer {peer} remove")
+        _remove_legacy_firewall_rules()
+        ensure_legacy_base_firewall_rules()
+        for row in _active_users(snapshot):
+            run_cmd(f"{wg_bin} set {WG_IF} peer {row['pubkey']} allowed-ips {row['ip']}/32 persistent-keepalive 25")
+            if int(row["internet"]):
+                ensure_legacy_client_internet_rules(row["ip"])
+        run_cmd("netfilter-persistent save")
     log.info("Синхронизация завершена")
     add_advice("Выполните health для проверки правил или config <имя> для скачивания клиентского конфига")
 
 def build_client_config(row, endpoint=None):
     """Формирует клиентский конфиг из данных БД."""
-    server_pub = open(f"/etc/wireguard/{WG_IF}.public").read().strip()
+    with open(f"{WG_DIR}/{WG_IF}.public") as public_file:
+        server_pub = public_file.read().strip()
     server_ip = str(endpoint).strip() if endpoint else run_cmd("hostname -I | awk '{print $1}'").strip()
     allowed_ips = "0.0.0.0/0" if row["internet"] else VPN_NET
     backend = require_backend()
+    listen_port = read_listen_port()
     awg_params = ""
     if backend == "awg":
-        awg_params = "\n" + format_awg_params(get_or_create_awg_params())
+        awg_params = "\n" + format_awg_params(read_awg_params_file())
 
     return f"""[Interface]
 PrivateKey = {row["privkey"]}
@@ -937,7 +1727,7 @@ DNS = 8.8.8.8{awg_params}
 
 [Peer]
 PublicKey = {server_pub}
-Endpoint = {server_ip}:{WG_BASE_PORT}
+Endpoint = {server_ip}:{listen_port}
 AllowedIPs = {allowed_ips}
 PersistentKeepalive = 25
 """
@@ -956,7 +1746,7 @@ def cmd_backend():
 
 def cmd_config(args):
     """Выводит клиентский конфиг в stdout для безопасного скачивания через sudo."""
-    conn = init_db()
+    conn = init_db(read_only=True)
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     if not row:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
@@ -970,13 +1760,16 @@ def cmd_add(args):
         raise RuntimeError(f"Учётная запись '{args.name}' уже существует")
         
     ip = allocate_ip(conn)
-    wg_bin = get_wg_cmd()
-    priv = run_cmd(f"{wg_bin} genkey")
-    pub = run_cmd(f"echo '{priv}' | {wg_bin} pubkey")
-    
     admin_val = 1 if args.admin else 0
     internet_val = 1 if (args.admin or args.internet) else 0
     blocked_val = 1 if args.block else 0
+    backend = require_backend()
+    if backend == "awg" and internet_val and not blocked_val:
+        get_wan_interface(ip)
+        public_client_firewall_rules()
+    wg_bin = get_wg_cmd()
+    priv = run_cmd(f"{wg_bin} genkey")
+    pub = derive_public_key(priv, wg_bin)
     
     conn.execute(
         "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -984,14 +1777,22 @@ def cmd_add(args):
     )
     conn.commit()
     
-    if not blocked_val:
-        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
-        if internet_val:
-            ensure_client_internet_rules(ip)
-            run_cmd("netfilter-persistent save")
-            
     row = conn.execute("SELECT * FROM users WHERE name=?", (args.name,)).fetchone()
     cfg_path = write_client_config(row)
+
+    if backend == "awg":
+        try:
+            _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+        except Exception as e:
+            raise RuntimeError(
+                f"Учётная запись '{args.name}' сохранена, но применение не завершено: {e}. "
+                "Не включайте клиент; проверьте list/health и устраните причину перед повторным sync"
+            ) from e
+    elif not blocked_val:
+        run_cmd(f"{wg_bin} set {WG_IF} peer {pub} allowed-ips {ip}/32 persistent-keepalive 25")
+        if internet_val:
+            ensure_legacy_client_internet_rules(ip)
+            run_cmd("netfilter-persistent save")
     
     log.info(f"Учётная запись '{args.name}' создана. IP: {ip}, Админ: {bool(admin_val)}, Интернет: {bool(internet_val)}")
     log.info(f"Конфиг сохранён: {cfg_path}")
@@ -1029,55 +1830,57 @@ def cmd_edit(args):
     add_advice("Выполните sync для применения сетевых правил. Если менялся интернет-доступ, заново скачайте config <имя>")
 
 def cmd_block(args):
-    """Блокировка учётной записи."""
+    """Блокировка учётки с fail-closed применением для AWG."""
     conn = init_db()
     user = conn.execute("SELECT pubkey, ip, internet FROM users WHERE name=?", (args.name,)).fetchone()
     if not user:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
-        
     pub, ip, internet = user
-    wg_bin = get_wg_cmd()
-    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove")
-    if internet:
-        run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-        run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
-        run_cmd("netfilter-persistent save")
-        
+    backend = require_backend()
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
+
+    if backend == "awg":
+        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    else:
+        run_cmd(f"wg set {WG_IF} peer {pub} remove")
+        if internet:
+            run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
+            run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
+            run_cmd("netfilter-persistent save")
     log.info(f"Учётная запись '{args.name}' заблокирована. Соединение разорвано.")
-    add_advice("Выполните list для проверки статуса или sync для полной пересборки runtime-правил")
+    add_advice("Выполните list для проверки статуса или health для проверки runtime")
 
 def cmd_delete(args):
-    """Удаление учётной записи с подтверждением."""
+    """Удаление учётки с подтверждением и безопасным применением для AWG."""
     if args.confirm != args.name:
         raise RuntimeError("Подтверждение удаления не совпадает с именем учётной записи")
-        
     conn = init_db()
     user = conn.execute("SELECT pubkey, ip FROM users WHERE name=?", (args.name,)).fetchone()
     if not user:
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
-        
     pub, ip = user
-    wg_bin = get_wg_cmd()
-    run_cmd(f"{wg_bin} set {WG_IF} peer {pub} remove || true")
-    run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
-    run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
-    run_cmd("netfilter-persistent save")
-    
+    backend = require_backend()
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
     conn.commit()
-    
+
     cfg = Path(f"{CONF_DIR}/{args.name}.conf")
     if cfg.exists():
         cfg.unlink()
-        
+
+    if backend == "awg":
+        _sync_awg_runtime_locked(load_state_snapshot(expected_backend="awg"))
+    else:
+        run_cmd(f"wg set {WG_IF} peer {pub} remove || true")
+        run_cmd(f"iptables -D FORWARD -s {ip} -j ACCEPT || true")
+        run_cmd(f"iptables -t nat -D POSTROUTING -s {ip} -o eth0 -j MASQUERADE || true")
+        run_cmd("netfilter-persistent save")
     log.info(f"Учётная запись '{args.name}' полностью удалена.")
     add_advice("Выполните list для проверки списка пользователей")
 
 def cmd_list():
     """Список учётных записей."""
-    conn = init_db()
+    conn = init_db(read_only=True)
     rows = conn.execute("SELECT name, ip, admin, internet, blocked, comment FROM users ORDER BY ip").fetchall()
     if not rows:
         log.info("Список учётных записей пуст")
@@ -1088,14 +1891,97 @@ def cmd_list():
         status = "БЛОК" if r[4] else "АКТИВ"
         log.info(f"{r[0]:<15} {r[1]:<12} {'ДА' if r[2] else 'НЕТ':<6} {'ДА' if r[3] else 'НЕТ':<6} {status:<10} {r[5]}")
 
+def _run_internal_install_module(argv):
+    """Атомарно заменяет root-owned server module из строго проверенного /tmp staged-файла."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--sha256", required=True)
+    parser.add_argument("--version", required=True)
+    args = parser.parse_args(argv)
+
+    sudo_uid = os.environ.get("SUDO_UID")
+    if not os.environ.get("SUDO_USER") or not sudo_uid:
+        raise RuntimeError("Внутренняя установка модуля разрешена только через sudo")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
+        raise RuntimeError("Некорректный ожидаемый SHA-256")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+        raise RuntimeError("Некорректная ожидаемая версия")
+
+    source = Path(args.source)
+    if source.parent != Path("/tmp") or not re.fullmatch(r"lanfabric-vsrv-[0-9a-f]{32}\.py", source.name):
+        raise RuntimeError("Недопустимый путь staged server module")
+    st = source.lstat()
+    if not source.is_file() or source.is_symlink():
+        raise RuntimeError("Staged server module должен быть обычным файлом")
+    if st.st_uid != int(sudo_uid):
+        raise RuntimeError("Staged server module не принадлежит вызвавшему sudo пользователю")
+
+    data = source.read_bytes()
+    import hashlib
+    if hashlib.sha256(data).hexdigest() != args.sha256:
+        raise RuntimeError("SHA-256 staged server module не совпадает")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"Server module не является UTF-8: {e}")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match or match.group(1) != args.version:
+        raise RuntimeError("Версия staged server module не совпадает")
+    compile(text, str(source), "exec")
+
+    target = Path(REMOTE_DIR) / "vsrv-admin.py"
+    Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(REMOTE_DIR, 0, 0)
+    os.chmod(REMOTE_DIR, 0o700)
+
+    tmp = Path(REMOTE_DIR) / f".vsrv-admin.py.new-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, target)
+        dir_fd = os.open(REMOTE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+    print("OK")
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_cleanup-temp-sudoers":
         print(_run_internal_cleanup_temp_sudoers(sys.argv[2:]))
         return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_install-module":
+        try:
+            _run_internal_install_module(sys.argv[2:])
+        except Exception as e:
+            log.error(str(e))
+            sys.exit(1)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_boot-awg":
+        try:
+            with runtime_lock():
+                cmd_boot_awg()
+        except Exception as e:
+            log.error(str(e))
+            sys.exit(1)
+        return
     
     if len(sys.argv) == 1:
         print_intro()
-        print("Краткая справка: vsrv-admin.py {init|backend|start|stop|restart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
+        print("Краткая справка: vsrv-admin.py {init|backend|start|stop|restart|autostart|status|health|sync|add|edit|block|delete|list|config|remove|purge|help} [--version]")
         sys.exit(0)
         
     if "--version" not in sys.argv and (len(sys.argv) < 2 or sys.argv[1] not in ("config", "backend")):
@@ -1104,11 +1990,16 @@ def main():
     parser = argparse.ArgumentParser(description="Серверное управление VPN-сетью", add_help=False)
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("init", help="Инициализация сервера и установка пакетов").add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    p_init = subparsers.add_parser("init", help="Инициализация сервера и установка пакетов")
+    p_init.add_argument("--no-amnezia", action="store_true", help="Использовать стандартный WireGuard вместо AmneziaWG")
+    p_init.add_argument("--listen-port", type=int, default=None, help="UDP-порт 1..65535; при отсутствии сохраняется прежний")
+    p_init.add_argument("--awg-profile", choices=["legacy", "awg31"], default=None, help="Профиль AWG; существующий не заменяется, новый по умолчанию legacy")
     subparsers.add_parser("backend", help="Вывести сохранённый backend")
     subparsers.add_parser("start", help="Запуск VPN runtime без полного init")
     subparsers.add_parser("stop", help="Остановка VPN runtime без удаления данных")
     subparsers.add_parser("restart", help="Перезапуск VPN runtime без полного init")
+    p_autostart = subparsers.add_parser("autostart", help="Управление автозапуском AWG после загрузки")
+    p_autostart.add_argument("autostart_action", choices=["enable", "disable", "status"], help="Включить, отключить или проверить AWG autostart")
     subparsers.add_parser("status", help="Быстрая проверка состояния")
     subparsers.add_parser("health", help="Глубокая диагностика системы")
     subparsers.add_parser("sync", help="Пересборка состояния из базы данных")
@@ -1153,38 +2044,63 @@ def main():
         sys.exit(0)
         
     try:
-        if args.command == "init":
-            cmd_init(args)
-        elif args.command == "backend":
-            cmd_backend()
-        elif args.command == "start":
-            cmd_start()
-        elif args.command == "stop":
-            cmd_stop()
-        elif args.command == "restart":
-            cmd_restart()
-        elif args.command == "status":
-            cmd_status()
-        elif args.command == "health":
-            cmd_health()
-        elif args.command == "sync":
-            cmd_sync()
-        elif args.command == "add":
-            cmd_add(args)
-        elif args.command == "edit":
-            cmd_edit(args)
-        elif args.command == "block":
-            cmd_block(args)
-        elif args.command == "delete":
-            cmd_delete(args)
-        elif args.command == "list":
-            cmd_list()
-        elif args.command == "config":
-            cmd_config(args)
-        elif args.command == "remove":
-            cmd_remove(args)
-        elif args.command == "purge":
-            cmd_purge(args)
+        mutating_commands = {
+            "init", "start", "stop", "restart", "sync", "autostart",
+            "add", "edit", "block", "delete", "remove", "purge",
+        }
+
+        def dispatch():
+            if args.command == "init":
+                cmd_init(args)
+            elif args.command == "backend":
+                cmd_backend()
+            elif args.command == "start":
+                cmd_start()
+            elif args.command == "stop":
+                cmd_stop()
+            elif args.command == "restart":
+                cmd_restart()
+            elif args.command == "autostart":
+                cmd_autostart(args)
+            elif args.command == "status":
+                cmd_status()
+            elif args.command == "health":
+                cmd_health()
+            elif args.command == "sync":
+                cmd_sync()
+            elif args.command == "add":
+                cmd_add(args)
+            elif args.command == "edit":
+                cmd_edit(args)
+            elif args.command == "block":
+                cmd_block(args)
+            elif args.command == "delete":
+                cmd_delete(args)
+            elif args.command == "list":
+                cmd_list()
+            elif args.command == "config":
+                cmd_config(args)
+            elif args.command == "remove":
+                cmd_remove(args)
+            elif args.command == "purge":
+                cmd_purge(args)
+
+        cancel_boot_commands = {"init", "remove", "purge"}
+        if args.command == "autostart" and args.autostart_action == "disable":
+            cancel_boot_commands.add("autostart")
+
+        if args.command in cancel_boot_commands:
+            cancel_awg_boot_before_lock()
+
+        needs_lock = (
+            args.command in mutating_commands
+            and not (args.command == "autostart" and args.autostart_action == "status")
+        )
+        if needs_lock:
+            with runtime_lock():
+                dispatch()
+        else:
+            dispatch()
         flush_advice()
     except Exception as e:
         log.error(str(e))
