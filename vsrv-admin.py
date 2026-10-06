@@ -304,11 +304,10 @@ def install_go_server_module(data, expected_version, components=False):
                     atomic_root_bytes(Path(REMOTE_DIR) / "vsrv-admin.py", data, 0o700)
                     record["phase"] = "committed"
                     _atomic_write_root_file(GO_UPDATE_RECORD, json.dumps(record) + "\n", mode=0o600)
-                if record["running"]:
-                    go_systemctl("reset-failed")
-                    _go_lifecycle_locked("start", updating=True)
+                # Готовность новой поставки проверяет именно новый модуль:
+                # старый установщик не должен отвергать новый закреплённый набор.
+                run_bounded_command([trusted_python_path(), str(Path(REMOTE_DIR) / "vsrv-admin.py"), "_finish-go-update"], timeout=180)
                 with runtime_lock():
-                    load_state_snapshot("awg")
                     for path, info in record["files"].items():
                         changing = {f"{REMOTE_DIR}/vsrv-admin.py"}
                         if components:
@@ -2934,6 +2933,21 @@ def main():
             require_go_unit()
             if read_go_install_record()["phase"] != "complete":
                 raise RuntimeError("Состояние Go не завершено")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_finish-go-update":
+        if os.geteuid() != 0 or len(sys.argv) != 2 or Path(__file__).resolve() != Path(REMOTE_DIR) / "vsrv-admin.py":
+            raise RuntimeError("Завершение обновления разрешено только установленному модулю root")
+        with runtime_lock():
+            record = read_go_update_record()
+            trusted_go_path(str(Path(__file__).resolve()), private=True)
+            if record["phase"] != "committed" or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != record["new_sha256"]:
+                raise RuntimeError("Журнал не подтверждает установленный кандидат обновления")
+            load_state_snapshot("awg")
+            require_go_unit()
+        if record["running"]:
+            go_systemctl("reset-failed")
+            _go_lifecycle_locked("start", updating=True)
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "_boot-awg":

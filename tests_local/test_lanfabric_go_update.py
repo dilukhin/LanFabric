@@ -131,3 +131,11 @@ class GoUpdateTests(unittest.TestCase):
             self.assertIn("--components", install[0].args[1])
             self.assertEqual(install[0].kwargs["timeout"], 600)
             legacy.assert_not_called()
+
+    def test_unconfirmed_completion_cannot_start_service(self):
+        with patch.object(sys, "argv", ["vsrv-admin.py", "_finish-go-update"]), \
+                patch.object(srv.os, "geteuid", return_value=0, create=True), \
+                patch.object(srv, "_go_lifecycle_locked") as start:
+            with self.assertRaises(RuntimeError):
+                srv.main()
+            start.assert_not_called()

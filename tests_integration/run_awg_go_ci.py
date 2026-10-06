@@ -126,6 +126,17 @@ def main():
         if srv.go_process_identity() != before_repeat:
             raise RuntimeError("Повтор уже завершённого обновления перезапустил процесс")
         update_module(good_source, components=True)
+        # То же настоящее содержимое компонентов, но другой проверенный дескриптор.
+        # Верхний регистр hex обозначает тот же исходный Git-объект; это позволяет
+        # проверить смену описания без выдуманных исходников/сумм бинарников.
+        previous = {"go_commit": srv.AWG_GO_COMMIT, "tools_commit": srv.AWG_GO_TOOLS_COMMIT,
+                    "sha256": srv.AWG_GO_RELEASE_SHA256}
+        good_source = good_source.replace(('AWG_GO_COMMIT = "' + srv.AWG_GO_COMMIT + '"').encode(),
+                                          ('AWG_GO_COMMIT = "' + srv.AWG_GO_COMMIT.upper() + '"').encode(), 1)
+        good_source = good_source.replace(b"AWG_GO_PREVIOUS_COMPONENTS = ()", ("AWG_GO_PREVIOUS_COMPONENTS = " + repr((previous,))).encode(), 1)
+        update_module(good_source, components=True)
+        if json.loads(Path(srv.AWG_GO_MANIFEST).read_text())["go_commit"] != srv.AWG_GO_COMMIT.upper():
+            raise RuntimeError("Новый проверенный дескриптор компонентов не был установлен")
         faulty_source = good_source.replace(b"        record_go_socket(pid)\n", b"        record_go_socket(pid)\n        raise RuntimeError('CI controlled restore failure')\n", 1)
         update_module(faulty_source, components=True, expected_success=False)
         if installed.read_bytes() != good_source:
