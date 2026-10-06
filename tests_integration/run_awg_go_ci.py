@@ -11,8 +11,6 @@ import subprocess
 import sys
 import time
 import uuid
-import io
-from unittest.mock import patch
 
 GO_COMMIT = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
 TOOLS_COMMIT = "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
@@ -66,39 +64,12 @@ def main():
     fingerprints = {}
     try:
         print("Чистая установка штатным init с готовыми компонентами", flush=True)
-        # До публикации выпуска источник загрузки заменён байтами той же CI-сборки.
-        # Проверки SHA-256, доверенных путей и весь установочный путь остаются штатными.
-        def component_response(url, timeout):
-            prefix = "https://github.com/dilukhin/LanFabric/releases/download/" + srv.AWG_GO_RELEASE + "/"
-            if not url.startswith(prefix):
-                raise RuntimeError("Неожиданный источник компонента")
-            filename = url[len(prefix):]
-            if filename not in ("amneziawg-go-linux-amd64", "awg-linux-amd64"):
-                raise RuntimeError("Неожиданный компонент")
-            response = io.BytesIO((repository / "ci-dist" / filename).read_bytes())
-            response.geturl = lambda: url
-            return response
-        with patch.object(srv.urllib.request, "urlopen", side_effect=component_response), \
-                patch.object(sys, "argv", [str(installed), "init", "--implementation", "go", "--listen-port", "4387"]):
-            srv.main()
+        # Обычная команда получает уже опубликованные файлы по публичным HTTPS URL.
+        run(["/usr/bin/python3", str(installed), "init", "--implementation", "go", "--listen-port", "4387"], timeout=540)
         run(["/usr/bin/python3", str(installed), "add", "ci-peer", "--internet"])
         # Контрольный снимок содержит только хеши; значения не выводятся.
         for path in (srv.DB_PATH, srv.AWG_PARAMS_PATH, "/etc/wireguard/wg0.private", "/etc/wireguard/wg0.public", srv.LISTEN_PORT_PATH):
             fingerprints[path] = digest(path)
-        print("Неподдержанное обновление Go отказывает до замены модуля", flush=True)
-        staged_module = Path("/tmp/lanfabric-vsrv-" + uuid.uuid4().hex + ".py")
-        with staged_module.open("xb") as target:
-            target.write(installed.read_bytes())
-        try:
-            env = os.environ.copy()
-            env.update(SUDO_USER="root", SUDO_UID="0")
-            rejected = subprocess.run(["/usr/bin/python3", str(installed), "_install-module", "--source", str(staged_module),
-                                       "--sha256", digest(staged_module), "--version", srv.__version__],
-                                      capture_output=True, env=env, timeout=30)
-            if rejected.returncode == 0 or digest(installed) != digest(staged_module):
-                raise RuntimeError("Неподдержанное обновление изменило модуль Go")
-        finally:
-            staged_module.unlink()
         run(["/usr/bin/python3", str(installed), "init", "--implementation", "go"])
         for action in ("start", "start", "sync", "restart", "stop", "start"):
             print("Штатная команда: " + action, flush=True)
@@ -128,6 +99,73 @@ def main():
             raise RuntimeError("Служба не восстановилась после SIGKILL в установленный срок")
         if any(digest(path) != expected for path, expected in fingerprints.items()):
             raise RuntimeError("Аварийное восстановление изменило сохранённое состояние")
+        print("Успешное обновление, возврат после отказа и повтор после обрыва", flush=True)
+        env = os.environ.copy()
+        env.update(SUDO_USER="root", SUDO_UID="0")
+        def update_module(contents, components=False, expected_success=True):
+            staged = Path("/tmp/lanfabric-vsrv-" + uuid.uuid4().hex + ".py")
+            staged.write_bytes(contents)
+            staged.chmod(0o600)
+            command = ["/usr/bin/python3", str(installed), "_install-module", "--source", str(staged),
+                       "--sha256", digest(staged), "--version", srv.__version__]
+            if components:
+                command.append("--components")
+            try:
+                result = subprocess.run(command, capture_output=True, env=env, timeout=180)
+                if (result.returncode == 0) != expected_success:
+                    raise RuntimeError("Проверка обновления дала неожиданный результат; вывод состояния скрыт")
+            finally:
+                staged.unlink()
+        good_source = installed.read_bytes() + b"\n# CI: candidate update\n"
+        profile_before = run(["/usr/bin/python3", str(installed), "config", "ci-peer", "--endpoint", "198.51.100.42"])
+        update_module(good_source)
+        if installed.read_bytes() != good_source:
+            raise RuntimeError("Успешное обновление не заменило модуль")
+        before_repeat = srv.go_process_identity()
+        update_module(good_source)
+        if srv.go_process_identity() != before_repeat:
+            raise RuntimeError("Повтор уже завершённого обновления перезапустил процесс")
+        update_module(good_source, components=True)
+        faulty_source = good_source.replace(b"        record_go_socket(pid)\n", b"        record_go_socket(pid)\n        raise RuntimeError('CI controlled restore failure')\n", 1)
+        update_module(faulty_source, components=True, expected_success=False)
+        if installed.read_bytes() != good_source:
+            raise RuntimeError("Отказ не вернул прежний модуль")
+        run(["/usr/bin/python3", str(installed), "health"])
+        if any(digest(path) != expected for path, expected in fingerprints.items()):
+            raise RuntimeError("Возврат изменил сохранённые ключи, параметры или пользователей")
+        if run(["/usr/bin/python3", str(installed), "config", "ci-peer", "--endpoint", "198.51.100.42"]) != profile_before:
+            raise RuntimeError("Возврат изменил клиентский профиль")
+        delayed = good_source.replace(b"def go_restore_locked():\n", b"def go_restore_locked():\n    time.sleep(4)\n", 1)
+        staged = Path("/tmp/lanfabric-vsrv-" + uuid.uuid4().hex + ".py")
+        staged.write_bytes(delayed)
+        process = subprocess.Popen(["/usr/bin/python3", str(installed), "_install-module", "--source", str(staged),
+                                    "--sha256", digest(staged), "--version", srv.__version__],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        try:
+            deadline = time.monotonic() + 30
+            interrupted = False
+            while time.monotonic() < deadline and process.poll() is None:
+                time.sleep(0.05)
+                record = srv.read_go_update_record()
+                if record["phase"] == "committed" and digest(installed) == digest(staged):
+                    process.kill()
+                    process.communicate(timeout=15)
+                    interrupted = True
+                    break
+            if not interrupted:
+                raise RuntimeError("Не удалось прервать испытательное обновление на записанном этапе")
+            rejected = subprocess.run(["/usr/bin/python3", str(installed), "add", "must-not-exist"], capture_output=True, timeout=30)
+            if rejected.returncode == 0 or any(digest(path) != expected for path, expected in fingerprints.items()):
+                raise RuntimeError("Незавершённое обновление разрешило изменение участников")
+            update_module(delayed)
+            run(["/usr/bin/python3", str(installed), "health"])
+            if run(["/usr/bin/python3", str(installed), "config", "ci-peer", "--endpoint", "198.51.100.42"]) != profile_before:
+                raise RuntimeError("Повтор после обрыва изменил клиентский профиль")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=15)
+            staged.unlink()
         print("Удаление службы и повторная установка без смены профилей", flush=True)
         run(["/usr/bin/python3", str(installed), "remove", "REMOVE"])
         if Path(srv.AWG_GO_UNIT_PATH).exists() or srv.interface_exists():
@@ -147,7 +185,7 @@ def main():
         run(["/usr/bin/python3", str(installed), "purge", "PURGE"])
         if root.exists() or Path(srv.WG_DIR).exists() or Path(srv.AWG_GO_UNIT_PATH).exists():
             raise RuntimeError("Собственные данные сохранились после purge")
-        print("PASS: чистый init, полный профиль, remove/reinstall/purge, защита чужих файлов и SIGKILL", flush=True)
+        print("PASS: публичная поставка, init, полный профиль, обновление/возврат/обрыв, remove/reinstall/purge и SIGKILL", flush=True)
     except Exception:
         # Только несекретные свойства службы, без showconf/dump/journal и ключей.
         print(run(["systemctl", "show", srv.AWG_GO_UNIT, "-p", "ActiveState", "-p", "SubState",

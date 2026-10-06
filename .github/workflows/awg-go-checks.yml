@@ -7,6 +7,7 @@ on:
       - vcli-admin.py
       - tests_local/test_lanfabric_awg_go.py
       - tests_local/test_lanfabric_go_installation.py
+      - tests_local/test_lanfabric_go_update.py
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
@@ -18,6 +19,7 @@ on:
       - vcli-admin.py
       - tests_local/test_lanfabric_awg_go.py
       - tests_local/test_lanfabric_go_installation.py
+      - tests_local/test_lanfabric_go_update.py
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
@@ -93,7 +95,7 @@ jobs:
           path: ci-dist/
       - name: Подготовить зависимости изолированной машины
         run: sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent
-      - name: Проверить чистую установку, удаление и аварийное восстановление
+      - name: Проверить публичную поставку, обновление, возврат и аварийное восстановление
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_REPOSITORY,RUNNER_ENVIRONMENT /usr/bin/python3 tests_integration/run_awg_go_ci.py
 
   publish-components:

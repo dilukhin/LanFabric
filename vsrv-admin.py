@@ -81,11 +81,250 @@ AWG_GO_SOCKET_RECORD = f"{LOCK_DIR}/go-socket.json"
 AWG_GO_OPERATION_LOCK = f"{LOCK_DIR}/go-operation.lock"
 AWG_GO_TIMEOUT_SECONDS = 60
 AWG_GO_RELEASE = "awg-go-3.1-r1"
+AWG_GO_COMMIT = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
+AWG_GO_TOOLS_COMMIT = "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
+AWG_GO_PREVIOUS_COMPONENTS = ()  # Только явно проверенные наборы для совместимого возврата.
 AWG_GO_RELEASE_SHA256 = {
     "amneziawg-go": "5e8e2e656d77f9f66102660234fa08d8c2ddb99bf32961db8c02ad19c32e872f",
     "awg": "a31d773ed5be300fafbd5d87689e5fd6541d47e60ecad9c704e6c197fffcfb28",
 }
 AWG_GO_INSTALL_RECORD = f"{REMOTE_DIR}/go-install.json"
+GO_UPDATE_RECORD = f"{REMOTE_DIR}/go-update.json"
+GO_UPDATE_SCHEMA = 1
+
+def go_update_paths():
+    """Точный набор данных и компонентов для совместимого обновления."""
+    return [f"{REMOTE_DIR}/vsrv-admin.py", DB_PATH, BACKEND_PATH, IMPLEMENTATION_PATH,
+            AWG_PARAMS_PATH, LISTEN_PORT_PATH, f"{WG_DIR}/{WG_IF}.private", f"{WG_DIR}/{WG_IF}.public",
+            AWG_GO_MANIFEST, AWG_GO_INSTALL_RECORD, AWG_GO_BINARY, AWG_GO_TOOLS]
+
+def read_go_update_record():
+    trusted_go_path(GO_UPDATE_RECORD, private=True)
+    try:
+        if Path(GO_UPDATE_RECORD).stat().st_size > 8192:
+            raise ValueError
+        record = json.loads(Path(GO_UPDATE_RECORD).read_text())
+        if (set(record) != {"schema", "phase", "old_sha256", "new_sha256", "running", "files", "backup", "components", "stage"}
+                or type(record["schema"]) is not int or record["schema"] != GO_UPDATE_SCHEMA
+                or record["phase"] not in ("prepared", "committed", "complete", "rolled-back")
+                or type(record["running"]) is not bool or type(record["components"]) is not bool or set(record["files"]) != set(go_update_paths())
+                or not re.fullmatch(r"go-update-backup-[0-9a-f]{32}", record["backup"])
+                or not re.fullmatch(r"\.go-update-[a-z0-9_]{8}", record["stage"])
+                or any(not re.fullmatch(r"[0-9a-f]{64}", record[key]) for key in ("old_sha256", "new_sha256"))):
+            raise ValueError
+        for path, info in record["files"].items():
+            if (set(info) != {"sha256", "mode"} or not re.fullmatch(r"[0-9a-f]{64}", info["sha256"])
+                    or type(info["mode"]) is not int or info["mode"] not in ((0o600, 0o644) if path == f"{WG_DIR}/{WG_IF}.public" else (0o600, 0o700))):
+                raise ValueError
+        if record["old_sha256"] != record["files"][f"{REMOTE_DIR}/vsrv-admin.py"]["sha256"]:
+            raise ValueError
+        return record
+    except (ValueError, TypeError, KeyError, OSError, AttributeError):
+        raise RuntimeError("Журнал обновления Go повреждён; автоматическое изменение запрещено") from None
+
+def require_go_update_idle():
+    if os.path.lexists(GO_UPDATE_RECORD) and read_go_update_record()["phase"] in ("prepared", "committed"):
+        raise RuntimeError("Обновление Go не завершено; повторите patch с тем же проверенным выпуском. Изменение участников и runtime временно запрещено")
+
+def atomic_root_bytes(path, data, mode=0o600):
+    """Атомарная root-запись двоичных данных контрольного снимка."""
+    target = Path(path)
+    temporary = target.parent / ("." + target.name + ".update-" + secrets.token_hex(8))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chown(temporary, 0, 0)
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+def validate_go_update_backup(record):
+    directory = Path(REMOTE_DIR) / record["backup"]
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise RuntimeError("Контрольный снимок Go не является приватным каталогом root")
+    expected = {str(index) for index in range(len(go_update_paths()))}
+    if {entry.name for entry in directory.iterdir()} != expected:
+        raise RuntimeError("В контрольном снимке есть неизвестные файлы")
+    for index, path in enumerate(go_update_paths()):
+        backup = directory / str(index)
+        trusted_go_path(str(backup), private=True)
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != record["files"][path]["sha256"]:
+            raise RuntimeError("Контрольный снимок повреждён; возврат запрещён")
+
+def stop_go_for_update():
+    """Останавливает доказанно свой процесс даже после отказа применения профиля."""
+    with runtime_lock():
+        require_go_unit()
+        pid = go_systemctl("show", "-p", "MainPID", "--value")
+        if pid != "0":
+            go_process_identity(require_socket=False)
+            if os.path.lexists(AWG_GO_SOCKET):
+                record_go_socket(go_process_identity())
+        else:
+            cleanup_go_stale_socket()
+            if interface_exists():
+                raise RuntimeError("Интерфейс существует без собственного процесса Go; остановка и очистка запрещены")
+        close_firewall_guard(persist=True)
+    go_systemctl("stop")
+    with runtime_lock():
+        if go_systemctl("show", "-p", "MainPID", "--value") != "0" or interface_exists() or os.path.lexists(AWG_GO_SOCKET):
+            raise RuntimeError("Остановка своего процесса при обновлении не подтверждена; чужие ресурсы не очищаются")
+        cleanup_owned_firewall()
+        run_cmd("netfilter-persistent save")
+
+def rollback_go_update(record):
+    """Возвращает подтверждённый снимок, затем прежнее состояние работы службы."""
+    validate_go_update_backup(record)
+    stop_go_for_update()
+    with runtime_lock():
+        for index, path in enumerate(go_update_paths()):
+            trusted_go_path(path, private=path != f"{WG_DIR}/{WG_IF}.public")
+            atomic_root_bytes(path, (Path(REMOTE_DIR) / record["backup"] / str(index)).read_bytes(), record["files"][path]["mode"])
+        load_state_snapshot("awg")
+    if record["running"]:
+        go_systemctl("reset-failed")
+        _go_lifecycle_locked("start", updating=True)
+    with runtime_lock():
+        for path, info in record["files"].items():
+            if hashlib.sha256(Path(path).read_bytes()).hexdigest() != info["sha256"]:
+                raise RuntimeError("Возврат Go не совпал с контрольным снимком")
+        record["phase"] = "rolled-back"
+        _atomic_write_root_file(GO_UPDATE_RECORD, json.dumps(record) + "\n", mode=0o600)
+
+def cleanup_go_update_stage(record):
+    """После обрыва удаляет только конкретный учтённый каталог проверенного кандидата."""
+    directory = Path(REMOTE_DIR) / record["stage"]
+    if not os.path.lexists(directory):
+        return
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise RuntimeError("Каталог кандидата обновления не является приватным каталогом root")
+    expected = {"candidate.py", "components"} if record["components"] else {"candidate.py"}
+    if {entry.name for entry in directory.iterdir()} != expected:
+        raise RuntimeError("В каталоге кандидата есть неизвестный ресурс; очистка запрещена")
+    candidate = directory / "candidate.py"
+    trusted_go_path(str(candidate), private=True)
+    if hashlib.sha256(candidate.read_bytes()).hexdigest() != record["new_sha256"]:
+        raise RuntimeError("Кандидат обновления изменён; очистка запрещена")
+    if record["components"]:
+        components = directory / "components"
+        data = components.lstat()
+        if not stat.S_ISDIR(data.st_mode) or data.st_uid != 0 or data.st_mode & 0o077:
+            raise RuntimeError("Каталог кандидата компонентов изменён")
+        if {entry.name for entry in components.iterdir()} != {"amneziawg-go", "awg", "manifest.json"}:
+            raise RuntimeError("Есть неизвестный компонент; очистка запрещена")
+        for entry in components.iterdir():
+            trusted_go_path(str(entry), private=True)
+        for entry in components.iterdir():
+            entry.unlink()
+        components.rmdir()
+    candidate.unlink()
+    directory.rmdir()
+
+def install_go_server_module(data, expected_version, components=False):
+    """Совместимое обновление модуля с долговечным снимком и возвратом."""
+    if tuple(map(int, expected_version.split("."))) < tuple(map(int, __version__.split("."))):
+        raise RuntimeError("Понижение версии серверного модуля запрещено")
+    if expected_version.split(".")[:2] != __version__.split(".")[:2]:
+        raise RuntimeError("Для смены major/minor Go требуется отдельная миграция без init")
+    if not re.search(rb"^GO_UPDATE_SCHEMA\s*=\s*1\s*$", data, re.MULTILINE):
+        raise RuntimeError("Новый модуль не подтверждает совместимый протокол обновления Go")
+    with runtime_lock(lock_path=AWG_GO_OPERATION_LOCK):
+        with runtime_lock():
+            if os.path.lexists(GO_UPDATE_RECORD):
+                previous = read_go_update_record()
+            else:
+                previous = None
+        if previous and previous["phase"] in ("prepared", "committed"):
+            # После обрыва сначала возвращается доказанное прежнее состояние.
+            rollback_go_update(previous)
+        if previous:
+            cleanup_go_update_stage(previous)
+        if not components:
+            with runtime_lock():
+                if hashlib.sha256(Path(REMOTE_DIR, "vsrv-admin.py").read_bytes()).digest() == hashlib.sha256(data).digest():
+                    snapshot = load_state_snapshot("awg")
+                    require_go_unit()
+                    if go_systemctl("show", "-p", "MainPID", "--value") != "0":
+                        _verify_awg_ready(snapshot)
+                    return
+        with tempfile.TemporaryDirectory(prefix=".go-update-", dir=REMOTE_DIR) as staging:
+            candidate = Path(staging) / "candidate.py"
+            atomic_root_bytes(candidate, data, 0o700)
+            # Дочерняя проверка получает свою runtime-блокировку; родитель её не держит.
+            try:
+                run_bounded_command([trusted_python_path(), str(candidate), "_check-go-update"], timeout=30)
+                if components:
+                    run_bounded_command([trusted_python_path(), str(candidate), "_stage-go-components"], timeout=300)
+            except RuntimeError:
+                raise RuntimeError("Новый модуль или поставка Go не прошли предварительную проверку; действующая установка сохранена") from None
+            with runtime_lock():
+                load_state_snapshot("awg")
+                require_go_unit()
+                if read_go_install_record()["phase"] != "complete":
+                    raise RuntimeError("Перед обновлением требуется завершённая штатная установка Go")
+                record = {"schema": GO_UPDATE_SCHEMA, "phase": "prepared", "running": go_systemctl("show", "-p", "MainPID", "--value") != "0",
+                          "old_sha256": hashlib.sha256(Path(REMOTE_DIR, "vsrv-admin.py").read_bytes()).hexdigest(),
+                          "new_sha256": hashlib.sha256(data).hexdigest(), "files": {},
+                          "backup": "go-update-backup-" + secrets.token_hex(16), "components": bool(components), "stage": Path(staging).name}
+                if previous is not None:
+                    validate_go_update_backup(previous)
+                backup_directory = Path(REMOTE_DIR) / record["backup"]
+                backup_directory.mkdir(mode=0o700)
+                for index, path in enumerate(go_update_paths()):
+                    trusted_go_path(path, private=path != f"{WG_DIR}/{WG_IF}.public")
+                    contents = Path(path).read_bytes()
+                    record["files"][path] = {"sha256": hashlib.sha256(contents).hexdigest(), "mode": Path(path).stat().st_mode & 0o777}
+                    atomic_root_bytes(backup_directory / str(index), contents)
+                _atomic_write_root_file(GO_UPDATE_RECORD, json.dumps(record) + "\n", mode=0o600)
+                validate_go_update_backup(record)
+                if previous is not None:
+                    # Новый снимок и его журнал уже долговечны; старый можно удалить.
+                    old_directory = Path(REMOTE_DIR) / previous["backup"]
+                    for index in range(len(go_update_paths())):
+                        (old_directory / str(index)).unlink()
+                    old_directory.rmdir()
+            try:
+                stop_go_for_update()
+                with runtime_lock():
+                    if components:
+                        for name, path in (("amneziawg-go", AWG_GO_BINARY), ("awg", AWG_GO_TOOLS), ("manifest.json", AWG_GO_MANIFEST)):
+                            atomic_root_bytes(path, (Path(staging) / "components" / name).read_bytes(), 0o600 if name == "manifest.json" else 0o700)
+                    atomic_root_bytes(Path(REMOTE_DIR) / "vsrv-admin.py", data, 0o700)
+                    record["phase"] = "committed"
+                    _atomic_write_root_file(GO_UPDATE_RECORD, json.dumps(record) + "\n", mode=0o600)
+                if record["running"]:
+                    go_systemctl("reset-failed")
+                    _go_lifecycle_locked("start", updating=True)
+                with runtime_lock():
+                    load_state_snapshot("awg")
+                    for path, info in record["files"].items():
+                        changing = {f"{REMOTE_DIR}/vsrv-admin.py"}
+                        if components:
+                            changing.update((AWG_GO_BINARY, AWG_GO_TOOLS, AWG_GO_MANIFEST))
+                        if path not in changing and hashlib.sha256(Path(path).read_bytes()).hexdigest() != info["sha256"]:
+                            raise RuntimeError("Обновление изменило сохранённые данные; требуется возврат")
+                    record["phase"] = "complete"
+                    _atomic_write_root_file(GO_UPDATE_RECORD, json.dumps(record) + "\n", mode=0o600)
+            except Exception:
+                try:
+                    rollback_go_update(record)
+                except Exception:
+                    with runtime_lock():
+                        close_firewall_guard(persist=True)
+                    raise RuntimeError("Обновление и возврат не подтверждены; защита закрыта. Сохраните контрольный снимок и проверьте сервер через независимый доступ") from None
+                raise RuntimeError("Обновление не прошло; прежний модуль, данные и состояние службы возвращены") from None
 
 def read_go_install_record():
     """Читает ограниченный служебный журнал, не включая его содержимое в ошибки."""
@@ -199,8 +438,8 @@ def download_go_components(directory):
         except Exception:
             raise RuntimeError("Не удалось получить проверенный компонент Go; состояние VPN не создано. Проверьте доступ к выпуску GitHub") from None
     data = {"schema": 1, "platform": "linux-amd64",
-            "go_commit": "b5928efb6ca19f0153958460c3d141f04abc5c2e",
-            "tools_commit": "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843",
+            "go_commit": AWG_GO_COMMIT,
+            "tools_commit": AWG_GO_TOOLS_COMMIT,
             "sha256": dict(AWG_GO_RELEASE_SHA256)}
     write_private_file(str(Path(directory) / "manifest.json"), json.dumps(data) + "\n")
 
@@ -280,11 +519,16 @@ def go_purge_files(snapshot):
             {"schema": 1, "phase": "complete"}, {"schema": 1, "phase": "removed"}, {"schema": 1, "phase": "prepared"}):
         raise RuntimeError("Для удаления требуется завершённое собственное состояние установки Go")
     allowed = {
-        Path(REMOTE_DIR): {"vsrv-admin.py", "vpn.db", "backend", "implementation", "awg_params", "listen_port", "go-install.json", "awg-go", "configs"},
+        Path(REMOTE_DIR): {"vsrv-admin.py", "vpn.db", "backend", "implementation", "awg_params", "listen_port", "go-install.json", "awg-go", "configs", "go-update.json"},
         Path(AWG_GO_DIR): {"amneziawg-go", "awg", "manifest.json"},
         Path(CONF_DIR): {row["name"] + ".conf" for row in snapshot["users"]},
         Path(WG_DIR): {WG_IF + ".private", WG_IF + ".public", WG_IF + ".setconf"},
     }
+    if os.path.lexists(GO_UPDATE_RECORD):
+        record = read_go_update_record()
+        validate_go_update_backup(record)
+        allowed[Path(REMOTE_DIR)].add(record["backup"])
+        allowed[Path(REMOTE_DIR) / record["backup"]] = {str(index) for index in range(len(go_update_paths()))}
     files = []
     for directory, names in allowed.items():
         info = directory.lstat()
@@ -303,7 +547,7 @@ def go_purge_files(snapshot):
         if forward.read_text() != "net.ipv4.ip_forward=1\n":
             raise RuntimeError("Настройка forwarding изменена; удаление запрещено")
         files.append(forward)
-    return files, list(reversed(list(allowed)))
+    return files, sorted(allowed, key=lambda path: len(path.parts), reverse=True)
 
 def cmd_remove_go(purge=False):
     """Удаляет собственную службу; purge удаляет только предварительно проверенные данные."""
@@ -483,9 +727,9 @@ def require_go_components():
         if (set(data) != {"schema", "platform", "go_commit", "tools_commit", "sha256"}
                 or type(data["schema"]) is not int or data["schema"] != 1
                 or data["platform"] != "linux-amd64"
-                or data["go_commit"] != "b5928efb6ca19f0153958460c3d141f04abc5c2e"
-                or data["tools_commit"] != "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
-                or data["sha256"] != AWG_GO_RELEASE_SHA256):
+                or {key: data[key] for key in ("go_commit", "tools_commit", "sha256")} not in (
+                    {"go_commit": AWG_GO_COMMIT, "tools_commit": AWG_GO_TOOLS_COMMIT, "sha256": AWG_GO_RELEASE_SHA256},
+                    *AWG_GO_PREVIOUS_COMPONENTS)):
             raise ValueError
         if os.uname().machine != "x86_64":
             raise ValueError
@@ -716,8 +960,10 @@ def go_lifecycle(action):
     with runtime_lock(lock_path=AWG_GO_OPERATION_LOCK):
         _go_lifecycle_locked(action)
 
-def _go_lifecycle_locked(action):
+def _go_lifecycle_locked(action, updating=False):
     """Операция под уже захваченной блокировкой Go."""
+    if not updating:
+        require_go_update_idle()
     with runtime_lock():
         snapshot = load_state_snapshot(expected_backend="awg")
         if snapshot["implementation"] != "go":
@@ -2588,6 +2834,7 @@ def _run_internal_install_module(argv):
     parser.add_argument("--source", required=True)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--components", action="store_true")
     args = parser.parse_args(argv)
 
     sudo_uid = os.environ.get("SUDO_UID")
@@ -2621,8 +2868,12 @@ def _run_internal_install_module(argv):
     compile(text, str(source), "exec")
 
     if os.path.exists(BACKEND_PATH) and get_implementation() == "go":
-        raise RuntimeError("Обновление модуля AWG Go требует проверенного пути с контрольным снимком и возвратом по #28; текущая установка сохранена")
+        install_go_server_module(data, args.version, components=args.components)
+        print("OK")
+        return
 
+    if args.components:
+        raise RuntimeError("Обновление компонентов разрешено только для сохранённой установки Go")
     target = Path(REMOTE_DIR) / "vsrv-admin.py"
     Path(REMOTE_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chown(REMOTE_DIR, 0, 0)
@@ -2662,6 +2913,27 @@ def main():
         except Exception as e:
             log.error(str(e))
             sys.exit(1)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_stage-go-components":
+        parent = Path(__file__).resolve().parent
+        if (os.geteuid() != 0 or len(sys.argv) != 2 or parent.parent != Path(REMOTE_DIR)
+                or not parent.name.startswith(".go-update-")):
+            raise RuntimeError("Подготовка компонентов разрешена только из проверенного файла обновления")
+        trusted_go_path(str(Path(__file__).resolve()), private=True)
+        directory = parent / "components"
+        directory.mkdir(mode=0o700)
+        download_go_components(directory)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "_check-go-update":
+        if os.geteuid() != 0 or len(sys.argv) != 2:
+            raise RuntimeError("Проверка обновления требует root и не принимает аргументы")
+        with runtime_lock():
+            load_state_snapshot("awg")
+            require_go_unit()
+            if read_go_install_record()["phase"] != "complete":
+                raise RuntimeError("Состояние Go не завершено")
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "_boot-awg":
@@ -2763,6 +3035,8 @@ def main():
         }
 
         def dispatch():
+            if args.command in mutating_commands and not (args.command == "autostart" and args.autostart_action == "status"):
+                require_go_update_idle()
             if args.command == "init":
                 cmd_init(args)
             elif args.command == "backend":
