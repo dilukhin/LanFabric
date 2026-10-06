@@ -325,6 +325,25 @@ class LifecycleTests(unittest.TestCase):
         start.assert_called_once()
         lock.assert_not_called()
 
+    def test_account_revocation_closes_guard_before_committing_database(self):
+        for command, row in ((srv.cmd_block, ("synthetic-public", "10.8.0.2", 1)),
+                             (srv.cmd_delete, ("synthetic-public", "10.8.0.2"))):
+            events = []
+            connection = Mock()
+            connection.execute.return_value.fetchone.return_value = row
+            connection.commit.side_effect = lambda: events.append("commit")
+            with self.subTest(command=command.__name__), patch.object(srv, "init_db", return_value=connection), \
+                    patch.object(srv, "require_backend", return_value="awg"), \
+                    patch.object(srv, "get_implementation", return_value="go"), \
+                    patch.object(srv, "load_state_snapshot", side_effect=[self.state(), RuntimeError("damaged state")]), \
+                    patch.object(srv, "awg_interface_ownership", return_value="owned"), \
+                    patch.object(srv, "close_firewall_guard", side_effect=lambda **kw: events.append("closed")), \
+                    patch.object(Path, "exists", return_value=False), patch.object(srv, "_sync_awg_runtime_locked") as sync:
+                with self.assertRaises(RuntimeError):
+                    command(SimpleNamespace(name="ci-peer", confirm="ci-peer"))
+                self.assertEqual(events, ["closed", "commit"])
+                sync.assert_not_called()
+
 
 class StaleSocketTests(unittest.TestCase):
     def cleanup(self, inode=2, alive=False, listening=False):

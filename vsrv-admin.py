@@ -2244,6 +2244,11 @@ def cmd_block(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
     pub, ip, internet = user
     backend = require_backend()
+    if backend == "awg" and get_implementation(backend) == "go":
+        snapshot = load_state_snapshot(expected_backend="awg")
+        if awg_interface_ownership(snapshot) != "owned":
+            raise RuntimeError("Блокировка Go требует подтверждённого собственного интерфейса; БД не изменена")
+        close_firewall_guard(persist=True)
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
 
@@ -2268,6 +2273,11 @@ def cmd_delete(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
     pub, ip = user
     backend = require_backend()
+    if backend == "awg" and get_implementation(backend) == "go":
+        snapshot = load_state_snapshot(expected_backend="awg")
+        if awg_interface_ownership(snapshot) != "owned":
+            raise RuntimeError("Удаление участника Go требует подтверждённого собственного интерфейса; БД не изменена")
+        close_firewall_guard(persist=True)
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
     conn.commit()
 
