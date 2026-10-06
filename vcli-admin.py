@@ -550,9 +550,10 @@ def copy_server_module(args, remote_version=None):
                     "--source", remote_upload,
                     "--sha256", local_sha256,
                     "--version", __version__,
+                    *(["--components"] if getattr(args, "components", False) else []),
                 ],
                 stream_output=False,
-                timeout=30,
+                timeout=600,
             )
         else:
             # Первичный bootstrap и миграция 0.0.17 используют только команды,
@@ -1159,7 +1160,7 @@ def cmd_patch(args):
         raise RuntimeError(f"Не удалось получить версию сервера. Выполните init: {e}")
 
     state = compare_versions(__version__, remote_ver)
-    if state == "equal":
+    if state == "equal" and not (getattr(args, "reinstall", False) or getattr(args, "components", False)):
         log.info(f"Версии уже совпадают: {__version__}. Patch не требуется")
         try_cleanup_stale_temporary_sudo_trust(args)
         add_advice("Patch не требуется. Можно выполнять обычные команды управления сервером")
@@ -1713,7 +1714,9 @@ def main():
     p_init.add_argument("--listen-port", type=int, default=None, help="UDP-порт 1..65535; при отсутствии сохраняется прежний")
     p_init.add_argument("--awg-profile", choices=["legacy", "awg31"], default=None, help="Профиль AWG; новый по умолчанию legacy, существующий не заменяется")
 
-    subparsers.add_parser("patch", help="Обновить серверный модуль при отличии только patch-версии")
+    p_patch = subparsers.add_parser("patch", help="Обновить серверный модуль при отличии только patch-версии")
+    p_patch.add_argument("--components", action="store_true", help="Обновить закреплённые компоненты Go вместе с модулем; сохранённые профили не меняются")
+    p_patch.add_argument("--reinstall", action="store_true", help="Повторно установить проверенный модуль той же версии без init; Go использует контрольный снимок и возврат")
 
     p_trust = subparsers.add_parser("trust", help="Постоянно доверить текущий клиент этому серверу")
     p_trust.add_argument("confirm", help="Для подтверждения введите TRUST")
