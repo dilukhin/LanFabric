@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -95,7 +96,7 @@ def main():
                 raise RuntimeError("Перезапуск изменил сохранённые ключи, параметры или пользователей")
         print("SIGKILL и автоматическое полное восстановление", flush=True)
         before = srv.go_process_identity()
-        run(["systemctl", "kill", "--kill-whom=main", "--signal=SIGKILL", srv.AWG_GO_UNIT])
+        os.kill(before, signal.SIGKILL)
         deadline = time.monotonic() + 45
         restored = False
         while time.monotonic() < deadline:

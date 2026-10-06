@@ -87,6 +87,21 @@ AWG_GO_RELEASE_SHA256 = {
 }
 AWG_GO_INSTALL_RECORD = f"{REMOTE_DIR}/go-install.json"
 
+def read_go_install_record():
+    """Читает ограниченный служебный журнал, не включая его содержимое в ошибки."""
+    trusted_go_path(AWG_GO_INSTALL_RECORD, private=True)
+    try:
+        if Path(AWG_GO_INSTALL_RECORD).stat().st_size > 2048:
+            raise ValueError
+        record = json.loads(Path(AWG_GO_INSTALL_RECORD).read_text())
+        if (not isinstance(record, dict) or set(record) != {"schema", "phase"}
+                or type(record["schema"]) is not int or record["schema"] != 1
+                or record["phase"] not in ("creating", "prepared", "complete", "removed")):
+            raise ValueError
+        return record
+    except (ValueError, TypeError, KeyError, OSError):
+        raise RuntimeError("Журнал установки Go повреждён; исправление состояния автоматически запрещено") from None
+
 def require_go_platform():
     """Проверяет платформу без установки компиляторов или обновления ОС."""
     values = {}
@@ -198,8 +213,7 @@ def cmd_init_go(args):
     with runtime_lock(lock_path=AWG_GO_OPERATION_LOCK):
         with runtime_lock():
             if os.path.lexists(AWG_GO_INSTALL_RECORD):
-                trusted_go_path(AWG_GO_INSTALL_RECORD, private=True)
-                record = json.loads(Path(AWG_GO_INSTALL_RECORD).read_text())
+                record = read_go_install_record()
                 if record not in ({"schema": 1, "phase": "prepared"}, {"schema": 1, "phase": "complete"}, {"schema": 1, "phase": "removed"}):
                     raise RuntimeError("Установка Go остановлена во время создания состояния; повторная генерация запрещена, требуется проверка состояния")
                 snapshot = load_state_snapshot("awg")
@@ -262,8 +276,7 @@ def run_bounded_command(argv, timeout):
 
 def go_purge_files(snapshot):
     """Возвращает доказанно собственные файлы; неизвестные ресурсы запрещают purge."""
-    trusted_go_path(AWG_GO_INSTALL_RECORD, private=True)
-    if json.loads(Path(AWG_GO_INSTALL_RECORD).read_text()) not in (
+    if read_go_install_record() not in (
             {"schema": 1, "phase": "complete"}, {"schema": 1, "phase": "removed"}, {"schema": 1, "phase": "prepared"}):
         raise RuntimeError("Для удаления требуется завершённое собственное состояние установки Go")
     allowed = {

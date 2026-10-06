@@ -54,11 +54,13 @@ class GoDownloadTests(unittest.TestCase):
             result.geturl = lambda: url
             return result
         with tempfile.TemporaryDirectory() as temp, patch.object(srv, "AWG_GO_RELEASE_SHA256", expected), \
-                patch.object(srv.urllib.request, "urlopen", side_effect=response):
+                patch.object(srv.urllib.request, "urlopen", side_effect=response), \
+                patch.object(srv.os, "fchmod", create=True) as private_mode:
             srv.download_go_components(temp)
             self.assertEqual(json.loads((Path(temp) / "manifest.json").read_text())["sha256"], expected)
             self.assertTrue(all(Path(temp, name).read_bytes() == value for name, value in data.items()))
             self.assertTrue(all(url.startswith("https://github.com/dilukhin/LanFabric/releases/download/awg-go-3.1-r1/") for url in urls))
+            self.assertEqual(private_mode.call_args.args[1], 0o600)
 
 
 class GoInstallTests(unittest.TestCase):
@@ -91,6 +93,16 @@ class GoInstallTests(unittest.TestCase):
                 download.assert_not_called()
                 execute.assert_not_called()
                 self.assertEqual(json.loads(record.read_text())["phase"], "creating")
+
+    def test_corrupted_record_and_boolean_schema_do_not_expose_contents(self):
+        with tempfile.TemporaryDirectory() as temp:
+            record = Path(temp) / "go-install.json"
+            for text in ('{"schema": true, "phase": "complete"}', '{"private": "do-not-report"'):
+                record.write_text(text)
+                with patch.object(srv, "AWG_GO_INSTALL_RECORD", str(record)), patch.object(srv, "trusted_go_path"):
+                    with self.assertRaises(RuntimeError) as caught:
+                        srv.read_go_install_record()
+                    self.assertNotIn("do-not-report", str(caught.exception))
 
     def test_repeat_rejects_port_change_before_restart(self):
         with tempfile.TemporaryDirectory() as temp:

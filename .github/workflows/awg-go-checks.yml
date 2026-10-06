@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - vsrv-admin.py
+      - vcli-admin.py
+      - tests_local/test_lanfabric_awg_go.py
+      - tests_local/test_lanfabric_go_installation.py
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
@@ -12,6 +15,9 @@ on:
     branches: [master]
     paths:
       - vsrv-admin.py
+      - vcli-admin.py
+      - tests_local/test_lanfabric_awg_go.py
+      - tests_local/test_lanfabric_go_installation.py
       - tests_integration/run_awg_go_ci.py
       - .github/workflows/awg-go-checks.yml
       - deployment/build_go_components.py
