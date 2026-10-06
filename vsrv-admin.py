@@ -19,6 +19,10 @@ import time
 import json
 import base64
 import binascii
+import hashlib
+import socket
+import stat
+import struct
 try:
     import fcntl
 except ImportError:  # локальные unit-тесты могут импортировать серверный модуль на Windows
@@ -62,6 +66,17 @@ FORWARD_MARK = "lanfabric-client-forward-v1"
 AWG_AUTOSTART_UNIT = "lanfabric-awg.service"
 AWG_AUTOSTART_PATH = f"/etc/systemd/system/{AWG_AUTOSTART_UNIT}"
 AWG_AUTOSTART_TIMEOUT_SECONDS = 60
+IMPLEMENTATION_PATH = "/opt/vpn-admin/implementation"
+AWG_GO_DIR = "/opt/vpn-admin/awg-go"
+AWG_GO_BINARY = f"{AWG_GO_DIR}/amneziawg-go"
+AWG_GO_TOOLS = f"{AWG_GO_DIR}/awg"
+AWG_GO_MANIFEST = f"{AWG_GO_DIR}/manifest.json"
+AWG_GO_UNIT = "lanfabric-awg-go.service"
+AWG_GO_UNIT_PATH = f"/etc/systemd/system/{AWG_GO_UNIT}"
+AWG_GO_SOCKET = f"/run/amneziawg/{WG_IF}.sock"
+AWG_GO_SOCKET_RECORD = f"{LOCK_DIR}/go-socket.json"
+AWG_GO_OPERATION_LOCK = f"{LOCK_DIR}/go-operation.lock"
+AWG_GO_TIMEOUT_SECONDS = 60
 
 # Логирование
 logging.basicConfig(
@@ -146,7 +161,7 @@ def get_backend():
 def get_wg_cmd(allow_missing=False):
     try:
         backend = require_backend()
-        return "awg" if backend == "awg" else "wg"
+        return backend_tools(backend, get_implementation(backend))
     except Exception:
         if allow_missing:
             return None
@@ -159,6 +174,314 @@ def require_backend():
         raise RuntimeError(f"Неизвестный backend: {backend}")
     return backend
 
+def get_implementation(backend=None):
+    """Прежние установки без отдельного файла используют модуль ядра."""
+    backend = require_backend() if backend is None else backend
+    try:
+        value = Path(IMPLEMENTATION_PATH).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        if os.path.lexists(IMPLEMENTATION_PATH):
+            raise RuntimeError("Файл реализации повреждён; выбор по умолчанию запрещён") from None
+        return "kernel"
+    if value not in ("kernel", "go") or (value == "go" and backend != "awg"):
+        raise RuntimeError("Сохранённая реализация VPN недопустима; автоматическая замена запрещена")
+    return value
+
+def backend_tools(backend, implementation):
+    return AWG_GO_TOOLS if implementation == "go" else ("awg" if backend == "awg" else "wg")
+
+def trusted_go_path(path_text, executable=False, private=False):
+    """Go-компоненты и их родители принадлежат root, без ссылок и чужой записи."""
+    path = Path(path_text)
+    for entry in (path, *path.parents):
+        try:
+            info = entry.lstat()
+        except OSError:
+            raise RuntimeError("Обязательный доверенный файл AWG Go отсутствует") from None
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError(f"Нарушены владелец, тип или права пути AWG Go: {entry}")
+    if not path.is_file() or (executable and not os.access(path, os.X_OK)):
+        raise RuntimeError("Обязательный файл AWG Go имеет неверный тип или недоступен")
+    if private and path.stat().st_mode & 0o077:
+        raise RuntimeError("Состояние AWG Go доступно другим пользователям")
+
+def require_go_components():
+    """Проверяет уже поставленные компоненты; ничего не скачивает и не исполняет."""
+    trusted_go_path(IMPLEMENTATION_PATH, private=True)
+    trusted_go_path(AWG_GO_MANIFEST, private=True)
+    try:
+        if Path(AWG_GO_MANIFEST).stat().st_size > 8192:
+            raise ValueError
+        data = json.loads(Path(AWG_GO_MANIFEST).read_text(encoding="utf-8"))
+        if (set(data) != {"schema", "platform", "go_commit", "tools_commit", "sha256"}
+                or type(data["schema"]) is not int or data["schema"] != 1
+                or data["platform"] != "linux-amd64"
+                or data["go_commit"] != "b5928efb6ca19f0153958460c3d141f04abc5c2e"
+                or data["tools_commit"] != "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"
+                or set(data["sha256"]) != {"amneziawg-go", "awg"}):
+            raise ValueError
+        if os.uname().machine != "x86_64":
+            raise ValueError
+        for path_text, name in ((AWG_GO_BINARY, "amneziawg-go"), (AWG_GO_TOOLS, "awg")):
+            trusted_go_path(path_text, executable=True)
+            expected = data["sha256"][name]
+            if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise ValueError
+            if Path(path_text).stat().st_size > 64 * 1024 * 1024:
+                raise ValueError
+            digest = hashlib.sha256()
+            with open(path_text, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if not secrets.compare_digest(digest.hexdigest(), expected):
+                raise ValueError
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        raise RuntimeError("Компоненты AWG Go не соответствуют закреплённой поставке; запуск запрещён") from None
+
+def go_systemctl(*arguments):
+    """Конечное ожидание systemd без выдачи вывода дочерних процессов."""
+    try:
+        command = ["systemctl", *arguments]
+        if arguments != ("daemon-reload",):
+            command.append(AWG_GO_UNIT)
+        result = subprocess.run(command,
+                                capture_output=True, text=True, timeout=AWG_GO_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("Управление службой AWG Go не завершилось в срок; проверьте status и health перед повтором") from None
+    if result.returncode != 0:
+        raise RuntimeError("Операция службы AWG Go завершилась ошибкой; проверьте status и health")
+    return result.stdout.strip()
+
+def awg_go_unit_text(python_path=None):
+    python_path = python_path or "/usr/bin/python3"
+    return f"""[Unit]
+Description=LanFabric AWG Go
+After=systemd-sysctl.service netfilter-persistent.service
+Wants=netfilter-persistent.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStartPre={python_path} -u {REMOTE_DIR}/vsrv-admin.py _go-preflight
+ExecStart={AWG_GO_BINARY} -f {WG_IF}
+ExecStartPost={python_path} -u {REMOTE_DIR}/vsrv-admin.py _go-restore
+ExecStopPost={python_path} -u {REMOTE_DIR}/vsrv-admin.py _go-closed
+Restart=always
+RestartSec=3
+TimeoutStartSec={AWG_GO_TIMEOUT_SECONDS}s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=WG_PROCESS_FOREGROUND=1 LOG_LEVEL=silent GOMEMLIMIT=256MiB
+MemoryMax=512M
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def require_go_unit():
+    """Проверяет файл службы и отсутствие подмены через дополнения systemd."""
+    trusted_go_path(AWG_GO_UNIT_PATH)
+    if Path(AWG_GO_UNIT_PATH).read_text(encoding="utf-8") != awg_go_unit_text(trusted_python_path()):
+        raise RuntimeError("Файл службы AWG Go не соответствует штатному контракту")
+    properties = go_systemctl("show", "-p", "FragmentPath", "-p", "DropInPaths")
+    values = dict(line.split("=", 1) for line in properties.splitlines() if "=" in line)
+    if values.get("FragmentPath") != AWG_GO_UNIT_PATH or values.get("DropInPaths", "missing"):
+        raise RuntimeError("Загруженная служба AWG Go имеет посторонние изменения")
+
+def go_process_identity(require_socket=True):
+    """Сверяет systemd, /proc и SO_PEERCRED управляющего сокета с одним PID."""
+    require_go_unit()
+    try:
+        pid_text = go_systemctl("show", "-p", "MainPID", "--value")
+        if not pid_text.isdecimal() or int(pid_text) <= 1:
+            raise ValueError
+        pid = int(pid_text)
+        proc = Path(f"/proc/{pid}")
+        if os.readlink(proc / "exe") != AWG_GO_BINARY:
+            raise ValueError
+        argv = (proc / "cmdline").read_bytes().split(b"\0")
+        if argv != [os.fsencode(AWG_GO_BINARY), b"-f", os.fsencode(WG_IF), b""]:
+            raise ValueError
+        if not any(line.split(":", 2)[-1].endswith("/" + AWG_GO_UNIT)
+                   for line in (proc / "cgroup").read_text().splitlines()):
+            raise ValueError
+        if require_socket:
+            info = os.lstat(AWG_GO_SOCKET)
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+                raise ValueError
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(1)
+                connection.connect(AWG_GO_SOCKET)
+                peer_pid, peer_uid, _ = struct.unpack("3i", connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            if peer_pid != pid or peer_uid != 0:
+                raise ValueError
+        # PID мог измениться во время чтения /proc или подключения.
+        if go_systemctl("show", "-p", "MainPID", "--value") != pid_text:
+            raise ValueError
+        return pid
+    except (OSError, ValueError, AttributeError, struct.error):
+        raise RuntimeError("Принадлежность процесса или сокета AWG Go не подтверждена") from None
+
+def go_preflight_locked():
+    """Вызывается systemd перед каждым запуском, включая восстановление после аварии."""
+    if get_implementation("awg") != "go":
+        raise RuntimeError("Служба Go не соответствует сохранённой реализации")
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нарушена доверенная граница AWG Go")
+    require_go_components()
+    require_go_unit()
+    snapshot = load_state_snapshot(expected_backend="awg")
+    close_firewall_guard(persist=True)
+    cleanup_go_stale_socket()
+    if interface_exists() or os.path.lexists(AWG_GO_SOCKET):
+        raise RuntimeError("Имя интерфейса или сокета AWG Go занято; автоматическая очистка запрещена")
+    port = snapshot["listen_port"]
+    if run_cmd(f"ss -ulnH 'sport = :{port}'", check=False):
+        raise RuntimeError("UDP-порт AWG Go уже занят")
+    # Пересечение с посторонними маршрутами не исправляется удалением маршрутов.
+    for entry in json.loads(run_cmd("ip -j -4 route show table all")):
+        if entry.get("dst", "default") != "default" and ipaddress.ip_network(VPN_NET).overlaps(
+                ipaddress.ip_network(entry["dst"], strict=False)):
+            raise RuntimeError("Подсеть AWG Go пересекается с существующим маршрутом")
+    # Проверка пересылаемого WAN-пути требует уже созданного входного wg0.
+    # Она выполняется в go_restore_locked при закрытой защитной цепочке.
+
+def record_go_socket(pid):
+    """Запоминает конкретный сокет только после независимого доказательства владения."""
+    info = os.lstat(AWG_GO_SOCKET)
+    _atomic_write_root_file(AWG_GO_SOCKET_RECORD, json.dumps({
+        "device": info.st_dev, "inode": info.st_ino, "ctime_ns": info.st_ctime_ns,
+        "pid": pid, "start": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+    }) + "\n", mode=0o600)
+
+def cleanup_go_stale_socket():
+    """После SIGKILL удаляет только подтверждённый мёртвый сокет прежнего процесса."""
+    if not os.path.lexists(AWG_GO_SOCKET):
+        return
+    trusted_go_path(AWG_GO_SOCKET_RECORD, private=True)
+    try:
+        if Path(AWG_GO_SOCKET_RECORD).stat().st_size > 2048:
+            raise ValueError
+        record = json.loads(Path(AWG_GO_SOCKET_RECORD).read_text())
+        if set(record) != {"device", "inode", "ctime_ns", "pid", "start"}:
+            raise ValueError
+        if any(type(record[key]) is not int or record[key] < 0 for key in ("device", "inode", "ctime_ns", "pid")):
+            raise ValueError
+        info = os.lstat(AWG_GO_SOCKET)
+        if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077
+                or (info.st_dev, info.st_ino, info.st_ctime_ns) != (record["device"], record["inode"], record["ctime_ns"])):
+            raise ValueError
+        try:
+            start = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except FileNotFoundError:
+            start = None
+        if start == record["start"]:
+            raise ValueError
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1)
+            try:
+                connection.connect(AWG_GO_SOCKET)
+            except ConnectionRefusedError:
+                pass
+            else:
+                raise ValueError
+        latest = os.lstat(AWG_GO_SOCKET)
+        if (latest.st_dev, latest.st_ino, latest.st_ctime_ns) != (info.st_dev, info.st_ino, info.st_ctime_ns):
+            raise ValueError
+        os.unlink(AWG_GO_SOCKET)
+    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+        raise RuntimeError("Оставшийся сокет Go не доказан как собственный и мёртвый; очистка запрещена") from None
+
+def go_restore_locked():
+    """Полная конфигурация применяется после каждого нового процесса, без новых ключей."""
+    errors = state_permission_errors()
+    if errors:
+        raise RuntimeError("Нарушена доверенная граница AWG Go")
+    snapshot = load_state_snapshot(expected_backend="awg")
+    if snapshot["implementation"] != "go":
+        raise RuntimeError("Восстановление Go запрещено для другой реализации")
+    close_firewall_guard(persist=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not os.path.lexists(AWG_GO_SOCKET) or not interface_exists():
+            # Процесс уже должен быть собственным, хотя его сокет ещё создаётся.
+            go_process_identity(require_socket=False)
+            if time.monotonic() >= deadline:
+                raise RuntimeError("AWG Go не создал интерфейс и сокет за 15 секунд")
+            time.sleep(0.05)
+        pid = go_process_identity()
+        record_go_socket(pid)
+        if not interface_exists() or "tun" not in run_cmd(f"ip -d link show {WG_IF}", check=False).lower():
+            raise RuntimeError("AWG Go не создал ожидаемый TUN-интерфейс")
+        path = write_setconf(snapshot["server_private_key"], "awg", snapshot["awg_params"], snapshot["listen_port"])
+        try:
+            run_cmd(f"{snapshot['wg_bin']} setconf {WG_IF} {shlex.quote(str(path))}")
+        except (RuntimeError, OSError):
+            raise RuntimeError("Не удалось применить полный профиль AWG Go; ответ с секретными полями скрыт") from None
+        run_cmd(f"ip link set down dev {WG_IF}")
+        run_cmd(f"ip -4 addr flush dev {WG_IF}")
+        run_cmd(f"ip addr add {SERVER_IP}/24 dev {WG_IF}")
+        run_cmd(f"ip link set dev {WG_IF} mtu 1280")
+        snapshot = prepare_internet_policy(snapshot)
+        public_client_firewall_rules()
+        _apply_awg_peers(snapshot)
+        rebuild_policy_chains(snapshot)
+        run_cmd(f"ip link set up dev {WG_IF}")
+        _verify_awg_before_open(snapshot)
+        if go_process_identity() != pid:
+            raise RuntimeError("Процесс AWG Go изменился во время восстановления")
+        open_firewall_guard()
+        _verify_awg_ready(snapshot)
+        run_cmd("netfilter-persistent save")
+    except Exception:
+        close_firewall_guard(persist=True)
+        raise
+
+def go_lifecycle(action):
+    """Блокировка операции не используется службой; systemctl ждёт вне runtime_lock."""
+    with runtime_lock(lock_path=AWG_GO_OPERATION_LOCK):
+        with runtime_lock():
+            snapshot = load_state_snapshot(expected_backend="awg")
+            if snapshot["implementation"] != "go":
+                raise RuntimeError("Сохранённая реализация изменилась; операция остановлена")
+            require_go_unit()
+            if interface_exists() and awg_interface_ownership(snapshot) != "owned":
+                raise RuntimeError("Принадлежность интерфейса Go не подтверждена; остановка запрещена")
+            # Работающий процесс также нельзя останавливать по одному имени службы.
+            pid = go_systemctl("show", "-p", "MainPID", "--value")
+            if pid != "0":
+                go_process_identity()
+                if action == "start":
+                    _sync_awg_runtime_locked(snapshot)
+                    return
+            else:
+                cleanup_go_stale_socket()
+                if os.path.lexists(AWG_GO_SOCKET) or interface_exists():
+                    raise RuntimeError("Без процесса Go остался интерфейс или сокет; очистка запрещена")
+            close_firewall_guard(persist=True)
+        try:
+            go_systemctl(action)
+        except Exception:
+            with runtime_lock():
+                close_firewall_guard(persist=True)
+            raise
+        with runtime_lock():
+            if action == "stop":
+                if go_systemctl("show", "-p", "MainPID", "--value") != "0" or interface_exists() or os.path.lexists(AWG_GO_SOCKET):
+                    raise RuntimeError("Остановка Go не подтверждена; защитная цепочка сохранена")
+                cleanup_owned_firewall()
+                run_cmd("netfilter-persistent save")
+            else:
+                snapshot = load_state_snapshot(expected_backend="awg")
+                _verify_awg_ready(snapshot)
+
 def run_cmd(cmd, check=True):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -168,12 +491,12 @@ def run_cmd(cmd, check=True):
     return result.stdout.strip()
 
 @contextmanager
-def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS):
+def runtime_lock(timeout=LOCK_TIMEOUT_SECONDS, lock_path=None):
     """Сериализует все изменения желаемого и фактического состояния LanFabric."""
     if fcntl is None:
         raise RuntimeError("Межпроцессная блокировка LanFabric поддерживается только на POSIX-сервере")
     Path(LOCK_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(lock_path or LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + timeout
     acquired = False
     try:
@@ -454,7 +777,7 @@ def read_server_key_material(backend):
         raise RuntimeError("Приватный ключ сервера имеет некорректный формат")
     if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pub or ""):
         raise RuntimeError("Публичный ключ сервера имеет некорректный формат")
-    wg_bin = "awg" if backend == "awg" else "wg"
+    wg_bin = backend_tools(backend, get_implementation(backend))
     if derive_public_key(priv, wg_bin) != pub:
         raise RuntimeError("Сохранённые приватный и публичный ключи сервера не соответствуют друг другу")
     return priv, pub
@@ -500,12 +823,18 @@ def load_state_snapshot(expected_backend=None):
     backend = require_backend()
     if expected_backend is not None and backend != expected_backend:
         raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
-    wg_bin = "awg" if backend == "awg" else "wg"
-    if not run_cmd(f"command -v {wg_bin}", check=False):
-        raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
-    module = "amneziawg" if backend == "awg" else "wireguard"
-    if not command_succeeds(f"modprobe -n {module}"):
-        raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
+    implementation = get_implementation(backend)
+    wg_bin = backend_tools(backend, implementation)
+    if implementation == "go":
+        require_go_components()
+        if not os.path.exists("/dev/net/tun"):
+            raise RuntimeError("Устройство TUN отсутствует; переключение на модуль ядра запрещено")
+    else:
+        if not run_cmd(f"command -v {wg_bin}", check=False):
+            raise RuntimeError(f"Бинарник backend не найден: {wg_bin}")
+        module = "amneziawg" if backend == "awg" else "wireguard"
+        if not command_succeeds(f"modprobe -n {module}"):
+            raise RuntimeError(f"Модуль ядра backend недоступен: {module}")
     priv, pub = read_server_key_material(backend)
     awg_params = read_awg_params_file() if backend == "awg" else None
     listen_port = read_listen_port()
@@ -520,7 +849,7 @@ def load_state_snapshot(expected_backend=None):
     finally:
         conn.close()
     validate_user_rows(rows, wg_bin)
-    return {"backend": backend, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "listen_port": listen_port, "users": rows}
+    return {"backend": backend, "implementation": implementation, "wg_bin": wg_bin, "server_private_key": priv, "server_public_key": pub, "awg_params": awg_params, "listen_port": listen_port, "users": rows}
 
 def ensure_iptables_rule(rule):
     """Добавляет правило iptables, если оно ещё не существует."""
@@ -785,7 +1114,9 @@ def load_runtime_identity(expected_backend=None):
     if expected_backend is not None and backend != expected_backend:
         raise RuntimeError(f"Ожидался backend {expected_backend}, сохранён backend {backend}")
     _, pub = read_server_key_material(backend)
-    return {"backend": backend, "wg_bin": "awg" if backend == "awg" else "wg", "server_public_key": pub}
+    implementation = get_implementation(backend)
+    return {"backend": backend, "implementation": implementation,
+            "wg_bin": backend_tools(backend, implementation), "server_public_key": pub}
 
 def interface_exists():
     return subprocess.run(
@@ -797,19 +1128,29 @@ def awg_interface_ownership(identity):
     if not interface_exists():
         return "absent"
     detail = run_cmd(f"ip -d link show {WG_IF}", check=False)
+    if identity.get("implementation", "kernel") == "go":
+        try:
+            go_process_identity()
+        except RuntimeError:
+            return "unknown"
+        if "tun" not in detail.lower():
+            return "unknown"
+        actual_pub = run_cmd(f"{identity['wg_bin']} show {WG_IF} public-key", check=False).strip()
+        return "owned" if actual_pub == identity["server_public_key"] else "unknown"
     if "amneziawg" not in detail.lower():
         return "unknown"
     actual_pub = run_cmd(f"awg show {WG_IF} public-key", check=False).strip()
     return "owned" if actual_pub == identity["server_public_key"] else "unknown"
 
 def _apply_awg_peers(snapshot):
-    current = run_cmd(f"awg show {WG_IF} peers", check=False)
+    wg_bin = snapshot.get("wg_bin", "awg")
+    current = run_cmd(f"{wg_bin} show {WG_IF} peers", check=False)
     for peer in current.splitlines():
         if peer:
-            run_cmd(f"awg set {WG_IF} peer {peer} remove")
+            run_cmd(f"{wg_bin} set {WG_IF} peer {peer} remove")
     for row in _active_users(snapshot):
         run_cmd(
-            f"awg set {WG_IF} peer {row['pubkey']} "
+            f"{wg_bin} set {WG_IF} peer {row['pubkey']} "
             f"allowed-ips {row['ip']}/32 persistent-keepalive 25"
         )
 
@@ -874,6 +1215,8 @@ def _verify_awg_ready(snapshot):
 
 def _restore_awg_runtime_locked(snapshot):
     """Fail-closed восстановление AWG из одного проверенного снимка."""
+    if snapshot.get("implementation", "kernel") == "go":
+        raise RuntimeError("Запуск Go выполняется службой вне блокировки состояния; используйте start")
     ownership = awg_interface_ownership(snapshot)
     if ownership == "unknown":
         raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
@@ -938,6 +1281,8 @@ def _sync_awg_runtime_locked(snapshot):
 
 def _stop_awg_runtime_locked():
     identity = load_runtime_identity(expected_backend="awg")
+    if identity.get("implementation", "kernel") == "go":
+        raise RuntimeError("Остановка Go выполняется службой вне блокировки состояния; используйте stop")
     ownership = awg_interface_ownership(identity)
     if ownership == "unknown":
         raise RuntimeError(f"Интерфейс {WG_IF} существует, но его принадлежность LanFabric не подтверждена")
@@ -955,6 +1300,10 @@ def cmd_stop():
     """Останавливает VPN runtime без удаления пакетов и данных."""
     backend = require_backend()
     log.info(f"Остановка VPN runtime. Backend: {backend}")
+    if get_implementation(backend) == "go":
+        go_lifecycle("stop")
+        log.info("AWG Go остановлен; ключи и пользователи сохранены")
+        return
     if backend == "wg":
         run_cmd(f"systemctl stop wg-quick@{WG_IF} 2>/dev/null || true", check=False)
         _remove_legacy_firewall_rules()
@@ -968,6 +1317,10 @@ def cmd_start():
     """Запускает VPN runtime по сохранённому backend без полного init."""
     backend = require_backend()
     log.info(f"Запуск VPN runtime. Backend: {backend}")
+    if get_implementation(backend) == "go":
+        go_lifecycle("start")
+        log.info("AWG Go запущен и проверен")
+        return
     if backend == "wg":
         run_cmd(f"systemctl enable wg-quick@{WG_IF}")
         run_cmd(f"systemctl restart wg-quick@{WG_IF}")
@@ -981,6 +1334,10 @@ def cmd_start():
 def cmd_restart():
     """Перезапускает VPN runtime без полного init под общей внешней блокировкой."""
     log.info("Перезапуск VPN runtime")
+    if get_implementation() == "go":
+        go_lifecycle("restart")
+        log.info("AWG Go перезапущен и проверен без изменения ключей")
+        return
     cmd_stop()
     cmd_start()
 
@@ -1100,16 +1457,33 @@ def state_permission_errors():
         trusted_python_path()
     except Exception as e:
         errors.append(str(e))
+    if os.path.lexists(IMPLEMENTATION_PATH):
+        try:
+            trusted_go_path(IMPLEMENTATION_PATH, private=True)
+        except RuntimeError as e:
+            errors.append(str(e))
     return errors
 
 def ensure_awg_autostart_unit():
     """Устанавливает и разрешает boot-only unit без запуска/перезапуска VPN."""
-    load_state_snapshot(expected_backend="awg")
+    snapshot = load_state_snapshot(expected_backend="awg")
     ensure_state_permissions()
     errors = state_permission_errors()
     if errors:
         raise RuntimeError("Нельзя включить AWG autostart: " + "; ".join(errors))
     python_path = trusted_python_path()
+    if snapshot.get("implementation", "kernel") == "go":
+        if os.path.lexists(AWG_AUTOSTART_PATH):
+            raise RuntimeError("Сохранилась служба AWG ядра; для смены реализации нужна отдельная миграция")
+        if os.path.lexists(AWG_GO_UNIT_PATH):
+            require_go_unit()
+        else:
+            _atomic_write_root_file(AWG_GO_UNIT_PATH, awg_go_unit_text(python_path), mode=0o644)
+            go_systemctl("daemon-reload")
+        go_systemctl("enable")
+        if go_systemctl("is-enabled") != "enabled":
+            raise RuntimeError("Автозапуск AWG Go не включён")
+        return
     _atomic_write_root_file(
         AWG_AUTOSTART_PATH,
         awg_autostart_unit_text(python_path=python_path),
@@ -1127,6 +1501,12 @@ def cancel_awg_boot_before_lock():
 
 def disable_awg_autostart(remove_unit=False):
     """Отключает будущий boot restore; текущий wg0 отдельно не останавливает."""
+    if os.path.exists(BACKEND_PATH) and get_implementation() == "go":
+        if remove_unit:
+            raise RuntimeError("Удаление службы Go требует отдельного этапа установки и удаления по #28")
+        require_go_unit()
+        go_systemctl("disable")
+        return
     run_cmd(f"systemctl disable {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
     if remove_unit:
         run_cmd(f"rm -f {AWG_AUTOSTART_PATH}", check=False)
@@ -1134,10 +1514,13 @@ def disable_awg_autostart(remove_unit=False):
         run_cmd(f"systemctl reset-failed {AWG_AUTOSTART_UNIT} 2>/dev/null || true", check=False)
 
 def awg_autostart_state():
-    installed = os.path.isfile(AWG_AUTOSTART_PATH)
-    enabled = run_cmd(f"systemctl is-enabled {AWG_AUTOSTART_UNIT}", check=False).strip()
+    is_go = get_implementation("awg") == "go"
+    unit = AWG_GO_UNIT if is_go else AWG_AUTOSTART_UNIT
+    unit_path = AWG_GO_UNIT_PATH if is_go else AWG_AUTOSTART_PATH
+    installed = os.path.isfile(unit_path)
+    enabled = run_cmd(f"systemctl is-enabled {unit}", check=False).strip()
     result = run_cmd(
-        f"systemctl show {AWG_AUTOSTART_UNIT} -p Result --value 2>/dev/null",
+        f"systemctl show {unit} -p Result --value 2>/dev/null",
         check=False
     ).strip()
     return {
@@ -1212,6 +1595,8 @@ def cmd_remove(args):
     """Удаление VPN runtime и пакетов без удаления данных LanFabric."""
     if args.confirm != "REMOVE":
         raise RuntimeError("Для подтверждения удаления укажите: REMOVE")
+    if get_implementation() == "go":
+        raise RuntimeError("Удаление AWG Go пока не принято по #28; используйте stop для остановки без потери данных")
 
     log.info("Начало remove: удаление runtime и пакетов, данные сохраняются")
 
@@ -1227,6 +1612,8 @@ def cmd_purge(args):
     """Полное удаление LanFabric с сервера."""
     if args.confirm != "PURGE":
         raise RuntimeError("Для подтверждения полного удаления укажите: PURGE")
+    if get_implementation() == "go":
+        raise RuntimeError("Полное удаление AWG Go пока не принято по #28; используйте stop")
 
     log.info("Начало purge: полное удаление LanFabric с сервера")
 
@@ -1320,6 +1707,7 @@ def ensure_state_permissions():
         Path(BACKEND_PATH),
         Path(AWG_PARAMS_PATH),
         Path(LISTEN_PORT_PATH),
+        Path(IMPLEMENTATION_PATH),
         Path(WG_DIR) / f"{WG_IF}.private",
         Path(WG_DIR) / f"{WG_IF}.setconf",
     ]
@@ -1340,6 +1728,8 @@ def ensure_state_permissions():
 
 def cmd_init(args):
     """Инициализация сервера, установка пакетов, настройка интерфейса."""
+    if os.path.lexists(IMPLEMENTATION_PATH) and get_implementation("awg") == "go":
+        raise RuntimeError("init поверх AWG Go запрещён: обновление должно сохранить ключи и пользователей по #28")
     # Временная установка AWG 3.1 имеет отдельные ключи, сеть и службу.
     # init не является её миграцией и не должен создавать второй VPN рядом.
     if os.path.lexists("/opt/lanfabric-awg31") or os.path.lexists("/etc/systemd/system/lanfabric-awg31.service"):
@@ -1523,6 +1913,10 @@ def cmd_status():
         add_advice("Выполните health для подробной диагностики")
         return
     log.info(f"Backend: {backend}")
+    try:
+        log.info(f"Реализация: {get_implementation(backend)}")
+    except RuntimeError:
+        log.warning("Сохранённая реализация недостоверна")
     snapshot = None
     snapshot_error = None
     try:
@@ -1569,7 +1963,7 @@ def _active_users(snapshot):
 def _expected_peer_map(snapshot):
     return {row["pubkey"]: f"{row['ip']}/32" for row in _active_users(snapshot)}
 
-def awg31_runtime_errors(params):
+def awg31_runtime_errors(params, wg_bin="awg"):
     """Сверяет применённые поля; секретные ответы никогда не включаются в ошибки."""
     if not params or "HeaderProtectionKey" not in params:
         return []
@@ -1585,7 +1979,7 @@ def awg31_runtime_errors(params):
     })
     for key, field in fields.items():
         try:
-            result = subprocess.run(["awg", "show", WG_IF, field], capture_output=True,
+            result = subprocess.run([wg_bin, "show", WG_IF, field], capture_output=True,
                                     text=True, timeout=2)
             if result.returncode != 0:
                 return [f"AWG 3.1: невозможно прочитать поле {key}"]
@@ -1618,7 +2012,17 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
     flags = set(flags_match.group(1).split(",")) if flags_match else set()
     if "UP" not in flags:
         errors.append(f"Интерфейс {WG_IF} не находится в административном состоянии UP")
-    if backend == "awg" and "amneziawg" not in detail.lower():
+    is_go = snapshot.get("implementation", "kernel") == "go"
+    if is_go:
+        if "tun" not in detail.lower():
+            errors.append("Интерфейс AWG Go не имеет тип TUN")
+        if not re.search(r"\bmtu 1280\b", link_state):
+            errors.append("MTU AWG Go отличается от 1280")
+        try:
+            go_process_identity()
+        except RuntimeError:
+            errors.append("Принадлежность процесса или сокета AWG Go не подтверждена")
+    elif backend == "awg" and "amneziawg" not in detail.lower():
         errors.append(f"Интерфейс {WG_IF} не имеет тип amneziawg")
     actual_pub = run_cmd(f"{wg_bin} show {WG_IF} public-key", check=False).strip()
     if actual_pub != snapshot["server_public_key"]:
@@ -1636,7 +2040,10 @@ def runtime_readiness_errors(snapshot, check_firewall=True):
     if listen_port != str(port):
         errors.append(f"ListenPort: ожидался {port}, получено {listen_port or 'нет'}")
     if backend == "awg":
-        errors.extend(awg31_runtime_errors(snapshot.get("awg_params")))
+        if is_go:
+            errors.extend(awg31_runtime_errors(snapshot.get("awg_params"), wg_bin=wg_bin))
+        else:
+            errors.extend(awg31_runtime_errors(snapshot.get("awg_params")))
     actual_peers = set(filter(None, run_cmd(f"{wg_bin} show {WG_IF} peers", check=False).splitlines()))
     expected_peers = set(_expected_peer_map(snapshot))
     if actual_peers != expected_peers:
@@ -1683,6 +2090,7 @@ def cmd_health():
         add_advice("Исправьте указанное нарушение и повторите health; диагностика сама состояние не изменяет")
         raise RuntimeError(f"Health завершён с ошибкой: нарушений {len(errors)}")
     log.info(f"Backend: {snapshot['backend']}")
+    log.info(f"Реализация: {snapshot.get('implementation', 'kernel')}")
     log.info(f"База данных: пользователей {len(snapshot['users'])}")
     log.info("Система работает штатно, обязательные runtime-инварианты подтверждены")
 
@@ -1837,6 +2245,11 @@ def cmd_block(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
     pub, ip, internet = user
     backend = require_backend()
+    if backend == "awg" and get_implementation(backend) == "go":
+        snapshot = load_state_snapshot(expected_backend="awg")
+        if awg_interface_ownership(snapshot) != "owned":
+            raise RuntimeError("Блокировка Go требует подтверждённого собственного интерфейса; БД не изменена")
+        close_firewall_guard(persist=True)
     conn.execute("UPDATE users SET blocked=1 WHERE name=?", (args.name,))
     conn.commit()
 
@@ -1861,6 +2274,11 @@ def cmd_delete(args):
         raise RuntimeError(f"Учётная запись '{args.name}' не найдена")
     pub, ip = user
     backend = require_backend()
+    if backend == "awg" and get_implementation(backend) == "go":
+        snapshot = load_state_snapshot(expected_backend="awg")
+        if awg_interface_ownership(snapshot) != "owned":
+            raise RuntimeError("Удаление участника Go требует подтверждённого собственного интерфейса; БД не изменена")
+        close_firewall_guard(persist=True)
     conn.execute("DELETE FROM users WHERE name=?", (args.name,))
     conn.commit()
 
@@ -1978,6 +2396,24 @@ def main():
             log.error(str(e))
             sys.exit(1)
         return
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("_go-preflight", "_go-restore", "_go-closed"):
+        try:
+            if os.geteuid() != 0 or len(sys.argv) != 2:
+                raise RuntimeError("Внутренняя операция Go требует root и не принимает аргументы")
+            with runtime_lock():
+                if sys.argv[1] == "_go-preflight":
+                    go_preflight_locked()
+                elif sys.argv[1] == "_go-restore":
+                    go_restore_locked()
+                else:
+                    # После аварии состав процесса уже может быть недостоверен.
+                    # Только закрываем свою цепочку; не удаляем интерфейс/сокет.
+                    close_firewall_guard(persist=True)
+        except Exception:
+            log.error("Внутренняя операция AWG Go завершилась ошибкой; защитная цепочка не открыта")
+            sys.exit(1)
+        return
     
     if len(sys.argv) == 1:
         print_intro()
@@ -2089,12 +2525,15 @@ def main():
         if args.command == "autostart" and args.autostart_action == "disable":
             cancel_boot_commands.add("autostart")
 
-        if args.command in cancel_boot_commands:
+        go_command = (args.command in {"start", "stop", "restart", "init", "remove", "purge", "autostart"}
+                      and os.path.exists(BACKEND_PATH) and get_implementation() == "go")
+        if args.command in cancel_boot_commands and not go_command:
             cancel_awg_boot_before_lock()
 
         needs_lock = (
             args.command in mutating_commands
             and not (args.command == "autostart" and args.autostart_action == "status")
+            and not (go_command and args.command in {"start", "stop", "restart"})
         )
         if needs_lock:
             with runtime_lock():
