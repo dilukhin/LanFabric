@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
         python-version: ['3.10', '3.12', '3.13', '3.14.2']
     env:
       PYTHONUTF8: '1'
@@ -38,3 +38,21 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Проверить модули, справку и регрессионные сценарии
         run: python tests_local/run_local_checks.py
+      - name: Проверить ограниченное окружение ACP
+        if: ${{ matrix.python-version == '3.14.2' }}
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          base = {k: os.environ[k] for k in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH") if k in os.environ}
+          base.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+          print("ACP current environment", flush=True)
+          old = subprocess.run([sys.executable, "-B", "tests_local/run_local_checks.py"], env=base, stdin=subprocess.DEVNULL, timeout=180)
+          print(f"ACP current environment exit={old.returncode}", flush=True)
+          if os.name == "nt" and "USERPROFILE" in os.environ:
+              base["USERPROFILE"] = os.environ["USERPROFILE"]
+          print("ACP environment with Windows home", flush=True)
+          fixed = subprocess.run([sys.executable, "-B", "tests_local/run_local_checks.py"], env=base, stdin=subprocess.DEVNULL, timeout=180)
+          print(f"ACP environment with Windows home exit={fixed.returncode}", flush=True)
+          sys.exit(fixed.returncode)
